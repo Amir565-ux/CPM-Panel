@@ -52,17 +52,8 @@ if [[ -f "$DIR/app.py" ]]; then
 else
 cat > "$DIR/app.py" << 'PYEOF'
 """
-CPM Panel — Flask backend  (v2 — owner-key security fix)
+CPM Panel — Flask backend
 GitHub: https://github.com/Amir565-ux/CPM-Panel
-
-Security changes vs v1
-----------------------
-* Removed hardcoded _OWNER_DEFAULT_KEY / _OWNER_DEFAULT_HASH.
-  No plaintext key or known hash ships with the source code.
-* Removed plaintext bypass: `or entered == _OWNER_DEFAULT_KEY.upper()`
-  in /api/user/activate — only hash comparison is used now.
-* _load() no longer backfills a default hash, so /api/owner/setup
-  is reachable on every fresh install.
 """
 import os, re, shutil, subprocess, logging, time, hashlib, json, uuid, secrets
 from datetime import datetime, timedelta, timezone
@@ -180,7 +171,7 @@ def cpu_percent():
             with open("/proc/stat") as f:
                 line = f.readline()
             vals = list(map(int, line.split()[1:]))
-            return vals[0]+vals[2], sum(vals)
+            return vals[0]+vals[2], sum(vals)   # active, total
         a1, t1 = read_cpu(); time.sleep(0.5); a2, t2 = read_cpu()
         dt = t2 - t1
         return round((a2 - a1) / dt * 100, 1) if dt else 0.0
@@ -290,6 +281,7 @@ def start():   return _action(request, "start")
 
 @app.route("/api/vps/stop",    methods=["POST"])
 def stop():
+    """Force-off (virsh destroy). Checks current state first to give a clear error."""
     err = _require_kvm()
     if err: return err
     data = request.get_json() or {}
@@ -310,10 +302,12 @@ def stop():
 
 @app.route("/api/vps/shutdown", methods=["POST"])
 def shutdown():
+    """Graceful ACPI shutdown — may not work if guest lacks ACPI support."""
     return _action(request, "shutdown")
 
 @app.route("/api/vps/restart", methods=["POST"])
 def restart():
+    """Hard reset (virsh reset) — always works regardless of guest ACPI support."""
     err = _require_kvm()
     if err: return err
     data = request.get_json() or {}
@@ -383,6 +377,7 @@ def create():
 
 @app.route("/api/vps/tmate", methods=["POST"])
 def vps_tmate():
+    """Auto-install tmate if needed, start a session, return SSH / web strings."""
     data      = request.get_json() or {}
     name      = data.get("name", "panel")
     cmds_run  = []
@@ -449,8 +444,8 @@ def vps_tmate():
 _DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpm_data.json")
 
 # FIX: No default key or hash is hardcoded here.
-# On first run owner_key_hash is None; the setup screen is shown and the
-# real owner sets their own secret key via /api/owner/setup.
+# On first run, owner_key_hash is None, the setup screen is shown,
+# and the real owner sets their own secret key.
 
 _DEFAULT_FEATURES = {
     "dashboard":    {"name":"Dashboard",            "category":"System",       "tier":"free",    "usage":0},
@@ -466,7 +461,7 @@ _DEFAULT_FEATURES = {
 
 def _load():
     if not os.path.exists(_DATA_FILE):
-        # Fresh install — no owner key yet; setup screen will appear
+        # Fresh install — no owner key set yet; setup screen will appear
         d = {"owner_key_hash": None, "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
         _save(d)
         return d
@@ -478,7 +473,7 @@ def _load():
             d.setdefault("features", {})[k] = d["features"].get(k, v)
         return d
     except Exception:
-        # Corrupted data — reset without injecting any default key
+        # Corrupted data file — reset (but do NOT inject a default key)
         d = {"owner_key_hash": None, "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
         _save(d)
         return d
@@ -632,13 +627,13 @@ def owner_analytics():
     feats = d.get("features", _DEFAULT_FEATURES)
     logs = d.get("activation_logs", [])
     return jsonify({
-        "total_keys":        len(keys),
-        "active_keys":       sum(1 for k in keys if k["status"] == "active"),
-        "used_keys":         sum(1 for k in keys if k["status"] == "used"),
+        "total_keys":       len(keys),
+        "active_keys":      sum(1 for k in keys if k["status"] == "active"),
+        "used_keys":        sum(1 for k in keys if k["status"] == "used"),
         "total_activations": len(logs),
-        "premium_features":  sum(1 for f in feats.values() if f.get("tier") == "premium"),
-        "free_features":     sum(1 for f in feats.values() if f.get("tier") == "free"),
-        "recent_logs":       list(reversed(logs[-10:])),
+        "premium_features": sum(1 for f in feats.values() if f.get("tier") == "premium"),
+        "free_features":    sum(1 for f in feats.values() if f.get("tier") == "free"),
+        "recent_logs":      list(reversed(logs[-10:])),
     })
 
 @app.route("/api/owner/logs", methods=["POST"])
@@ -656,7 +651,8 @@ def user_activate():
     if not entered: return jsonify({"error": "No key provided"}), 400
     d = _load()
 
-    # FIX: Only use hash comparison — no hardcoded plaintext bypass.
+    # FIX: Only compare against the stored hash — no plaintext bypass.
+    # Owner key grants permanent premium access if a hash is set.
     stored_hash = d.get("owner_key_hash")
     if stored_hash and _hash(entered) == stored_hash:
         log.info("Owner key used for premium activation")
@@ -680,6 +676,113 @@ def user_activate():
             return jsonify({"success": True, "expires_at": k.get("expires_at"), "key_id": k["id"]})
     return jsonify({"error": "Invalid activation key — check your key and try again"}), 403
 
+# ── Cloud Storage ─────────────────────────────────────────────────────────────
+
+STORAGE_ROOT = '/opt/cpm-storage'
+
+def _safe_storage_path(rel):
+    base = os.path.realpath(STORAGE_ROOT)
+    target = os.path.realpath(os.path.join(base, rel.lstrip('/'))) if rel.strip('/') else base
+    return target if target.startswith(base) else None
+
+@app.route("/api/storage/list")
+def storage_list():
+    rel = request.args.get('path', '')
+    path = _safe_storage_path(rel)
+    if not path:
+        return jsonify({"error": "Invalid path"}), 400
+    os.makedirs(path, exist_ok=True)
+    items = []
+    try:
+        for name in sorted(os.listdir(path)):
+            full = os.path.join(path, name)
+            try:
+                st = os.stat(full)
+                items.append({
+                    "name": name,
+                    "type": "folder" if os.path.isdir(full) else "file",
+                    "size": st.st_size if os.path.isfile(full) else 0,
+                    "modified": datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')
+                })
+            except Exception:
+                pass
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    items.sort(key=lambda x: (0 if x["type"] == "folder" else 1, x["name"].lower()))
+    return jsonify({"items": items, "path": rel})
+
+@app.route("/api/storage/upload", methods=["POST", "OPTIONS"])
+def storage_upload():
+    if request.method == "OPTIONS":
+        return "", 204
+    rel = request.form.get('path', '')
+    path = _safe_storage_path(rel)
+    if not path:
+        return jsonify({"error": "Invalid path"}), 400
+    if 'file' not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    f = request.files['file']
+    if not f.filename:
+        return jsonify({"error": "No filename"}), 400
+    os.makedirs(path, exist_ok=True)
+    save_name = os.path.basename(f.filename)
+    f.save(os.path.join(path, save_name))
+    return jsonify({"success": True, "name": save_name})
+
+@app.route("/api/storage/download")
+def storage_download():
+    rel = request.args.get('path', '')
+    path = _safe_storage_path(rel)
+    if not path or not os.path.isfile(path):
+        return jsonify({"error": "File not found"}), 404
+    return send_file(path, as_attachment=True, download_name=os.path.basename(path))
+
+@app.route("/api/storage/delete", methods=["POST"])
+def storage_delete():
+    data = request.json or {}
+    rel = data.get('path', '')
+    path = _safe_storage_path(rel)
+    if not path or not os.path.exists(path):
+        return jsonify({"error": "Not found"}), 404
+    if os.path.realpath(path) == os.path.realpath(STORAGE_ROOT):
+        return jsonify({"error": "Cannot delete root storage folder"}), 400
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)
+    return jsonify({"success": True})
+
+@app.route("/api/storage/mkdir", methods=["POST"])
+def storage_mkdir():
+    data = request.json or {}
+    rel = data.get('path', '')
+    path = _safe_storage_path(rel)
+    if not path:
+        return jsonify({"error": "Invalid path"}), 400
+    os.makedirs(path, exist_ok=True)
+    return jsonify({"success": True})
+
+@app.route("/api/storage/stats")
+def storage_stats():
+    os.makedirs(STORAGE_ROOT, exist_ok=True)
+    used = 0
+    try:
+        r = subprocess.run(['du', '-sb', STORAGE_ROOT], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            used = int(r.stdout.split()[0])
+    except Exception:
+        pass
+    total = free = 0
+    try:
+        st = os.statvfs(STORAGE_ROOT)
+        total = st.f_blocks * st.f_frsize
+        free  = st.f_avail  * st.f_frsize
+    except Exception:
+        pass
+    return jsonify({"used": used, "total": total, "free": free})
+
+# ── Logo ──────────────────────────────────────────────────────────────────────
+
 @app.route("/logo.png")
 def logo():
     here = os.path.dirname(os.path.abspath(__file__))
@@ -692,6 +795,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log.info(f"CPM Panel listening on port {port}")
     app.run(host="0.0.0.0", port=port)
+
 PYEOF
 ok "app.py written"
 fi
@@ -984,6 +1088,18 @@ else
   .log-time{font-size:11px;color:var(--muted);min-width:135px;font-family:monospace}
   .log-key{font-family:monospace;font-size:12px;color:#2563eb}
 
+  /* ── Cloud Storage ── */
+  .storage-bar-wrap{background:#f1f5f9;border-radius:8px;height:10px;overflow:hidden;margin-bottom:4px}
+  .storage-bar-fill{height:100%;background:linear-gradient(90deg,#2563eb,#60a5fa);border-radius:8px;transition:.5s}
+  .storage-crumb{display:flex;align-items:center;gap:2px;flex-wrap:wrap;font-size:13px;margin-bottom:14px}
+  .file-table{width:100%;border-collapse:collapse;font-size:13px}
+  .file-table th{text-align:left;padding:10px 14px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);border-bottom:2px solid var(--border);background:#f8fafc}
+  .file-table td{padding:11px 14px;border-bottom:1px solid #f1f5f9;vertical-align:middle}
+  .file-table tr:hover td{background:#f8fafc}
+  .file-name-btn{background:none;border:none;font-size:13px;font-weight:500;color:var(--text);cursor:pointer;padding:0;text-align:left}
+  .file-name-btn:hover{color:var(--blue);text-decoration:underline}
+  .storage-toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+
   /* ── Upgrade modal ── */
   .upgrade-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:7000;display:none;align-items:center;justify-content:center;padding:16px}
   .upgrade-overlay.open{display:flex}
@@ -1070,6 +1186,10 @@ else
     <a onclick="showPage('create',this)">
       <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
       Create VPS
+    </a>
+    <a onclick="showPage('storage',this);storageOpen()">
+      <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4.03 3-9 3S3 13.66 3 12"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/></svg>
+      Cloud Storage
     </a>
   </nav>
   <a onclick="enterOwnerPanel()" id="nav-owner" style="display:none;margin-top:auto;background:linear-gradient(135deg,#fef3c7,#fde68a);color:#92400e;border-radius:8px;margin:0 10px 8px">
@@ -1391,6 +1511,56 @@ else
           </div>
         </div>
       </div>
+    </section>
+
+    <!-- CLOUD STORAGE -->
+    <section class="page" id="page-storage">
+      <h1>Cloud Storage</h1>
+      <p class="subtitle">Store and manage files directly on your VPS disk.</p>
+
+      <!-- Disk usage bar -->
+      <div class="card" style="margin-bottom:20px">
+        <div class="card-body" style="padding:16px 22px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <div style="font-size:13px;font-weight:600;display:flex;align-items:center;gap:6px">
+              <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4.03 3-9 3S3 13.66 3 12"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/></svg>
+              Disk Usage
+            </div>
+            <div style="font-size:12px;color:var(--muted)" id="storage-usage-text">—</div>
+          </div>
+          <div class="storage-bar-wrap">
+            <div class="storage-bar-fill" id="storage-bar" style="width:0%"></div>
+          </div>
+          <div style="font-size:11px;color:var(--muted);margin-top:4px">Storage root: /opt/cpm-storage/</div>
+        </div>
+      </div>
+
+      <!-- File browser -->
+      <div class="card">
+        <div class="card-header" style="padding-bottom:14px">
+          <div class="storage-crumb" id="storage-crumb">
+            <span onclick="storageTo('')" style="cursor:pointer;color:var(--blue);font-weight:600">📁 Storage</span>
+          </div>
+          <div class="storage-toolbar">
+            <button class="btn" onclick="storageUpload()" style="background:var(--blue);color:#fff;display:flex;align-items:center;gap:6px">
+              <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
+              Upload File
+            </button>
+            <button class="btn" onclick="storageMkdir()" style="display:flex;align-items:center;gap:6px">
+              <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>
+              New Folder
+            </button>
+          </div>
+        </div>
+        <div class="card-body" style="padding:0">
+          <div id="storage-file-list">
+            <div style="padding:32px;color:var(--muted);text-align:center">Open the Cloud Storage page to load files.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Hidden file input -->
+      <input type="file" id="storage-file-input" style="display:none" multiple onchange="storageDoUpload(this)"/>
     </section>
 
   </main>
@@ -2262,6 +2432,151 @@ async function ownerLoadLogs() {
         </div>`).join('')
       : '<div style="color:var(--muted);font-size:14px;padding:24px">No activation logs yet</div>';
   } catch(e) { el.innerHTML = '<div style="color:#dc2626">Failed to load logs</div>'; }
+}
+
+// ── Cloud Storage ─────────────────────────────────────────────────────────
+let storagePath = '';
+
+function storageOpen() { loadStorage(''); }
+
+function storageTo(path) { loadStorage(path); }
+
+async function loadStorage(path) {
+  storagePath = path;
+  renderStorageCrumb();
+  const el = document.getElementById('storage-file-list');
+  el.innerHTML = '<div style="padding:32px;color:var(--muted);text-align:center">⏳ Loading…</div>';
+  try {
+    const d = await api('/api/storage/list?path=' + encodeURIComponent(path));
+    const items = d.items || [];
+    if (!items.length) {
+      el.innerHTML = '<div style="padding:36px;color:var(--muted);text-align:center">📂 This folder is empty.<br><small>Upload files or create a folder to get started.</small></div>';
+    } else {
+      el.innerHTML = `<div style="overflow-x:auto"><table class="file-table">
+        <thead><tr>
+          <th>Name</th><th>Size</th><th>Modified</th><th style="text-align:right">Actions</th>
+        </tr></thead>
+        <tbody>${items.map(f => {
+          const fullRel = (path ? path + '/' : '') + f.name;
+          const esc = fullRel.replace(/'/g, "\\'");
+          return `<tr>
+            <td>
+              ${f.type === 'folder'
+                ? `<button class="file-name-btn" onclick="storageTo('${esc}')">📁 ${f.name}</button>`
+                : `<span>${storageFileIcon(f.name)} ${f.name}</span>`}
+            </td>
+            <td style="color:var(--muted);font-size:12px">${f.type === 'folder' ? '—' : fmtBytes(f.size)}</td>
+            <td style="color:var(--muted);font-size:12px;white-space:nowrap">${f.modified}</td>
+            <td style="text-align:right;white-space:nowrap">
+              ${f.type === 'file' ? `<a href="/api/storage/download?path=${encodeURIComponent(fullRel)}" download="${f.name}" class="tbl-btn" style="text-decoration:none;display:inline-block">⬇ Download</a>` : ''}
+              <button class="tbl-btn tbl-btn-delete" onclick="storageDelete('${esc}','${f.type}')">🗑 Delete</button>
+            </td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table></div>`;
+    }
+  } catch(e) {
+    el.innerHTML = '<div style="padding:24px;color:#dc2626;text-align:center">❌ Failed to load — is the panel running?</div>';
+  }
+  loadStorageStats();
+}
+
+function renderStorageCrumb() {
+  const el = document.getElementById('storage-crumb');
+  if (!el) return;
+  const parts = storagePath ? storagePath.split('/').filter(Boolean) : [];
+  let html = `<span onclick="storageTo('')" style="cursor:pointer;color:var(--blue);font-weight:600">📁 Storage</span>`;
+  let built = '';
+  parts.forEach((p, i) => {
+    built = built ? built + '/' + p : p;
+    const snap = built;
+    html += `<span style="color:var(--muted);padding:0 5px">/</span>`;
+    if (i === parts.length - 1) {
+      html += `<span style="color:var(--text);font-weight:600">${p}</span>`;
+    } else {
+      html += `<span onclick="storageTo('${snap}')" style="cursor:pointer;color:var(--blue)">${p}</span>`;
+    }
+  });
+  el.innerHTML = html;
+}
+
+async function loadStorageStats() {
+  try {
+    const d = await api('/api/storage/stats');
+    const used = d.used || 0, total = d.total || 0;
+    const pct = total ? Math.min(100, (used / total) * 100).toFixed(1) : 0;
+    const el = document.getElementById('storage-usage-text');
+    const bar = document.getElementById('storage-bar');
+    if (el) el.textContent = fmtBytes(used) + ' used of ' + fmtBytes(total);
+    if (bar) bar.style.width = pct + '%';
+  } catch(_) {}
+}
+
+function storageFileIcon(name) {
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  const map = {jpg:'🖼',jpeg:'🖼',png:'🖼',gif:'🖼',webp:'🖼',svg:'🖼',ico:'🖼',
+    mp4:'🎬',mkv:'🎬',avi:'🎬',mov:'🎬',mp3:'🎵',wav:'🎵',ogg:'🎵',
+    pdf:'📄',doc:'📝',docx:'📝',txt:'📝',log:'📝',
+    zip:'📦',tar:'📦',gz:'📦','7z':'📦',rar:'📦',
+    sh:'⚙',py:'🐍',js:'📜',ts:'📜',json:'📋',yml:'📋',yaml:'📋',
+    html:'🌐',css:'🎨',php:'🐘',sql:'🗃'};
+  return map[ext] || '📄';
+}
+
+function fmtBytes(b) {
+  if (!b) return '0 B';
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b/1048576).toFixed(1) + ' MB';
+  return (b/1073741824).toFixed(2) + ' GB';
+}
+
+function storageUpload() {
+  document.getElementById('storage-file-input').click();
+}
+
+async function storageDoUpload(input) {
+  const files = Array.from(input.files);
+  if (!files.length) return;
+  toast(`⏳ Uploading ${files.length} file(s)…`);
+  let ok = 0, fail = 0;
+  for (const file of files) {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('path', storagePath);
+    try {
+      const r = await fetch('/api/storage/upload', {method:'POST', body: fd});
+      const d = await r.json();
+      if (d.success) ok++; else { fail++; toast('❌ ' + file.name + ': ' + (d.error||'failed'), false); }
+    } catch(_) { fail++; toast('❌ Upload failed for ' + file.name, false); }
+  }
+  input.value = '';
+  if (ok) toast('✅ ' + ok + ' file(s) uploaded', true);
+  loadStorage(storagePath);
+}
+
+async function storageMkdir() {
+  const name = prompt('New folder name:');
+  if (!name || !name.trim()) return;
+  const safe = name.trim().replace(/[^a-zA-Z0-9_\-. ]/g, '_');
+  if (!safe) { toast('Invalid folder name', false); return; }
+  try {
+    const d = await api('/api/storage/mkdir', {method:'POST', body: JSON.stringify({path: (storagePath ? storagePath + '/' : '') + safe})});
+    if (d.success) { toast('📁 Folder created', true); loadStorage(storagePath); }
+    else toast(d.error || 'Failed to create folder', false);
+  } catch(_) { toast('Server error', false); }
+}
+
+async function storageDelete(path, type) {
+  const msg = type === 'folder'
+    ? 'Delete this folder and ALL its contents? This cannot be undone.'
+    : 'Delete this file? This cannot be undone.';
+  if (!confirm(msg)) return;
+  try {
+    const d = await api('/api/storage/delete', {method:'POST', body: JSON.stringify({path})});
+    if (d.success) { toast('🗑 Deleted', true); loadStorage(storagePath); }
+    else toast(d.error || 'Delete failed', false);
+  } catch(_) { toast('Server error', false); }
 }
 
 // ── Logout / Switch Account ───────────────────────────────────────────────
