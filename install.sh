@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CPM Panel — One-Shot Installer
+#  CPM Panel — One-Shot Installer  (v2 — owner-key security fix)
 #  GitHub : https://github.com/Amir565-ux/CPM-Panel
 #  Usage  : sudo bash install.sh
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -26,13 +26,12 @@ cat <<'BANNER'
   ╚██████╗██║     ██║ ╚═╝ ██║    ██║     ██║  ██║██║ ╚████║███████╗███████╗
    ╚═════╝╚═╝     ╚═╝     ╚═╝    ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝
 BANNER
-echo -e "${N}  KVM VPS Management Panel — Installer\n"
+echo -e "${N}  KVM VPS Management Panel — Installer v2\n"
 
 # ─── 1. System packages ───────────────────────────────────────────────────────
 sep "1/4  System packages"
 apt-get update -y
 apt-get install -y python3 python3-pip python3-venv python3-full curl tmate
-# Try installing Flask via apt (most reliable — no pip conflicts)
 apt-get install -y python3-flask python3-psutil 2>/dev/null || true
 
 # ─── 2. KVM / libvirt ─────────────────────────────────────────────────────────
@@ -46,10 +45,24 @@ ok "KVM stack installed"
 # ─── 3. Write app.py ──────────────────────────────────────────────────────────
 sep "3/4  Writing backend (app.py) and frontend (index.html)"
 
+# Copy pre-fixed app.py if running from the extracted package,
+# otherwise write it inline below.
+if [[ -f "$DIR/app.py" ]]; then
+  ok "app.py already present (using pre-fixed version)"
+else
 cat > "$DIR/app.py" << 'PYEOF'
 """
-CPM Panel — Flask backend
+CPM Panel — Flask backend  (v2 — owner-key security fix)
 GitHub: https://github.com/Amir565-ux/CPM-Panel
+
+Security changes vs v1
+----------------------
+* Removed hardcoded _OWNER_DEFAULT_KEY / _OWNER_DEFAULT_HASH.
+  No plaintext key or known hash ships with the source code.
+* Removed plaintext bypass: `or entered == _OWNER_DEFAULT_KEY.upper()`
+  in /api/user/activate — only hash comparison is used now.
+* _load() no longer backfills a default hash, so /api/owner/setup
+  is reachable on every fresh install.
 """
 import os, re, shutil, subprocess, logging, time, hashlib, json, uuid, secrets
 from datetime import datetime, timedelta, timezone
@@ -167,7 +180,7 @@ def cpu_percent():
             with open("/proc/stat") as f:
                 line = f.readline()
             vals = list(map(int, line.split()[1:]))
-            return vals[0]+vals[2], sum(vals)   # active, total
+            return vals[0]+vals[2], sum(vals)
         a1, t1 = read_cpu(); time.sleep(0.5); a2, t2 = read_cpu()
         dt = t2 - t1
         return round((a2 - a1) / dt * 100, 1) if dt else 0.0
@@ -277,14 +290,12 @@ def start():   return _action(request, "start")
 
 @app.route("/api/vps/stop",    methods=["POST"])
 def stop():
-    """Force-off (virsh destroy). Checks current state first to give a clear error."""
     err = _require_kvm()
     if err: return err
     data = request.get_json() or {}
     name = data.get("name", "")
     if not VM_RE.match(name):
         return jsonify({"error": "Invalid VM name"}), 400
-    # Check current state — destroy only works on running/paused VMs
     info = run_virsh("domstate", name, timeout=5)
     if info["success"]:
         state = info["output"].strip().lower()
@@ -292,7 +303,6 @@ def stop():
             return jsonify({"success": True, "message": f"VPS '{name}' is already stopped"})
     r = run_virsh("destroy", "--graceful", name, timeout=20)
     if not r["success"]:
-        # --graceful flag not supported on older libvirt, fall back to plain destroy
         r = run_virsh("destroy", name, timeout=20)
     if r["success"]:
         return jsonify({"success": True, "message": f"VPS '{name}' stopped (force-off)"})
@@ -300,33 +310,27 @@ def stop():
 
 @app.route("/api/vps/shutdown", methods=["POST"])
 def shutdown():
-    """Graceful ACPI shutdown — may not work if guest lacks ACPI support."""
     return _action(request, "shutdown")
 
 @app.route("/api/vps/restart", methods=["POST"])
 def restart():
-    """Hard reset (virsh reset) — always works regardless of guest ACPI support."""
     err = _require_kvm()
     if err: return err
     data = request.get_json() or {}
     name = data.get("name", "")
     if not VM_RE.match(name):
         return jsonify({"error": "Invalid VM name"}), 400
-    # Check current state
     info = run_virsh("domstate", name, timeout=5)
     if info["success"]:
         state = info["output"].strip().lower()
         if "shut off" in state or "shutoff" in state:
-            # VM is off — just start it
             r = run_virsh("start", name, timeout=30)
             if r["success"]:
                 return jsonify({"success": True, "message": f"VPS '{name}' was stopped — started"})
             return jsonify({"error": r["error"]}), 400
-    # VM is running — hard reset (like pressing physical reset button)
     r = run_virsh("reset", name, timeout=20)
     if r["success"]:
         return jsonify({"success": True, "message": f"VPS '{name}' restarted (hard reset)"})
-    # Fallback: destroy then start
     run_virsh("destroy", name, timeout=20)
     time.sleep(1)
     r2 = run_virsh("start", name, timeout=30)
@@ -379,12 +383,10 @@ def create():
 
 @app.route("/api/vps/tmate", methods=["POST"])
 def vps_tmate():
-    """Auto-install tmate if needed, start a session, return SSH / web strings."""
     data      = request.get_json() or {}
     name      = data.get("name", "panel")
     cmds_run  = []
 
-    # ── Step 1: install tmate if not present ─────────────────────────────────
     if not shutil.which("tmate"):
         log.info("tmate not found — installing via apt-get…")
         cmds_run.append("sudo apt install tmate -y")
@@ -398,11 +400,9 @@ def vps_tmate():
             }), 500
         log.info("tmate installed successfully")
 
-    # ── Step 2: start tmate session ───────────────────────────────────────────
     cmds_run.append("tmate")
     sock_path = f"/tmp/tmate-cpm-{re.sub(r'[^a-z0-9]', '', name.lower())}.sock"
 
-    # Kill stale session for this slot (ignore errors)
     subprocess.run(["tmate", "-S", sock_path, "kill-server"],
                    capture_output=True, timeout=5)
     time.sleep(0.3)
@@ -414,7 +414,6 @@ def vps_tmate():
     if r.returncode != 0:
         return jsonify({"error": f"tmate failed to start: {r.stderr.strip()}"}), 500
 
-    # ── Step 3: poll for tokens (tmate needs a moment to connect) ────────────
     ssh_cmd = web_url = ""
     for _ in range(30):
         time.sleep(0.5)
@@ -445,12 +444,13 @@ def vps_tmate():
         "cmds_run": cmds_run
     })
 
+
 # ── Data persistence ──────────────────────────────────────────────────────────
 _DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpm_data.json")
 
-# Pre-set owner key — change only by replacing this hash
-_OWNER_DEFAULT_KEY  = 'CPM1-V1C2-B2OW-N3R1'
-_OWNER_DEFAULT_HASH = hashlib.sha256(_OWNER_DEFAULT_KEY.encode()).hexdigest()
+# FIX: No default key or hash is hardcoded here.
+# On first run owner_key_hash is None; the setup screen is shown and the
+# real owner sets their own secret key via /api/owner/setup.
 
 _DEFAULT_FEATURES = {
     "dashboard":    {"name":"Dashboard",            "category":"System",       "tier":"free",    "usage":0},
@@ -466,22 +466,20 @@ _DEFAULT_FEATURES = {
 
 def _load():
     if not os.path.exists(_DATA_FILE):
-        d = {"owner_key_hash": _OWNER_DEFAULT_HASH, "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
+        # Fresh install — no owner key yet; setup screen will appear
+        d = {"owner_key_hash": None, "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
         _save(d)
         return d
     try:
         with open(_DATA_FILE) as f:
             d = json.load(f)
-        # Backfill owner hash if never set (upgrade from older install)
-        if not d.get("owner_key_hash"):
-            d["owner_key_hash"] = _OWNER_DEFAULT_HASH
-            _save(d)
-        # Merge any new default features
+        # Merge any new default features added in future versions
         for k, v in _DEFAULT_FEATURES.items():
             d.setdefault("features", {})[k] = d["features"].get(k, v)
         return d
     except Exception:
-        d = {"owner_key_hash": _OWNER_DEFAULT_HASH, "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
+        # Corrupted data — reset without injecting any default key
+        d = {"owner_key_hash": None, "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
         _save(d)
         return d
 
@@ -511,8 +509,11 @@ def _key_status(k):
 
 def _verify_owner(data):
     d = _load()
-    if not d.get("owner_key_hash"): return False
-    return _hash(data.get("owner_key", "")) == d["owner_key_hash"]
+    stored_hash = d.get("owner_key_hash")
+    if not stored_hash:
+        return False
+    return _hash(data.get("owner_key", "")) == stored_hash
+
 
 # ── Owner routes ───────────────────────────────────────────────────────────────
 @app.route("/api/owner/status")
@@ -530,6 +531,7 @@ def owner_setup():
         return jsonify({"error": "Key must be at least 6 characters"}), 400
     d["owner_key_hash"] = _hash(k)
     _save(d)
+    log.info("Owner key configured for the first time")
     return jsonify({"success": True})
 
 @app.route("/api/owner/auth", methods=["POST"])
@@ -598,6 +600,7 @@ def owner_delete_key():
         _save(d); return jsonify({"success": True})
     return jsonify({"error": "Not found"}), 404
 
+
 # ── Feature routes ─────────────────────────────────────────────────────────────
 @app.route("/api/features/status")
 def features_status():
@@ -629,13 +632,13 @@ def owner_analytics():
     feats = d.get("features", _DEFAULT_FEATURES)
     logs = d.get("activation_logs", [])
     return jsonify({
-        "total_keys":       len(keys),
-        "active_keys":      sum(1 for k in keys if k["status"] == "active"),
-        "used_keys":        sum(1 for k in keys if k["status"] == "used"),
+        "total_keys":        len(keys),
+        "active_keys":       sum(1 for k in keys if k["status"] == "active"),
+        "used_keys":         sum(1 for k in keys if k["status"] == "used"),
         "total_activations": len(logs),
-        "premium_features": sum(1 for f in feats.values() if f.get("tier") == "premium"),
-        "free_features":    sum(1 for f in feats.values() if f.get("tier") == "free"),
-        "recent_logs":      list(reversed(logs[-10:])),
+        "premium_features":  sum(1 for f in feats.values() if f.get("tier") == "premium"),
+        "free_features":     sum(1 for f in feats.values() if f.get("tier") == "free"),
+        "recent_logs":       list(reversed(logs[-10:])),
     })
 
 @app.route("/api/owner/logs", methods=["POST"])
@@ -644,6 +647,7 @@ def owner_logs():
     if not _verify_owner(data): return jsonify({"error": "Unauthorized"}), 403
     return jsonify({"logs": list(reversed(_load().get("activation_logs", [])))})
 
+
 # ── User activation ────────────────────────────────────────────────────────────
 @app.route("/api/user/activate", methods=["POST"])
 def user_activate():
@@ -651,10 +655,13 @@ def user_activate():
     entered = data.get("key", "").strip().upper()
     if not entered: return jsonify({"error": "No key provided"}), 400
     d = _load()
-    # Owner key also grants permanent premium access
-    if _hash(entered) == d.get("owner_key_hash") or entered == _OWNER_DEFAULT_KEY.upper():
+
+    # FIX: Only use hash comparison — no hardcoded plaintext bypass.
+    stored_hash = d.get("owner_key_hash")
+    if stored_hash and _hash(entered) == stored_hash:
         log.info("Owner key used for premium activation")
         return jsonify({"success": True, "expires_at": None, "key_id": "OWNER"})
+
     for k in d.get("premium_keys", []):
         if k["key"].upper() == entered:
             st = _key_status(k)
@@ -686,11 +693,14 @@ if __name__ == "__main__":
     log.info(f"CPM Panel listening on port {port}")
     app.run(host="0.0.0.0", port=port)
 PYEOF
-
 ok "app.py written"
+fi
 
-# ── Write index.html ──────────────────────────────────────────────────────────
-cat > "$DIR/index.html" << 'HTMLEOF'
+# Copy pre-extracted index.html if present, otherwise write it inline
+if [[ -f "$DIR/index.html" ]]; then
+  ok "index.html already present"
+else
+  cat > "$DIR/index.html" << 'HTMLEOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -996,21 +1006,46 @@ cat > "$DIR/index.html" << 'HTMLEOF'
     <div class="act-logo">
       <img src="/logo.png" alt="CPM Panel" onerror="this.parentElement.innerHTML='<div class=&quot;act-logo-fallback&quot;>CP</div>'"/>
     </div>
-    <div class="act-title">Activate Your Panel</div>
-    <div class="act-sub">Enter your paid activation key to unlock the full CPM Panel experience, or continue with the free version.</div>
+    <div class="act-title">CPM Panel</div>
+    <div class="act-sub">Enter your key to continue. Owner key opens the Owner Panel. Paid key activates Premium mode.</div>
     <div class="act-badge">
       <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
       CPM Panel &mdash; KVM VPS Manager
     </div>
-    <input class="act-input" id="act-key-input" type="text" placeholder="CPM-XXXX-XXXX-XXXX" maxlength="19" autocomplete="off" spellcheck="false"/>
-    <div class="act-err" id="act-err"></div>
-    <button class="act-btn act-btn-paid" id="act-btn-paid" onclick="activatePanel()">
-      🔑 Activate Panel
-    </button>
-    <div class="act-divider">or</div>
-    <button class="act-btn act-btn-free" onclick="useFreeVersion()" style="margin-top:8px">
-      Continue with Free Version
-    </button>
+
+    <!-- Normal key entry (shown by default) -->
+    <div id="act-main-form">
+      <input class="act-input" id="act-key-input" type="password" placeholder="Enter your key…" maxlength="64" autocomplete="off" spellcheck="false"/>
+      <div class="act-err" id="act-err"></div>
+      <button class="act-btn act-btn-paid" id="act-btn-paid" onclick="activatePanel()">
+        🔑 Access Panel
+      </button>
+      <div class="act-divider">or</div>
+      <button class="act-btn act-btn-free" onclick="useFreeVersion()" style="margin-top:8px">
+        Continue with Free Version
+      </button>
+      <div style="margin-top:14px;text-align:center">
+        <button onclick="showActSetup()" style="background:none;border:none;color:#475569;font-size:12px;cursor:pointer;text-decoration:underline">
+          First time? Set up owner key →
+        </button>
+      </div>
+    </div>
+
+    <!-- First-time owner setup (hidden by default) -->
+    <div id="act-setup-form" style="display:none">
+      <div style="font-size:13px;color:#94a3b8;margin-bottom:16px;line-height:1.6;text-align:left">
+        No owner key set yet. Create your secret owner key below.<br>
+        <strong style="color:#f59e0b">Keep it safe — it cannot be recovered.</strong>
+      </div>
+      <input class="act-input" id="act-setup-key" type="password" placeholder="Create owner key (min 6 chars)" maxlength="64" autocomplete="new-password"/>
+      <div class="act-err" id="act-setup-err"></div>
+      <button class="act-btn act-btn-paid" id="act-setup-btn" onclick="submitActOwnerSetup()">
+        🔐 Set Owner Key & Enter
+      </button>
+      <button class="act-btn act-btn-free" onclick="hideActSetup()" style="margin-top:6px">
+        ← Back
+      </button>
+    </div>
   </div>
 </div>
 
@@ -1037,13 +1072,16 @@ cat > "$DIR/index.html" << 'HTMLEOF'
       Create VPS
     </a>
   </nav>
-  <a onclick="openOwnerPanel()" id="nav-owner" style="margin-top:auto;background:linear-gradient(135deg,#fef3c7,#fde68a);color:#92400e;border-radius:8px;margin:0 10px 8px">
+  <a onclick="enterOwnerPanel()" id="nav-owner" style="display:none;margin-top:auto;background:linear-gradient(135deg,#fef3c7,#fde68a);color:#92400e;border-radius:8px;margin:0 10px 8px">
     <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M2 4l3 12h14l3-12-6 5-4-7-4 7-6-5z"/></svg>
     Owner Panel
   </a>
   <div class="sidebar-footer">
     <div><span class="status-dot" id="dot"></span><span class="status-label" id="status-txt">Connecting…</span></div>
     <div class="version">v1.0.0</div>
+    <button onclick="logoutPanel()" style="margin-top:8px;width:100%;background:none;border:1px solid var(--border);border-radius:6px;padding:5px 0;font-size:12px;color:var(--muted);cursor:pointer;transition:.15s" onmouseover="this.style.background='#fee2e2';this.style.color='#dc2626';this.style.borderColor='#fca5a5'" onmouseout="this.style.background='none';this.style.color='var(--muted)';this.style.borderColor='var(--border)'">
+      🔓 Logout / Switch Account
+    </button>
   </div>
 </aside>
 
@@ -1865,7 +1903,10 @@ const ACT_STORE_KEY = 'cpm_activation';
 
 function activationInit() {
   const saved = localStorage.getItem(ACT_STORE_KEY);
-  if (saved === 'premium' || saved === 'paid' || saved === 'free') {
+  if (saved === 'owner') {
+    ownerKeySession = localStorage.getItem('cpm_owner_key') || '';
+    hideActOverlay('owner');
+  } else if (saved === 'premium' || saved === 'paid' || saved === 'free') {
     hideActOverlay(saved);
   } else {
     document.getElementById('act-overlay').classList.remove('hidden');
@@ -1879,32 +1920,51 @@ function activationInit() {
 }
 
 async function activatePanel() {
-  const inp = document.getElementById('act-key-input');
-  const err = document.getElementById('act-err');
-  const btn = document.getElementById('act-btn-paid');
-  const key = inp.value.trim().toUpperCase();
-  if (!key) { inp.classList.add('error'); err.textContent = 'Please enter your activation key.'; return; }
+  const inp  = document.getElementById('act-key-input');
+  const err  = document.getElementById('act-err');
+  const btn  = document.getElementById('act-btn-paid');
+  const key  = inp.value.trim();
+  if (!key) { inp.classList.add('error'); err.textContent = 'Please enter your key.'; return; }
   btn.textContent = '⏳ Validating…'; btn.disabled = true;
+  err.textContent = '';
+
+  // 1 — try owner auth first
+  try {
+    const st = await api('/api/owner/status');
+    if (st.initialized) {
+      const od = await api('/api/owner/auth', {method:'POST', body:JSON.stringify({owner_key: key})});
+      if (od.success) {
+        ownerKeySession = key;
+        inp.classList.add('success');
+        localStorage.setItem(ACT_STORE_KEY, 'owner');
+        localStorage.setItem('cpm_owner_key', key);
+        btn.textContent = '✅ Owner Access!';
+        btn.style.background = 'linear-gradient(135deg,#d97706,#b45309)';
+        setTimeout(() => hideActOverlay('owner'), 700);
+        return;
+      }
+    }
+  } catch(_) {}
+
+  // 2 — try paid user activation
   try {
     const uid = 'u-' + Math.random().toString(36).slice(2, 9);
-    const d = await api('/api/user/activate', {method:'POST', body:JSON.stringify({key, user_id: uid})});
+    const d = await api('/api/user/activate', {method:'POST', body:JSON.stringify({key: key.toUpperCase(), user_id: uid})});
     if (d.success) {
       inp.classList.add('success');
       localStorage.setItem(ACT_STORE_KEY, 'premium');
-      localStorage.setItem('cpm_premium_key', key);
+      localStorage.setItem('cpm_premium_key', key.toUpperCase());
       if (d.expires_at) localStorage.setItem('cpm_premium_expires', d.expires_at);
-      btn.textContent = '✅ Activated!';
+      btn.textContent = '✅ Premium Activated!';
       btn.style.background = 'linear-gradient(135deg,#16a34a,#15803d)';
       setTimeout(() => hideActOverlay('premium'), 700);
-    } else {
-      inp.classList.add('error');
-      err.textContent = '❌ ' + (d.error || 'Invalid key');
-      btn.textContent = '🔑 Activate Panel'; btn.disabled = false;
+      return;
     }
-  } catch(e) {
-    err.textContent = '❌ Server error — try again';
-    btn.textContent = '🔑 Activate Panel'; btn.disabled = false;
-  }
+  } catch(_) {}
+
+  inp.classList.add('error');
+  err.textContent = '❌ Invalid key — check it and try again.';
+  btn.textContent = '🔑 Access Panel'; btn.disabled = false;
 }
 
 function useFreeVersion() {
@@ -1914,6 +1974,14 @@ function useFreeVersion() {
 
 function hideActOverlay(mode) {
   document.getElementById('act-overlay').classList.add('hidden');
+  const nav = document.getElementById('nav-owner');
+  if (mode === 'owner') {
+    nav.style.display = 'flex';
+    updatePlanBadge(); loadFeatureMap();
+    enterOwnerPanel();
+    return;
+  }
+  nav.style.display = 'none';
   updatePlanBadge(); loadFeatureMap();
   const banner = document.getElementById('act-mode-banner');
   if (mode === 'premium' || mode === 'paid') {
@@ -1921,21 +1989,63 @@ function hideActOverlay(mode) {
     banner.textContent = '👑 Premium — All features unlocked';
   } else {
     banner.className = 'act-mode-banner free';
-    banner.textContent = '🔓 Free Version — Enter a premium key to unlock all features';
+    banner.textContent = '🔓 Free Version — Enter a key to unlock features';
   }
   banner.style.display = 'block';
   setTimeout(() => { banner.style.display = 'none'; }, 5000);
 }
 
+// ── First-time owner setup inside startup dialog ──────────────────────────
+async function showActSetup() {
+  try {
+    const st = await api('/api/owner/status');
+    if (st.initialized) {
+      document.getElementById('act-err').textContent = 'Owner key already set. Enter it above.';
+      return;
+    }
+  } catch(_) {}
+  document.getElementById('act-main-form').style.display = 'none';
+  document.getElementById('act-setup-form').style.display = 'block';
+  setTimeout(() => { const i = document.getElementById('act-setup-key'); if (i) { i.focus(); i.addEventListener('keydown', e => { if (e.key === 'Enter') submitActOwnerSetup(); }); } }, 50);
+}
+
+function hideActSetup() {
+  document.getElementById('act-setup-form').style.display = 'none';
+  document.getElementById('act-main-form').style.display = 'block';
+  document.getElementById('act-setup-err').textContent = '';
+}
+
+async function submitActOwnerSetup() {
+  const inp = document.getElementById('act-setup-key');
+  const err = document.getElementById('act-setup-err');
+  const btn = document.getElementById('act-setup-btn');
+  const key = inp.value.trim();
+  if (key.length < 6) { err.textContent = 'Key must be at least 6 characters.'; return; }
+  btn.textContent = '⏳ Setting up…'; btn.disabled = true;
+  try {
+    const d = await api('/api/owner/setup', {method:'POST', body:JSON.stringify({owner_key: key})});
+    if (d.success) {
+      ownerKeySession = key;
+      localStorage.setItem(ACT_STORE_KEY, 'owner');
+      localStorage.setItem('cpm_owner_key', key);
+      btn.textContent = '✅ Done!';
+      btn.style.background = 'linear-gradient(135deg,#d97706,#b45309)';
+      setTimeout(() => hideActOverlay('owner'), 700);
+    } else {
+      err.textContent = '❌ ' + (d.error || 'Setup failed');
+      btn.textContent = '🔐 Set Owner Key & Enter'; btn.disabled = false;
+    }
+  } catch(_) {
+    err.textContent = '❌ Server error — try again';
+    btn.textContent = '🔐 Set Owner Key & Enter'; btn.disabled = false;
+  }
+}
+
 // ── Owner panel ───────────────────────────────────────────────────────────
 let ownerKeySession = '';
 
-async function openOwnerPanel() {
-  try {
-    const st = await api('/api/owner/status');
-    if (!st.initialized) { showOwnerSetup(); } else { showOwnerAuth(); }
-    document.getElementById('owner-modal-overlay').classList.add('open');
-  } catch(e) { toast('Cannot reach server', false); }
+function openOwnerPanel() {
+  enterOwnerPanel();
 }
 
 function closeOwnerModal() {
@@ -2154,6 +2264,13 @@ async function ownerLoadLogs() {
   } catch(e) { el.innerHTML = '<div style="color:#dc2626">Failed to load logs</div>'; }
 }
 
+// ── Logout / Switch Account ───────────────────────────────────────────────
+function logoutPanel() {
+  if (!confirm('Log out and return to the startup screen?')) return;
+  ['cpm_activation','cpm_owner_key','cpm_premium_key','cpm_premium_expires'].forEach(k => localStorage.removeItem(k));
+  location.reload();
+}
+
 // ── init & poll ───────────────────────────────────────────────────────────
 activationInit();
 checkKvmStatus();
@@ -2164,9 +2281,10 @@ setInterval(checkKvmStatus, 30000);
 </script>
 </body>
 </html>
-HTMLEOF
 
-ok "index.html written"
+HTMLEOF
+  ok "index.html written"
+fi
 
 # ── Write requirements.txt ────────────────────────────────────────────────────
 cat > "$DIR/requirements.txt" << 'EOF'
@@ -2176,15 +2294,28 @@ psutil>=6.0.0
 # tmate is installed as a system package (apt), not via pip
 EOF
 
+# ── Write run.sh ──────────────────────────────────────────────────────────────
+cat > "$DIR/run.sh" << 'RUNEOF'
+#!/usr/bin/env bash
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PORT="${PORT:-5000}"
+if [[ -f "$DIR/venv/bin/python3" ]]; then PYTHON="$DIR/venv/bin/python3"
+else PYTHON="$(which python3)"; fi
+echo "  Starting CPM Panel on port $PORT …"
+cd "$DIR"
+PORT="$PORT" "$PYTHON" app.py
+RUNEOF
+chmod +x "$DIR/run.sh"
+ok "run.sh written"
+
 # Copy logo if it exists next to install.sh
 [[ -f "$DIR/logo.png" ]] && ok "logo.png found" || wrn "logo.png not found in $DIR — sidebar will show text brand"
 
-# ── 4. Install Python packages ─────────────────────────────────────────────────
+# ─── 4. Install Python packages ─────────────────────────────────────────────────
 sep "4/4  Installing Python packages"
 
 PKGS="flask flask-cors psutil"
 
-# ── Step 4a: Build / ensure venv ──────────────────────────────────────────────
 inf "Creating virtual environment…"
 if python3 -m venv "$DIR/venv" 2>/dev/null && [[ -f "$DIR/venv/bin/pip" ]]; then
   ok "venv ready at $DIR/venv"
@@ -2193,63 +2324,31 @@ else
   rm -rf "$DIR/venv"
 fi
 
-# ── Resolve Python / pip to use ───────────────────────────────────────────────
 if [[ -f "$DIR/venv/bin/python3" ]]; then
   PYTHON="$DIR/venv/bin/python3"
   PIP="$DIR/venv/bin/pip"
 else
   PYTHON="$(which python3)"
-  PIP=""   # determined per-attempt below
+  PIP=""
 fi
 ok "Python: $PYTHON"
 
-# ── Helper: install one package, trying every known method ───────────────────
 install_pkg() {
   local pkg="$1"
-  # Already installed?
   if "$PYTHON" -c "import ${pkg//-/_}" 2>/dev/null; then
-    ok "$pkg already available"
-    return 0
+    ok "$pkg already available"; return 0
   fi
   inf "Installing $pkg…"
-  # venv pip (fastest, cleanest)
-  if [[ -n "$PIP" ]] && "$PIP" install "$pkg" -q 2>/dev/null; then
-    ok "$pkg installed (venv pip)"
-    return 0
-  fi
-  # pip3 --break-system-packages  (Ubuntu 22.04+ / Debian 12+)
-  if pip3 install --break-system-packages "$pkg" -q 2>/dev/null; then
-    ok "$pkg installed (pip3 --break-system-packages)"
-    return 0
-  fi
-  # pip3 plain  (older systems)
-  if pip3 install "$pkg" -q 2>/dev/null; then
-    ok "$pkg installed (pip3)"
-    return 0
-  fi
-  # python3 -m pip variants
-  if "$PYTHON" -m pip install --break-system-packages "$pkg" -q 2>/dev/null; then
-    ok "$pkg installed (python3 -m pip --break-system-packages)"
-    return 0
-  fi
-  if "$PYTHON" -m pip install "$pkg" -q 2>/dev/null; then
-    ok "$pkg installed (python3 -m pip)"
-    return 0
-  fi
-  # pipx as absolute last resort (available on some systems)
-  if command -v pipx &>/dev/null && pipx install "$pkg" -q 2>/dev/null; then
-    ok "$pkg installed (pipx)"
-    return 0
-  fi
+  if [[ -n "$PIP" ]] && "$PIP" install "$pkg" -q 2>/dev/null; then ok "$pkg installed (venv pip)"; return 0; fi
+  if pip3 install --break-system-packages "$pkg" -q 2>/dev/null; then ok "$pkg installed (pip3 --break-system-packages)"; return 0; fi
+  if pip3 install "$pkg" -q 2>/dev/null; then ok "$pkg installed (pip3)"; return 0; fi
+  if "$PYTHON" -m pip install --break-system-packages "$pkg" -q 2>/dev/null; then ok "$pkg installed (python3 -m pip --break-system-packages)"; return 0; fi
+  if "$PYTHON" -m pip install "$pkg" -q 2>/dev/null; then ok "$pkg installed (python3 -m pip)"; return 0; fi
   die "FAILED to install $pkg — check your network / pip setup and re-run install.sh"
 }
 
-# ── Step 4b: Install every package (individually so one failure doesn't block others) ──
-for pkg in $PKGS; do
-  install_pkg "$pkg"
-done
+for pkg in $PKGS; do install_pkg "$pkg"; done
 
-# ── Step 4c: Final verification — every package must import ──────────────────
 sep "Verifying all packages"
 ALL_OK=true
 for pkg in flask flask_cors psutil; do
@@ -2266,7 +2365,7 @@ for pkg in flask flask_cors psutil; do
     fi
   fi
 done
-[[ "$ALL_OK" == true ]] && ok "All packages verified — WebSocket terminal will work"
+[[ "$ALL_OK" == true ]] && ok "All packages verified"
 
 # ── done ──────────────────────────────────────────────────────────────────────
 echo ""
@@ -2279,5 +2378,9 @@ echo -e "    ${Y}bash run.sh${N}"
 echo ""
 echo -e "  Then open:"
 echo -e "    ${Y}http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo localhost):5000${N}"
+echo ""
+echo -e "  ${Y}FIRST-TIME SETUP:${N}"
+echo -e "    Click 'Owner Panel' in the sidebar and create your secret owner key."
+echo -e "    No default key is pre-set — you choose your own on first run."
 echo ""
 [[ -n "${SUDO_USER:-}" ]] && echo -e "  ${Y}NOTE:${N} Log out and back in so '$SUDO_USER' can use virsh without sudo."
