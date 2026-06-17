@@ -465,38 +465,55 @@ _DEFAULT_FEATURES = {
 }
 
 def _load():
-    @app.route("/api/user/activate", methods=["POST"])
-def activate_user():
+    if not os.path.exists(_DATA_FILE):
+        d = {"owner_key_hash": _OWNER_DEFAULT_HASH, "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
+        _save(d)
+        return d
+    try:
+        with open(_DATA_FILE) as f:
+            d = json.load(f)
+        # Backfill owner hash if never set (upgrade from older install)
+        if not d.get("owner_key_hash"):
+            d["owner_key_hash"] = _OWNER_DEFAULT_HASH
+            _save(d)
+        # Merge any new default features
+        for k, v in _DEFAULT_FEATURES.items():
+            d.setdefault("features", {})[k] = d["features"].get(k, v)
+        return d
+    except Exception:
+        d = {"owner_key_hash": _OWNER_DEFAULT_HASH, "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
+        _save(d)
+        return d
+
+def _save(d):
+    try:
+        with open(_DATA_FILE, "w") as f:
+            json.dump(d, f, indent=2, default=str)
+    except Exception as e:
+        log.error(f"Data save failed: {e}")
+
+def _hash(k): return hashlib.sha256(k.encode()).hexdigest()
+
+def _now(): return datetime.now(timezone.utc).isoformat()
+
+def _key_status(k):
+    now = datetime.now(timezone.utc)
+    if k.get("revoked"): return "revoked"
+    if k.get("expires_at"):
+        try:
+            exp = datetime.fromisoformat(k["expires_at"])
+            if not exp.tzinfo: exp = exp.replace(tzinfo=timezone.utc)
+            if now > exp: return "expired"
+        except Exception: pass
+    um, uc = k.get("uses_max", 1), k.get("uses_count", 0)
+    if um != -1 and uc >= um: return "used"
+    return "active"
+
+def _verify_owner(data):
     d = _load()
-    data = request.get_json() or {}
+    if not d.get("owner_key_hash"): return False
+    return _hash(data.get("owner_key", "")) == d["owner_key_hash"]
 
-    key = (data.get("key") or "").strip()
-    if not key:
-        return jsonify({"status": "error", "message": "Key required"}), 400
-
-    # OWNER CHECK
-    if _hash(key) == d.get("owner_key_hash"):
-        return jsonify({
-            "status": "success",
-            "type": "owner",
-            "access": "full",
-            "message": "Owner access granted"
-        })
-
-    # PREMIUM CHECK
-    for k in d.get("premium_keys", []):
-        if k == key or _hash(k) == _hash(key):
-            return jsonify({
-                "status": "success",
-                "type": "premium",
-                "access": "premium",
-                "message": "Premium activated"
-            })
-
-    return jsonify({
-        "status": "error",
-        "message": "Invalid activation key — check your key and try again"
-    }), 401
 # ── Owner routes ───────────────────────────────────────────────────────────────
 @app.route("/api/owner/status")
 def owner_status():
