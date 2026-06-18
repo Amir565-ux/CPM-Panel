@@ -463,7 +463,7 @@ _DEFAULT_FEATURES = {
 def _load():
     if not os.path.exists(_DATA_FILE):
         # Fresh install — no owner key set yet; setup screen will appear
-        d = {"owner_key_hash": 4a91e7573bef598f06cc8abfae6234b8d4a024bd65a1c17985e309bd6fd87dd2, "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
+        d = {"owner_key_hash":"4a91e7573bef598f06cc8abfae6234b8d4a024bd65a1c17985e309bd6fd87dd2","premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
         _save(d)
         return d
     try:
