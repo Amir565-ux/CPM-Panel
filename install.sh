@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CPM Panel — One-Shot Installer  (v2 — owner-key security fix)
+#  CPM Panel — One-Shot Installer  (v1 — owner-key security fix)
 #  GitHub : https://github.com/Amir565-ux/CPM-Panel
 #  Usage  : sudo bash install.sh
 #  ⚡POWERED BY ABDULLAH
@@ -27,7 +27,7 @@ cat <<'BANNER'
   ╚██████╗██║     ██║ ╚═╝ ██║    ██║     ██║  ██║██║ ╚████║███████╗███████╗
    ╚═════╝╚═╝     ╚═╝     ╚═╝    ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝
 BANNER
-echo -e "${N}  KVM VPS Management Panel — Installer v1\n ⚡POWERED BY ABDULLAH"
+echo -e "${N}  KVM VPS Management Panel — Installer v2\n"
 
 # ─── 1. System packages ───────────────────────────────────────────────────────
 sep "1/4  System packages"
@@ -463,7 +463,7 @@ _DEFAULT_FEATURES = {
 def _load():
     if not os.path.exists(_DATA_FILE):
         # Fresh install — no owner key set yet; setup screen will appear
-        d = {"owner_key_hash":"4a91e7573bef598f06cc8abfae6234b8d4a024bd65a1c17985e309bd6fd87dd2","premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
+        d = {"owner_key_hash": 4a91e7573bef598f06cc8abfae6234b8d4a024bd65a1c17985e309bd6fd87dd2, "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
         _save(d)
         return d
     try:
@@ -475,7 +475,8 @@ def _load():
         return d
     except Exception:
         # Corrupted data file — reset (but do NOT inject a default key)
-        d = {"owner_key_hash":"4a91e7573bef598f06cc8abfae6234b8d4a024bd65a1c17985e309bd6fd87dd2", "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
+        
+ "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
         _save(d)
         return d
 
