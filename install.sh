@@ -458,15 +458,18 @@ def vps_tmate():
 _DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpm_data.json")
 
 _DEFAULT_FEATURES = {
-    "dashboard":    {"name":"Dashboard",            "category":"System",       "tier":"free",    "usage":0},
-    "system_stats": {"name":"System Statistics",    "category":"Monitoring",   "tier":"free",    "usage":0},
-    "vps_list":     {"name":"View VPS Instances",   "category":"VPS",          "tier":"free",    "usage":0},
-    "vps_start":    {"name":"Start VPS",            "category":"VPS Control",  "tier":"free",    "usage":0},
-    "vps_stop":     {"name":"Stop VPS",             "category":"VPS Control",  "tier":"free",    "usage":0},
-    "vps_restart":  {"name":"Restart VPS",          "category":"VPS Control",  "tier":"free",    "usage":0},
-    "vps_delete":   {"name":"Delete VPS",           "category":"VPS Control",  "tier":"premium", "usage":0},
-    "vps_create":   {"name":"Create VPS",           "category":"VPS Control",  "tier":"premium", "usage":0},
-    "ssh_access":   {"name":"SSH Access (tmate)",   "category":"Connectivity", "tier":"premium", "usage":0},
+    "dashboard":     {"name":"Dashboard",            "category":"System",       "tier":"free",    "usage":0},
+    "system_stats":  {"name":"System Statistics",    "category":"Monitoring",   "tier":"free",    "usage":0},
+    "vps_list":      {"name":"View VPS Instances",   "category":"VPS",          "tier":"free",    "usage":0},
+    "vps_stop":      {"name":"Stop VPS",             "category":"VPS Control",  "tier":"free",    "usage":0},
+    "vps_start":     {"name":"Start VPS",            "category":"VPS Control",  "tier":"premium", "usage":0},
+    "vps_restart":   {"name":"Restart VPS",          "category":"VPS Control",  "tier":"premium", "usage":0},
+    "vps_delete":    {"name":"Delete VPS",           "category":"VPS Control",  "tier":"premium", "usage":0},
+    "vps_create":    {"name":"Create VPS",           "category":"VPS Control",  "tier":"premium", "usage":0},
+    "ssh_access":    {"name":"SSH Access (tmate)",   "category":"Connectivity", "tier":"premium", "usage":0},
+    "file_manager":  {"name":"File Manager",         "category":"Storage",      "tier":"premium", "usage":0},
+    "file_upload":   {"name":"Upload File",          "category":"Storage",      "tier":"premium", "usage":0},
+    "file_download": {"name":"Download File",        "category":"Storage",      "tier":"premium", "usage":0},
 }
 
 def _hash(k): return hashlib.sha256(k.encode()).hexdigest()
@@ -695,24 +698,8 @@ def owner_delete_key():
 # ── Feature routes ─────────────────────────────────────────────────────────────
 @app.route("/api/features/status")
 def features_status():
-    return jsonify({"features": _load().get("features", _DEFAULT_FEATURES)})
-
-@app.route("/api/owner/features", methods=["POST"])
-def owner_features():
-    data = request.get_json() or {}
-    if not _verify_owner(data): return jsonify({"error": "Unauthorized"}), 403
-    return jsonify({"features": _load().get("features", _DEFAULT_FEATURES)})
-
-@app.route("/api/owner/features/toggle", methods=["POST"])
-def owner_feature_toggle():
-    data = request.get_json() or {}
-    if not _verify_owner(data): return jsonify({"error": "Unauthorized"}), 403
-    fid, tier = data.get("feature_id", ""), data.get("tier", "free")
-    d = _load(); feats = d.setdefault("features", dict(_DEFAULT_FEATURES))
-    if fid not in feats: return jsonify({"error": "Feature not found"}), 404
-    feats[fid]["tier"] = tier; _save(d)
-    log.info(f"Feature '{fid}' -> {tier}")
-    return jsonify({"success": True, "feature_id": fid, "tier": tier})
+    # Features are hardcoded — tiers cannot be changed via UI
+    return jsonify({"features": _DEFAULT_FEATURES})
 
 @app.route("/api/owner/analytics", methods=["POST"])
 def owner_analytics():
@@ -1399,7 +1386,7 @@ else
       <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
       Create VPS
     </a>
-    <a onclick="showPage('storage',this);storageOpen()">
+    <a onclick="openStorageWithCheck(this)">
       <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4.03 3-9 3S3 13.66 3 12"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/></svg>
       Cloud Storage
     </a>
@@ -1628,7 +1615,6 @@ else
       <div class="owner-tabs">
         <button class="owner-tab active" onclick="ownerTab('analytics',this)">📊 Analytics</button>
         <button class="owner-tab" onclick="ownerTab('keys',this)">🔑 Keys</button>
-        <button class="owner-tab" onclick="ownerTab('features',this)">⚙️ Features</button>
         <button class="owner-tab" onclick="ownerTab('logs',this)">📋 Logs</button>
       </div>
 
@@ -1639,8 +1625,6 @@ else
           <div class="ana-card"><div class="ana-num" style="color:var(--green)">—</div><div class="ana-label">Active Keys</div></div>
           <div class="ana-card"><div class="ana-num" style="color:#0369a1">—</div><div class="ana-label">Used Keys</div></div>
           <div class="ana-card"><div class="ana-num" style="color:#7c3aed">—</div><div class="ana-label">Activations</div></div>
-          <div class="ana-card"><div class="ana-num" style="color:#d97706">—</div><div class="ana-label">Premium Features</div></div>
-          <div class="ana-card"><div class="ana-num" style="color:var(--muted)">—</div><div class="ana-label">Free Features</div></div>
         </div>
         <div class="card">
           <div class="card-header"><div class="card-title">Recent Activations</div></div>
@@ -1709,19 +1693,6 @@ else
         </div>
       </div>
 
-      <!-- Feature Control -->
-      <div class="owner-tab-panel" id="otab-features">
-        <div class="card">
-          <div class="card-header">
-            <div class="card-title">Feature Access Control</div>
-            <input class="search-inp" id="feat-search" placeholder="Search features…" oninput="ownerLoadFeatures()"/>
-          </div>
-          <div class="card-body" id="feat-list">
-            <div style="color:var(--muted);font-size:14px">Loading…</div>
-          </div>
-        </div>
-      </div>
-
       <!-- Logs -->
       <div class="owner-tab-panel" id="otab-logs">
         <div class="card">
@@ -1765,9 +1736,9 @@ else
             <span onclick="storageTo('')" style="cursor:pointer;color:var(--blue);font-weight:600">📁 Storage</span>
           </div>
           <div class="storage-toolbar">
-            <button class="btn" onclick="storageUpload()" style="background:var(--blue);color:#fff;display:flex;align-items:center;gap:6px">
+            <button class="btn" onclick="requirePremium('file_upload',()=>storageUpload())" style="background:var(--blue);color:#fff;display:flex;align-items:center;gap:6px">
               <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
-              Upload File
+              Upload File 👑
             </button>
             <button class="btn" onclick="storageMkdir()" style="display:flex;align-items:center;gap:6px">
               <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>
@@ -2014,14 +1985,14 @@ function renderQuickActions(name) {
   const isStopped = vm.state==='stopped';
   body.innerHTML = `
     <div class="qa-btns">
-      <button class="qa-btn qa-start"   ${isRunning?'disabled':''} onclick="dashAction('start')">
-        <svg width="15" height="15" fill="currentColor" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg> Start Instance
+      <button class="qa-btn qa-start"   ${isRunning?'disabled':''} onclick="requirePremium('vps_start',()=>dashAction('start'))">
+        <svg width="15" height="15" fill="currentColor" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg> Start Instance 👑
       </button>
       <button class="qa-btn qa-stop"    ${isStopped?'disabled':''} onclick="dashAction('stop')">
         <svg width="15" height="15" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg> Stop Instance
       </button>
-      <button class="qa-btn qa-restart" ${isStopped?'disabled':''} onclick="dashAction('restart')">
-        <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Restart Instance
+      <button class="qa-btn qa-restart" ${isStopped?'disabled':''} onclick="requirePremium('vps_restart',()=>dashAction('restart'))">
+        <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Restart Instance 👑
       </button>
       <button class="qa-btn qa-ssh" onclick="openSsh('${name}')">
         <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg> Get SSH Access
@@ -2071,16 +2042,16 @@ function selectVps(name) {
       <span class="badge ${badgeClass(vm?.state||'unknown')}" style="margin-left:auto">${vm?.state||'unknown'}</span>
     </div>
     <div class="action-btns">
-      <button class="btn btn-start"   onclick="doAction('start')"   ${isRunning?'disabled':''}>
+      <button class="btn btn-start"   onclick="requirePremium('vps_start',()=>doAction('start'))"   ${isRunning?'disabled':''}>
         <svg width="13" height="13" fill="currentColor" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>Start</button>
       <button class="btn btn-stop"    onclick="doAction('stop')"    ${isStopped?'disabled':''}>
         <svg width="13" height="13" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>Stop</button>
-      <button class="btn btn-restart" onclick="doAction('restart')" ${isStopped?'disabled':''}>
+      <button class="btn btn-restart" onclick="requirePremium('vps_restart',()=>doAction('restart'))" ${isStopped?'disabled':''}>
         <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>Restart</button>
       <button class="btn btn-delete"  onclick="confirmDelete('${name}')">
         <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>Delete</button>
       <button class="btn btn-ssh" onclick="openSsh('${name}')" style="grid-column:1/-1">
-        <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>Get SSH Access</button>
+        <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>Get SSH Access 👑</button>
     </div>`;
 }
 
@@ -2535,7 +2506,6 @@ function ownerTab(tab, btn) {
   document.getElementById('otab-' + tab).classList.add('active');
   if (tab === 'analytics') ownerLoadAnalytics();
   else if (tab === 'keys') ownerLoadKeys();
-  else if (tab === 'features') ownerLoadFeatures();
   else if (tab === 'logs') ownerLoadLogs();
 }
 
@@ -2554,8 +2524,6 @@ async function ownerLoadAnalytics() {
       ['Active Keys', d.active_keys, '#16a34a'],
       ['Used Keys', d.used_keys, '#0369a1'],
       ['Activations', d.total_activations, '#7c3aed'],
-      ['Premium Features', d.premium_features, '#d97706'],
-      ['Free Features', d.free_features, '#64748b'],
     ];
     el.innerHTML = stats.map(([label, num, color]) =>
       `<div class="ana-card"><div class="ana-num" style="color:${color}">${num ?? 0}</div><div class="ana-label">${label}</div></div>`
@@ -2621,44 +2589,6 @@ async function ownerDeleteKey(id) {
   catch(e) { toast('Failed', false); }
 }
 
-async function ownerLoadFeatures() {
-  const el = document.getElementById('feat-list');
-  if (!el) return;
-  const search = (document.getElementById('feat-search')?.value || '').toLowerCase();
-  try {
-    const d = await ownerPost('/api/owner/features');
-    const feats = d.features || {};
-    const rows = Object.entries(feats)
-      .filter(([id, f]) => !search || f.name.toLowerCase().includes(search) || f.category.toLowerCase().includes(search));
-    el.innerHTML = rows.length
-      ? rows.map(([id, f]) => `
-        <div class="feat-row">
-          <div class="feat-info">
-            <div class="feat-name">${f.name}</div>
-            <div class="feat-cat">${f.category}</div>
-          </div>
-          <div class="tier-toggle">
-            <button class="tier-btn ${f.tier==='free'?'active-free':''}" onclick="ownerToggleFeature('${id}','free',this)">🟢 Free</button>
-            <button class="tier-btn ${f.tier==='premium'?'active-premium':''}" onclick="ownerToggleFeature('${id}','premium',this)">👑 Premium</button>
-          </div>
-        </div>`).join('')
-      : '<div style="color:var(--muted);padding:16px">No features found</div>';
-  } catch(e) { el.innerHTML = '<div style="color:#dc2626">Failed to load features</div>'; }
-}
-
-async function ownerToggleFeature(featureId, tier, btn) {
-  try {
-    const d = await ownerPost('/api/owner/features/toggle', {feature_id: featureId, tier});
-    if (d.success) {
-      if (featureMap[featureId]) featureMap[featureId].tier = tier;
-      const toggle = btn.closest('.tier-toggle');
-      toggle.querySelectorAll('.tier-btn').forEach(b => b.className = 'tier-btn');
-      btn.classList.add(tier === 'free' ? 'active-free' : 'active-premium');
-      updatePlanBadge();
-    } else { toast(d.error || 'Failed', false); }
-  } catch(e) { toast('Server error', false); }
-}
-
 async function ownerLoadLogs() {
   const el = document.getElementById('log-list');
   if (!el) return;
@@ -2678,6 +2608,10 @@ async function ownerLoadLogs() {
 
 // ── Cloud Storage ─────────────────────────────────────────────────────────
 let storagePath = '';
+
+function openStorageWithCheck(el) {
+  requirePremium('file_manager', () => { showPage('storage', el); storageOpen(); });
+}
 
 function storageOpen() { loadStorage(''); }
 
@@ -2710,7 +2644,7 @@ async function loadStorage(path) {
             <td style="color:var(--muted);font-size:12px">${f.type === 'folder' ? '—' : fmtBytes(f.size)}</td>
             <td style="color:var(--muted);font-size:12px;white-space:nowrap">${f.modified}</td>
             <td style="text-align:right;white-space:nowrap">
-              ${f.type === 'file' ? `<a href="/api/storage/download?path=${encodeURIComponent(fullRel)}" download="${f.name}" class="tbl-btn" style="text-decoration:none;display:inline-block">⬇ Download</a>` : ''}
+              ${f.type === 'file' ? `<button class="tbl-btn" onclick="requirePremium('file_download',()=>{ window.location='/api/storage/download?path=${encodeURIComponent(fullRel)}'; })" style="display:inline-block">⬇ Download 👑</button>` : ''}
               <button class="tbl-btn tbl-btn-delete" onclick="storageDelete('${esc}','${f.type}')">🗑 Delete</button>
             </td>
           </tr>`;
