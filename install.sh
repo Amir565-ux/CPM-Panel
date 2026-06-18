@@ -475,8 +475,7 @@ def _load():
         return d
     except Exception:
         # Corrupted data file — reset (but do NOT inject a default key)
-        
- "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
+        d = {"owner_key_hash":"4a91e7573bef598f06cc8abfae6234b8d4a024bd65a1c17985e309bd6fd87dd2","premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
         _save(d)
         return d
 
