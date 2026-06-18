@@ -72,6 +72,19 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
+# ── Supabase client ────────────────────────────────────────────────────────────
+try:
+    from supabase import create_client, Client as SupabaseClient
+    _SB_URL = os.environ.get("SUPABASE_URL", "https://vompmplmluxwtwgofgks.supabase.co")
+    _SB_KEY = os.environ.get("SUPABASE_KEY", "sb_secret_9E5gznEQ0m-6w2zkYT2j4Q_OEBJyWO8")
+    _sb: SupabaseClient = create_client(_SB_URL, _SB_KEY)
+    HAS_SUPABASE = True
+    logging.getLogger(__name__).info("Supabase connected ✓")
+except Exception as _sb_err:
+    _sb = None
+    HAS_SUPABASE = False
+    logging.getLogger(__name__).warning(f"Supabase not available ({_sb_err}) — using local JSON fallback")
+
 app = Flask(__name__)
 if HAS_CORS:
     CORS(app)
@@ -444,10 +457,6 @@ def vps_tmate():
 # ── Data persistence ──────────────────────────────────────────────────────────
 _DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpm_data.json")
 
-# FIX: No default key or hash is hardcoded here.
-# On first run, owner_key_hash is None, the setup screen is shown,
-# and the real owner sets their own secret key.
-
 _DEFAULT_FEATURES = {
     "dashboard":    {"name":"Dashboard",            "category":"System",       "tier":"free",    "usage":0},
     "system_stats": {"name":"System Statistics",    "category":"Monitoring",   "tier":"free",    "usage":0},
@@ -460,42 +469,98 @@ _DEFAULT_FEATURES = {
     "ssh_access":   {"name":"SSH Access (tmate)",   "category":"Connectivity", "tier":"premium", "usage":0},
 }
 
-def _load():
-    if not os.path.exists(_DATA_FILE):
-        # Fresh install — default owner key pre-set
-        d = {"owner_key_hash": "4a91e7573bef598f06cc8abfae6234b8d4a024bd65a1c17985e309bd6fd87dd2", "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
-        _save(d)
+def _hash(k): return hashlib.sha256(k.encode()).hexdigest()
+def _now(): return datetime.now(timezone.utc).isoformat()
+
+# ── Supabase helpers ───────────────────────────────────────────────────────────
+
+def _sb_load():
+    """Load full data dict from Supabase cpm_config table."""
+    try:
+        rows = _sb.table("cpm_config").select("key,value").execute().data
+        d = {"premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": [], "owner_key_hash": None}
+        for row in rows:
+            if row["key"] == "owner_key_hash":
+                d["owner_key_hash"] = row["value"].get("v") if isinstance(row["value"], dict) else row["value"]
+            elif row["key"] == "features":
+                d["features"] = row["value"]
+        # Load premium keys from dedicated table
+        keys = _sb.table("cpm_premium_keys").select("*").execute().data or []
+        d["premium_keys"] = keys
+        # Load activation logs
+        logs = _sb.table("cpm_activation_logs").select("*").order("activated_at", desc=False).execute().data or []
+        d["activation_logs"] = logs
         return d
+    except Exception as e:
+        log.error(f"Supabase load failed: {e}")
+        return None
+
+def _sb_save_config(key, value):
+    """Upsert a single config key into cpm_config."""
+    try:
+        _sb.table("cpm_config").upsert({"id": key, "key": key, "value": value, "updated_at": _now()}).execute()
+    except Exception as e:
+        log.error(f"Supabase config save failed ({key}): {e}")
+
+def _sb_audit(action, details=None, actor="owner"):
+    try:
+        _sb.table("cpm_audit_log").insert({"action": action, "actor": actor, "details": details or {}, "created_at": _now()}).execute()
+    except Exception as e:
+        log.warning(f"Audit log failed: {e}")
+
+# ── JSON fallback helpers ──────────────────────────────────────────────────────
+
+def _json_load():
+    if not os.path.exists(_DATA_FILE):
+        d = {"owner_key_hash": "4a91e7573bef598f06cc8abfae6234b8d4a024bd65a1c17985e309bd6fd87dd2", "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
+        _json_save(d); return d
     try:
         with open(_DATA_FILE) as f:
             d = json.load(f)
-        # Merge any new default features added in future versions
         for k, v in _DEFAULT_FEATURES.items():
             d.setdefault("features", {})[k] = d["features"].get(k, v)
         return d
     except Exception:
-        # Corrupted data file — reset with default owner key
         d = {"owner_key_hash": "4a91e7573bef598f06cc8abfae6234b8d4a024bd65a1c17985e309bd6fd87dd2", "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
-        _save(d)
-        return d
+        _json_save(d); return d
 
-def _save(d):
+def _json_save(d):
     try:
         with open(_DATA_FILE, "w") as f:
             json.dump(d, f, indent=2, default=str)
     except Exception as e:
-        log.error(f"Data save failed: {e}")
+        log.error(f"JSON save failed: {e}")
 
-def _hash(k): return hashlib.sha256(k.encode()).hexdigest()
+# ── Unified load/save (Supabase primary, JSON fallback) ───────────────────────
 
-def _now(): return datetime.now(timezone.utc).isoformat()
+def _load():
+    if HAS_SUPABASE:
+        d = _sb_load()
+        if d is not None:
+            return d
+    return _json_load()
+
+def _save(d):
+    """Save full data dict. Supabase = primary, JSON = fallback."""
+    if HAS_SUPABASE:
+        try:
+            # Save owner_key_hash
+            if "owner_key_hash" in d:
+                _sb_save_config("owner_key_hash", {"v": d["owner_key_hash"]})
+            # Save features
+            if "features" in d:
+                _sb_save_config("features", d["features"])
+            return
+        except Exception as e:
+            log.error(f"Supabase save failed, falling back to JSON: {e}")
+    _json_save(d)
 
 def _key_status(k):
     now = datetime.now(timezone.utc)
     if k.get("revoked"): return "revoked"
     if k.get("expires_at"):
         try:
-            exp = datetime.fromisoformat(k["expires_at"])
+            exp = datetime.fromisoformat(str(k["expires_at"]).replace("Z", "+00:00"))
             if not exp.tzinfo: exp = exp.replace(tzinfo=timezone.utc)
             if now > exp: return "expired"
         except Exception: pass
@@ -525,8 +590,12 @@ def owner_setup():
     k = (request.get_json() or {}).get("owner_key", "").strip()
     if len(k) < 6:
         return jsonify({"error": "Key must be at least 6 characters"}), 400
-    d["owner_key_hash"] = _hash(k)
-    _save(d)
+    h = _hash(k)
+    if HAS_SUPABASE:
+        _sb_save_config("owner_key_hash", {"v": h})
+        _sb_audit("owner_setup", {"action": "first_time_owner_key_set"})
+    else:
+        d["owner_key_hash"] = h; _json_save(d)
     log.info("Owner key configured for the first time")
     return jsonify({"success": True})
 
@@ -540,8 +609,10 @@ def owner_auth():
 def owner_keys():
     data = request.get_json() or {}
     if not _verify_owner(data): return jsonify({"error": "Unauthorized"}), 403
-    d = _load()
-    keys = d.get("premium_keys", [])
+    if HAS_SUPABASE:
+        keys = _sb.table("cpm_premium_keys").select("*").order("created_at", desc=True).execute().data or []
+    else:
+        keys = _load().get("premium_keys", [])
     for k in keys: k["status"] = _key_status(k)
     return jsonify({"keys": keys})
 
@@ -549,11 +620,8 @@ def owner_keys():
 def owner_keygen():
     data = request.get_json() or {}
     if not _verify_owner(data): return jsonify({"error": "Unauthorized"}), 403
-    d = _load()
     custom = data.get("custom_key", "").strip().upper()
     if custom:
-        if any(k["key"] == custom for k in d.get("premium_keys", [])):
-            return jsonify({"error": "Key already exists"}), 400
         new_key = custom
     else:
         seg = lambda n: secrets.token_hex(n).upper()[:n]
@@ -569,20 +637,40 @@ def owner_keygen():
     uses_max = int(data.get("uses_max", 1))
     entry = {"id": "KID-"+secrets.token_hex(4).upper(), "key": new_key, "created_at": _now(),
              "expires_at": expires_at, "uses_max": uses_max, "uses_count": 0,
-             "revoked": False, "status": "active", "activated_by": [], "note": data.get("note", "")}
-    d.setdefault("premium_keys", []).append(entry)
-    _save(d)
+             "revoked": False, "activated_by": [], "note": data.get("note", "")}
+    if HAS_SUPABASE:
+        try:
+            existing = _sb.table("cpm_premium_keys").select("id").eq("key", new_key).execute().data
+            if existing:
+                return jsonify({"error": "Key already exists"}), 400
+            _sb.table("cpm_premium_keys").insert(entry).execute()
+            _sb_audit("keygen", {"key": new_key, "expires_at": expires_at, "uses_max": uses_max})
+        except Exception as e:
+            return jsonify({"error": f"DB error: {e}"}), 500
+    else:
+        d = _load()
+        if any(k["key"] == new_key for k in d.get("premium_keys", [])):
+            return jsonify({"error": "Key already exists"}), 400
+        d.setdefault("premium_keys", []).append(entry); _json_save(d)
     log.info(f"Premium key generated: {new_key}")
+    entry["status"] = "active"
     return jsonify({"success": True, "key": entry})
 
 @app.route("/api/owner/keys/revoke", methods=["POST"])
 def owner_revoke():
     data = request.get_json() or {}
     if not _verify_owner(data): return jsonify({"error": "Unauthorized"}), 403
-    d = _load(); kid = data.get("id", "")
+    kid = data.get("id", "")
+    if HAS_SUPABASE:
+        r = _sb.table("cpm_premium_keys").update({"revoked": True}).eq("id", kid).execute()
+        if r.data:
+            _sb_audit("revoke_key", {"key_id": kid})
+            return jsonify({"success": True})
+        return jsonify({"error": "Not found"}), 404
+    d = _load()
     for k in d.get("premium_keys", []):
         if k["id"] == kid:
-            k["revoked"] = True; k["status"] = "revoked"; _save(d)
+            k["revoked"] = True; k["status"] = "revoked"; _json_save(d)
             return jsonify({"success": True})
     return jsonify({"error": "Not found"}), 404
 
@@ -590,10 +678,17 @@ def owner_revoke():
 def owner_delete_key():
     data = request.get_json() or {}
     if not _verify_owner(data): return jsonify({"error": "Unauthorized"}), 403
-    d = _load(); kid = data.get("id", ""); before = len(d.get("premium_keys", []))
+    kid = data.get("id", "")
+    if HAS_SUPABASE:
+        r = _sb.table("cpm_premium_keys").delete().eq("id", kid).execute()
+        if r.data:
+            _sb_audit("delete_key", {"key_id": kid})
+            return jsonify({"success": True})
+        return jsonify({"error": "Not found"}), 404
+    d = _load(); before = len(d.get("premium_keys", []))
     d["premium_keys"] = [k for k in d.get("premium_keys", []) if k["id"] != kid]
     if len(d["premium_keys"]) < before:
-        _save(d); return jsonify({"success": True})
+        _json_save(d); return jsonify({"success": True})
     return jsonify({"error": "Not found"}), 404
 
 
@@ -623,24 +718,48 @@ def owner_feature_toggle():
 def owner_analytics():
     data = request.get_json() or {}
     if not _verify_owner(data): return jsonify({"error": "Unauthorized"}), 403
+    if HAS_SUPABASE:
+        try:
+            keys = _sb.table("cpm_premium_keys").select("*").execute().data or []
+            for k in keys: k["status"] = _key_status(k)
+            logs = _sb.table("cpm_activation_logs").select("*").order("activated_at", desc=True).limit(10).execute().data or []
+            feats = _load().get("features", _DEFAULT_FEATURES)
+            total_logs = _sb.table("cpm_activation_logs").select("id", count="exact").execute().count or 0
+            return jsonify({
+                "total_keys":        len(keys),
+                "active_keys":       sum(1 for k in keys if k["status"] == "active"),
+                "used_keys":         sum(1 for k in keys if k["status"] == "used"),
+                "total_activations": total_logs,
+                "premium_features":  sum(1 for f in feats.values() if f.get("tier") == "premium"),
+                "free_features":     sum(1 for f in feats.values() if f.get("tier") == "free"),
+                "recent_logs":       logs,
+            })
+        except Exception as e:
+            log.error(f"Analytics Supabase error: {e}")
     d = _load(); keys = d.get("premium_keys", [])
     for k in keys: k["status"] = _key_status(k)
     feats = d.get("features", _DEFAULT_FEATURES)
     logs = d.get("activation_logs", [])
     return jsonify({
-        "total_keys":       len(keys),
-        "active_keys":      sum(1 for k in keys if k["status"] == "active"),
-        "used_keys":        sum(1 for k in keys if k["status"] == "used"),
+        "total_keys":        len(keys),
+        "active_keys":       sum(1 for k in keys if k["status"] == "active"),
+        "used_keys":         sum(1 for k in keys if k["status"] == "used"),
         "total_activations": len(logs),
-        "premium_features": sum(1 for f in feats.values() if f.get("tier") == "premium"),
-        "free_features":    sum(1 for f in feats.values() if f.get("tier") == "free"),
-        "recent_logs":      list(reversed(logs[-10:])),
+        "premium_features":  sum(1 for f in feats.values() if f.get("tier") == "premium"),
+        "free_features":     sum(1 for f in feats.values() if f.get("tier") == "free"),
+        "recent_logs":       list(reversed(logs[-10:])),
     })
 
 @app.route("/api/owner/logs", methods=["POST"])
 def owner_logs():
     data = request.get_json() or {}
     if not _verify_owner(data): return jsonify({"error": "Unauthorized"}), 403
+    if HAS_SUPABASE:
+        try:
+            logs = _sb.table("cpm_activation_logs").select("*").order("activated_at", desc=True).limit(200).execute().data or []
+            return jsonify({"logs": logs})
+        except Exception as e:
+            log.error(f"Logs Supabase error: {e}")
     return jsonify({"logs": list(reversed(_load().get("activation_logs", [])))})
 
 
@@ -650,15 +769,49 @@ def user_activate():
     data = request.get_json() or {}
     entered = data.get("key", "").strip().upper()
     if not entered: return jsonify({"error": "No key provided"}), 400
-    d = _load()
+    user_id = data.get("user_id", "anonymous")
+    ip = request.remote_addr or ""
 
-    # FIX: Only compare against the stored hash — no plaintext bypass.
-    # Owner key grants permanent premium access if a hash is set.
+    d = _load()
     stored_hash = d.get("owner_key_hash")
     if stored_hash and _hash(entered) == stored_hash:
         log.info("Owner key used for premium activation")
+        if HAS_SUPABASE:
+            _sb_audit("owner_activate", {"user_id": user_id, "ip": ip}, actor="user")
         return jsonify({"success": True, "expires_at": None, "key_id": "OWNER"})
 
+    if HAS_SUPABASE:
+        try:
+            rows = _sb.table("cpm_premium_keys").select("*").eq("key", entered).execute().data
+            if not rows:
+                return jsonify({"error": "Invalid activation key — check your key and try again"}), 403
+            k = rows[0]
+            st = _key_status(k)
+            if st == "revoked": return jsonify({"error": "This key has been revoked"}), 403
+            if st == "expired": return jsonify({"error": "This key has expired"}), 403
+            if st == "used":    return jsonify({"error": "This key has already been fully used"}), 403
+            new_count = k.get("uses_count", 0) + 1
+            activated_by = k.get("activated_by") or []
+            if isinstance(activated_by, str):
+                try: activated_by = json.loads(activated_by)
+                except: activated_by = []
+            activated_by.append(user_id)
+            _sb.table("cpm_premium_keys").update({
+                "uses_count": new_count,
+                "activated_by": activated_by
+            }).eq("id", k["id"]).execute()
+            _sb.table("cpm_activation_logs").insert({
+                "key_id": k["id"], "key": entered, "user_id": user_id,
+                "activated_at": _now(), "expires_at": k.get("expires_at"), "ip_address": ip
+            }).execute()
+            _sb_audit("key_activate", {"key": entered, "user_id": user_id, "ip": ip}, actor="user")
+            log.info(f"Key {entered} activated (Supabase)")
+            return jsonify({"success": True, "expires_at": k.get("expires_at"), "key_id": k["id"]})
+        except Exception as e:
+            log.error(f"Supabase activate error: {e}")
+            return jsonify({"error": "Server error during activation"}), 500
+
+    # JSON fallback
     for k in d.get("premium_keys", []):
         if k["key"].upper() == entered:
             st = _key_status(k)
@@ -666,13 +819,13 @@ def user_activate():
             if st == "expired": return jsonify({"error": "This key has expired"}), 403
             if st == "used":    return jsonify({"error": "This key has already been fully used"}), 403
             k["uses_count"] = k.get("uses_count", 0) + 1
-            k.setdefault("activated_by", []).append(data.get("user_id", "anonymous"))
+            k.setdefault("activated_by", []).append(user_id)
             k["status"] = _key_status(k)
             d.setdefault("activation_logs", []).append({
-                "key_id": k["id"], "key": entered, "user_id": data.get("user_id", "anonymous"),
+                "key_id": k["id"], "key": entered, "user_id": user_id,
                 "activated_at": _now(), "expires_at": k.get("expires_at"),
             })
-            _save(d)
+            _json_save(d)
             log.info(f"Key {entered} activated")
             return jsonify({"success": True, "expires_at": k.get("expires_at"), "key_id": k["id"]})
     return jsonify({"error": "Invalid activation key — check your key and try again"}), 403
@@ -2752,7 +2905,7 @@ ok "run.sh written"
 # ─── 4. Install Python packages ─────────────────────────────────────────────────
 sep "4/4  Installing Python packages"
 
-PKGS="flask flask-cors psutil"
+PKGS="flask flask-cors psutil supabase"
 
 inf "Creating virtual environment…"
 if python3 -m venv "$DIR/venv" 2>/dev/null && [[ -f "$DIR/venv/bin/pip" ]]; then
@@ -2797,7 +2950,7 @@ fi
 
 sep "Verifying all packages"
 ALL_OK=true
-for pkg in flask flask_cors psutil; do
+for pkg in flask flask_cors psutil supabase; do
   if "$PYTHON" -c "import $pkg" 2>/dev/null; then
     ok "$pkg importable"
   else
@@ -2821,8 +2974,8 @@ PYTHON_PATH="$(cd "$DIR" && [[ -f venv/bin/python3 ]] && echo "$DIR/venv/bin/pyt
 cat > /etc/systemd/system/cpm-panel.service << SVCEOF
 [Unit]
 Description=CPM Panel — KVM VPS Management
-After=network.target libvirtd.service
-Wants=network.target
+After=network-online.target libvirtd.service
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -2832,15 +2985,18 @@ ExecStart=$PYTHON_PATH $DIR/app.py
 Restart=on-failure
 RestartSec=5
 Environment=PORT=5000
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
 
 systemctl daemon-reload
+systemctl enable systemd-networkd-wait-online 2>/dev/null || true
 systemctl enable cpm-panel
 systemctl restart cpm-panel 2>/dev/null || systemctl start cpm-panel
-ok "cpm-panel service enabled — auto-starts on every boot"
+ok "cpm-panel service enabled — auto-starts on every boot (waits for full internet)"
 
 # ── Login message (show panel URL after SSH login) ─────────────────────────────
 cat > /etc/profile.d/cpm-url.sh << 'MOTDEOF'
@@ -2854,17 +3010,44 @@ echo "  ╔═══════════════════════
 echo "  ║        CPM Panel — KVM Manager           ║"
 echo "  ╠══════════════════════════════════════════╣"
 printf  "  ║  Local  : %-31s║\n" "$_LOCAL_URL"
-if [[ -f "$_URL_FILE" ]]; then
-  _TUN="$(cat $_URL_FILE 2>/dev/null | tr -d '\n')"
-  printf "  ║  Public : %-31s║\n" "$_TUN"
+
+# Wait up to 30 seconds for tunnel URL to appear
+_TUN=""
+if [[ ! -f "$_URL_FILE" ]]; then
+  printf "  ║  Public : %-31s║\n" "Waiting for tunnel URL…"
+  echo "  ╚══════════════════════════════════════════╝"
+  echo ""
+  _WAITED=0
+  while [[ $_WAITED -lt 30 ]]; do
+    sleep 1
+    _WAITED=$((_WAITED + 1))
+    if [[ -f "$_URL_FILE" ]]; then
+      _TUN="$(cat "$_URL_FILE" 2>/dev/null | tr -d '\n')"
+      break
+    fi
+  done
+  # Re-print the banner with the result
+  echo ""
+  echo "  ╔══════════════════════════════════════════╗"
+  echo "  ║        CPM Panel — KVM Manager           ║"
+  echo "  ╠══════════════════════════════════════════╣"
+  printf  "  ║  Local  : %-31s║\n" "$_LOCAL_URL"
+  if [[ -n "$_TUN" ]]; then
+    printf "  ║  Public : %-31s║\n" "$_TUN"
+  else
+    echo "  ║  Public : (tunnel not ready — try again) ║"
+  fi
+  echo "  ╚══════════════════════════════════════════╝"
+  echo ""
 else
-  echo "  ║  Public : (tunnel starting… wait ~10s)   ║"
+  _TUN="$(cat "$_URL_FILE" 2>/dev/null | tr -d '\n')"
+  printf "  ║  Public : %-31s║\n" "$_TUN"
+  echo "  ╚══════════════════════════════════════════╝"
+  echo ""
 fi
-echo "  ╚══════════════════════════════════════════╝"
-echo ""
 MOTDEOF
 chmod +x /etc/profile.d/cpm-url.sh
-ok "Login message installed — URL will show on every SSH login"
+ok "Login message installed — waits up to 30s for loca.lt URL on every SSH login"
 
 # ── done ──────────────────────────────────────────────────────────────────────
 echo ""
@@ -2881,5 +3064,10 @@ echo ""
 echo -e "  ${Y}FIRST-TIME SETUP:${N}"
 echo -e "    Click 'Owner Panel' in the sidebar and create your secret owner key."
 echo -e "    No default key is pre-set — you choose your own on first run."
+echo ""
+echo -e "  ${Y}SUPABASE:${N}"
+echo -e "    Run this SQL in Supabase Dashboard → SQL Editor:"
+echo -e "    ${Y}https://supabase.com/dashboard/project/vompmplmluxwtwgofgks/editor${N}"
+echo -e "    SQL file: copy from ${Y}supabase_tables.sql${N} (provided separately)"
 echo ""
 [[ -n "${SUDO_USER:-}" ]] && echo -e "  ${Y}NOTE:${N} Log out and back in so '$SUDO_USER' can
