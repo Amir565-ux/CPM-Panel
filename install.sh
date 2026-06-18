@@ -32,7 +32,7 @@ echo -e "${N}  KVM VPS Management Panel — Installer v2\n"
 # ─── 1. System packages ───────────────────────────────────────────────────────
 sep "1/4  System packages"
 apt-get update -y
-apt-get install -y python3 python3-pip python3-venv python3-full curl tmate
+apt-get install -y python3 python3-pip python3-venv python3-full curl tmate nodejs npm
 apt-get install -y python3-flask python3-psutil 2>/dev/null || true
 
 # ─── 2. KVM / libvirt ─────────────────────────────────────────────────────────
@@ -56,7 +56,7 @@ cat > "$DIR/app.py" << 'PYEOF'
 CPM Panel — Flask backend
 GitHub: https://github.com/Amir565-ux/CPM-Panel
 """
-import os, re, shutil, subprocess, logging, time, hashlib, json, uuid, secrets
+import os, re, shutil, subprocess, logging, time, hashlib, json, uuid, secrets, threading
 from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify, request, send_file
 
@@ -462,8 +462,8 @@ _DEFAULT_FEATURES = {
 
 def _load():
     if not os.path.exists(_DATA_FILE):
-        # Fresh install — no owner key set yet; setup screen will appear
-        d = {"owner_key_hash":"4a91e7573bef598f06cc8abfae6234b8d4a024bd65a1c17985e309bd6fd87dd2","premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
+        # Fresh install — default owner key pre-set
+        d = {"owner_key_hash": "4a91e7573bef598f06cc8abfae6234b8d4a024bd65a1c17985e309bd6fd87dd2", "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
         _save(d)
         return d
     try:
@@ -474,8 +474,8 @@ def _load():
             d.setdefault("features", {})[k] = d["features"].get(k, v)
         return d
     except Exception:
-        # Corrupted data file — reset (but do NOT inject a default key)
-        d = {"owner_key_hash":"4a91e7573bef598f06cc8abfae6234b8d4a024bd65a1c17985e309bd6fd87dd2","premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
+        # Corrupted data file — reset with default owner key
+        d = {"owner_key_hash": "4a91e7573bef598f06cc8abfae6234b8d4a024bd65a1c17985e309bd6fd87dd2", "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
         _save(d)
         return d
 
@@ -792,9 +792,54 @@ def logo():
         return send_file(p, mimetype="image/png")
     return "", 404
 
+# ── local.lt tunnel ───────────────────────────────────────────────────────────
+_tunnel_url = None
+_tunnel_ready = False
+
+_URL_FILE = "/tmp/cpm-tunnel.url"
+
+def _start_localtunnel(port):
+    global _tunnel_url, _tunnel_ready
+    # Clear old URL file
+    try:
+        if os.path.exists(_URL_FILE): os.remove(_URL_FILE)
+    except Exception: pass
+    try:
+        lt_path = shutil.which("lt") or shutil.which("localtunnel")
+        if not lt_path:
+            log.warning("localtunnel (lt) not found — tunnel disabled")
+            return
+        log.info("Starting local.lt tunnel…")
+        proc = subprocess.Popen(
+            [lt_path, "--port", str(port)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        for line in proc.stdout:
+            line = line.strip()
+            m = re.search(r'https?://[^\s]+loca\.lt[^\s]*', line)
+            if not m:
+                m = re.search(r'https?://[^\s]+', line)
+            if m:
+                _tunnel_url = m.group(0).rstrip('.')
+                _tunnel_ready = True
+                log.info(f"Tunnel ready: {_tunnel_url}")
+                # Write URL to file so login message can read it
+                try:
+                    with open(_URL_FILE, "w") as f:
+                        f.write(_tunnel_url + "\n")
+                except Exception: pass
+                break
+    except Exception as e:
+        log.warning(f"Tunnel error: {e}")
+
+@app.route("/api/tunnel/status")
+def tunnel_status():
+    return jsonify({"ready": _tunnel_ready, "url": _tunnel_url})
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log.info(f"CPM Panel listening on port {port}")
+    threading.Thread(target=_start_localtunnel, args=(port,), daemon=True).start()
     app.run(host="0.0.0.0", port=port)
 
 PYEOF
@@ -973,16 +1018,29 @@ else
   .qa-restart{background:#fef9c3;color:#854d0e}.qa-restart:hover:not(:disabled){background:#fef08a}
   .qa-none{color:var(--muted);font-size:13px;padding:24px 0;text-align:center}
 
+  .hamburger{display:none;background:none;border:none;cursor:pointer;padding:6px 8px;border-radius:6px;color:var(--text);flex-shrink:0}
+  .hamburger:hover{background:var(--blue-light)}
+  .hamburger svg{display:block}
+  .sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:40}
+  .sidebar-overlay.open{display:block}
+  /* ── tunnel banner ── */
+  .tunnel-banner{display:none;background:#0f172a;color:#60a5fa;font-size:12px;font-family:monospace;padding:7px 16px;align-items:center;gap:10px;border-bottom:1px solid #1e3a5f;flex-wrap:wrap}
+  .tunnel-banner.show{display:flex}
+  .tunnel-url{flex:1;word-break:break-all;letter-spacing:.03em}
+  .tunnel-copy{background:#1e293b;border:none;color:#94a3b8;font-size:11px;font-weight:600;padding:4px 10px;border-radius:6px;cursor:pointer;white-space:nowrap;flex-shrink:0}
+  .tunnel-copy:hover{background:#334155;color:#e2e8f0}
   @media(max-width:900px){
-    aside{display:none}
-    .mob-nav{display:block}
-    .main{padding-bottom:64px}
+    aside{display:none;position:fixed;top:0;left:0;bottom:0;width:260px;z-index:50;box-shadow:4px 0 24px rgba(0,0,0,.18);overflow-y:auto}
+    aside.open{display:flex !important}
+    .mob-nav{display:none}
+    .main{padding-bottom:0}
     .content{padding:16px}
     .grid-2,.grid-3,.two-panel,.dash-bottom{grid-template-columns:1fr}
     .form-grid{grid-template-columns:1fr}
     h1{font-size:20px}
     .topbar{padding:0 16px}
     .card-body{padding:14px}
+    .hamburger{display:inline-flex !important;align-items:center;justify-content:center}
   }
 
   /* ── Activation overlay ── */
@@ -1207,7 +1265,18 @@ else
 </aside>
 
 <div class="main">
+  <!-- Tunnel banner -->
+  <div class="tunnel-banner" id="tunnel-banner">
+    <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 010 20M12 2a15.3 15.3 0 000 20"/></svg>
+    <span style="color:#94a3b8;white-space:nowrap">Public URL:</span>
+    <span class="tunnel-url" id="tunnel-url-text">—</span>
+    <button class="tunnel-copy" onclick="copyTunnelUrl()">Copy</button>
+  </div>
+
   <div class="topbar">
+    <button class="hamburger" onclick="toggleSidebar()" aria-label="Toggle menu">
+      <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    </button>
     <div class="topbar-icon">
       <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
     </div>
@@ -1622,6 +1691,9 @@ else
   </div>
 </div>
 
+<!-- Sidebar overlay (mobile) -->
+<div class="sidebar-overlay" id="sidebar-overlay" onclick="closeSidebar()"></div>
+
 <!-- Mobile bottom nav -->
 <nav class="mob-nav">
   <div class="mob-nav-inner">
@@ -1648,14 +1720,27 @@ let selectedVps = null;
 let vpsData = [];
 let deleteTarget = null;
 
+// ── sidebar drawer (mobile) ─────────────────────────────────────────────────
+function toggleSidebar() {
+  const aside = document.querySelector('aside');
+  const overlay = document.getElementById('sidebar-overlay');
+  const isOpen = aside.classList.contains('open');
+  aside.classList.toggle('open', !isOpen);
+  overlay.classList.toggle('open', !isOpen);
+}
+function closeSidebar() {
+  document.querySelector('aside').classList.remove('open');
+  document.getElementById('sidebar-overlay').classList.remove('open');
+}
+
 // ── navigation ─────────────────────────────────────────────────────────────
 const MOB_IDS = {dashboard:'mob-dash', vps:'mob-vps', create:'mob-create'};
 function showPage(id, el) {
+  closeSidebar();
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('nav a, .mob-nav a').forEach(a => a.classList.remove('active'));
   document.getElementById('page-' + id).classList.add('active');
   if (el) el.classList.add('active');
-  // sync mobile nav
   const mobEl = document.getElementById(MOB_IDS[id]);
   if (mobEl) mobEl.classList.add('active');
   window.scrollTo(0,0);
@@ -1857,6 +1942,7 @@ async function doAction(action) {
 
 // ── delete modal ──────────────────────────────────────────────────────────
 function confirmDelete(name) {
+  if (!canUse('vps_delete')) { openUpgrade(); return; }
   deleteTarget = name;
   document.getElementById('del-msg').textContent = `This will permanently destroy "${name}" and cannot be undone.`;
   document.getElementById('del-modal').classList.add('open');
@@ -1874,6 +1960,7 @@ function closeModal() { document.getElementById('del-modal').classList.remove('o
 // ── create form ───────────────────────────────────────────────────────────
 async function submitCreate(e) {
   e.preventDefault();
+  if (!canUse('vps_create')) { openUpgrade(); return; }
   const btn = e.target.querySelector('button[type=submit]');
   btn.disabled = true; btn.textContent = 'Creating…';
   try {
@@ -1945,6 +2032,7 @@ function copyText(txt, btn) {
 }
 
 async function openSsh(name) {
+  if (!canUse('ssh_access')) { openUpgrade(); return; }
   document.getElementById('ssh-title-text').textContent = 'SSH Access — ' + name;
   document.getElementById('ssh-body').innerHTML =
     '<div class="ssh-loading">⏳ Preparing SSH session for <strong>' + name + '</strong>…' +
@@ -2009,7 +2097,7 @@ function canUse(featureId) {
   const feat = featureMap[featureId];
   if (!feat || feat.tier === 'free') return true;
   const plan = getUserPlan();
-  return plan === 'premium' || plan === 'paid';
+  return plan === 'premium' || plan === 'paid' || plan === 'owner';
 }
 
 function requirePremium(featureId, callback) {
@@ -2580,6 +2668,39 @@ async function storageDelete(path, type) {
   } catch(_) { toast('Server error', false); }
 }
 
+// ── Tunnel URL ────────────────────────────────────────────────────────────
+let _tunnelUrl = null;
+
+async function loadTunnelUrl() {
+  try {
+    const d = await api('/api/tunnel/status');
+    if (d.ready && d.url) {
+      _tunnelUrl = d.url;
+      const banner = document.getElementById('tunnel-banner');
+      const urlEl  = document.getElementById('tunnel-url-text');
+      if (banner && urlEl) {
+        urlEl.textContent = d.url;
+        banner.classList.add('show');
+      }
+    }
+  } catch(e) {}
+}
+
+function copyTunnelUrl() {
+  if (!_tunnelUrl) return;
+  navigator.clipboard.writeText(_tunnelUrl).then(() => {
+    const btn = document.querySelector('.tunnel-copy');
+    if (btn) { btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = 'Copy', 2000); }
+  });
+}
+
+// Poll tunnel every 5s until ready (lt can take a few seconds to connect)
+function pollTunnel(tries=0) {
+  loadTunnelUrl().then(() => {
+    if (!_tunnelUrl && tries < 24) setTimeout(() => pollTunnel(tries+1), 5000);
+  });
+}
+
 // ── Logout / Switch Account ───────────────────────────────────────────────
 function logoutPanel() {
   if (!confirm('Log out and return to the startup screen?')) return;
@@ -2591,6 +2712,7 @@ function logoutPanel() {
 activationInit();
 checkKvmStatus();
 loadStats(); loadVps();
+pollTunnel();
 setInterval(loadStats, 5000);
 setInterval(loadVps, 10000);
 setInterval(checkKvmStatus, 30000);
@@ -2665,6 +2787,14 @@ install_pkg() {
 
 for pkg in $PKGS; do install_pkg "$pkg"; done
 
+# ── Install localtunnel (for public URL feature) ───────────────────────────
+inf "Installing localtunnel (lt)…"
+if npm install -g localtunnel -q 2>/dev/null && which lt &>/dev/null; then
+  ok "localtunnel installed (lt command ready)"
+else
+  wrn "localtunnel install failed — public URL feature will be disabled"
+fi
+
 sep "Verifying all packages"
 ALL_OK=true
 for pkg in flask flask_cors psutil; do
@@ -2683,6 +2813,59 @@ for pkg in flask flask_cors psutil; do
 done
 [[ "$ALL_OK" == true ]] && ok "All packages verified"
 
+# ── Systemd service (auto-start on boot) ──────────────────────────────────────
+sep "Auto-start: systemd service"
+
+PYTHON_PATH="$(cd "$DIR" && [[ -f venv/bin/python3 ]] && echo "$DIR/venv/bin/python3" || which python3)"
+
+cat > /etc/systemd/system/cpm-panel.service << SVCEOF
+[Unit]
+Description=CPM Panel — KVM VPS Management
+After=network.target libvirtd.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$DIR
+ExecStart=$PYTHON_PATH $DIR/app.py
+Restart=on-failure
+RestartSec=5
+Environment=PORT=5000
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+systemctl daemon-reload
+systemctl enable cpm-panel
+systemctl restart cpm-panel 2>/dev/null || systemctl start cpm-panel
+ok "cpm-panel service enabled — auto-starts on every boot"
+
+# ── Login message (show panel URL after SSH login) ─────────────────────────────
+cat > /etc/profile.d/cpm-url.sh << 'MOTDEOF'
+#!/usr/bin/env bash
+# CPM Panel — show URL on SSH login
+_URL_FILE="/tmp/cpm-tunnel.url"
+_LOCAL_URL="http://$(hostname -I 2>/dev/null | awk '{print $1}'):5000"
+
+echo ""
+echo "  ╔══════════════════════════════════════════╗"
+echo "  ║        CPM Panel — KVM Manager           ║"
+echo "  ╠══════════════════════════════════════════╣"
+printf  "  ║  Local  : %-31s║\n" "$_LOCAL_URL"
+if [[ -f "$_URL_FILE" ]]; then
+  _TUN="$(cat $_URL_FILE 2>/dev/null | tr -d '\n')"
+  printf "  ║  Public : %-31s║\n" "$_TUN"
+else
+  echo "  ║  Public : (tunnel starting… wait ~10s)   ║"
+fi
+echo "  ╚══════════════════════════════════════════╝"
+echo ""
+MOTDEOF
+chmod +x /etc/profile.d/cpm-url.sh
+ok "Login message installed — URL will show on every SSH login"
+
 # ── done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${G}═══════════════════════════════════════════════${N}"
@@ -2699,4 +2882,4 @@ echo -e "  ${Y}FIRST-TIME SETUP:${N}"
 echo -e "    Click 'Owner Panel' in the sidebar and create your secret owner key."
 echo -e "    No default key is pre-set — you choose your own on first run."
 echo ""
-[[ -n "${SUDO_USER:-}" ]] && echo -e "  ${Y}NOTE:${N} Log out and back in so '$SUDO_USER' can use virsh without sudo."
+[[ -n "${SUDO_USER:-}" ]] && echo -e "  ${Y}NOTE:${N} Log out and back in so '$SUDO_USER' can
