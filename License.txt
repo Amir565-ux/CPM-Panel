@@ -1,0 +1,28 @@
+CPM PANEL LICENSE
+
+Copyright (c) 2026 Amir565-ux
+
+All rights reserved.
+
+This software, CPM Panel, and its source code are the exclusive property of Amir565-ux.
+
+Permission is granted to use and install CPM Panel for personal or commercial purposes only as authorized by the owner.
+
+The following actions are strictly prohibited without written permission from Amir565-ux:
+
+1. Copying or redistributing the source code.
+2. Modifying and republishing the software.
+3. Selling, sublicensing, or reselling the source code.
+4. Claiming ownership of the software or any part of it.
+5. Reverse engineering, decompiling, or attempting to extract protected components.
+6. Removing or altering copyright notices, branding, or license information.
+
+Any unauthorized use, distribution, or modification of this software may result in termination of access and legal action.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. THE AUTHOR SHALL NOT BE LIABLE FOR ANY DAMAGES ARISING FROM THE USE OF THIS SOFTWARE.
+
+Author: Amir565-ux
+Project: CPM Panel
+Year: 2026
+
+For licensing inquiries, contact the author directly.
