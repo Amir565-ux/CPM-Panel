@@ -99,4 +99,4 @@ All VM names are validated with `^[a-zA-Z0-9_\-]{1,64}$` before being passed to 
 
 ## License
 
-MADE BY ABDULLAH
+See [License]
