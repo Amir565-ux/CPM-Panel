@@ -2,7 +2,7 @@
 
 **A modern web dashboard for managing KVM virtual machines on Linux.**
 
-> **Author:** [Amir565-ux](https://github.com/Amir565-ux)  
+> **Author:** [Abdullah](https://github.com/Amir565-ux)  
 > **Repo:** [github.com/Amir565-ux/CPM-Panel](https://github.com/Amir565-ux/CPM-Panel)
 
 ---
@@ -67,36 +67,6 @@ bash run.sh & lt --port 5000
 # 6. For Runing From Normal Home dashboard
 ```
 cd CPM-Panel && bash run.sh & lt --port 5000
-```
----
-
----
-
-## Run as a background service (keeps running after you disconnect)
-
-```bash
-sudo tee /etc/systemd/system/cpm-panel.service > /dev/null <<EOF
-[Unit]
-Description=CPM Panel
-After=network.target libvirtd.service
-
-[Service]
-Type=simple
-User=$USER
-WorkingDirectory=$(pwd)
-ExecStart=/bin/bash $(pwd)/run.sh
-Restart=on-failure
-Environment=PORT=5000
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now cpm-panel
-
-# Check it's running
-sudo systemctl status cpm-panel
 ```
 
 ---
