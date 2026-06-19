@@ -1009,7 +1009,8 @@ else
     --green:#16a34a;--red:#dc2626;--amber:#d97706;--gray:#94a3b8;
     --radius:12px;--shadow:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.04);
   }
-  body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);display:flex;min-height:100vh}
+  html,body{overflow-x:hidden}
+  body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);display:flex;min-height:100vh;margin:0}
 
   /* ── sidebar ── */
   aside{width:220px;background:var(--sidebar);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:0 0 16px;flex-shrink:0;position:sticky;top:0;height:100vh}
@@ -1087,7 +1088,7 @@ else
   .vm-count-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-top:2px}
 
   /* ── vps manager ── */
-  .two-panel{display:grid;grid-template-columns:1fr 380px;gap:20px;align-items:start}
+  .two-panel{display:grid;grid-template-columns:1fr minmax(0,380px);gap:20px;align-items:start}
   .vps-list{list-style:none}
   .vps-item{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-radius:10px;cursor:pointer;transition:.15s;border:2px solid transparent;margin-bottom:8px}
   .vps-item:hover{background:var(--blue-light)}
@@ -1831,6 +1832,20 @@ else
             <div class="uic-label">Theme Presets</div>
             <div class="uic-presets" id="uic-preset-btns"></div>
           </div>
+          <div class="uic-section" style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
+            <div class="uic-label">Quick Color Adjustments</div>
+            <div style="display:flex;gap:20px;flex-wrap:wrap;margin-top:10px">
+              <div class="uic-color-row">
+                <div class="uic-swatch" id="sw-text"><input type="color" id="uic-clr-text" oninput="uicPickColor('text',this)" onchange="uicPickColor('text',this)"/></div>
+                <span class="uic-color-name">Text Color</span>
+              </div>
+              <div class="uic-color-row">
+                <div class="uic-swatch" id="sw-blue"><input type="color" id="uic-clr-blue" oninput="uicPickColor('blue',this)" onchange="uicPickColor('blue',this)"/></div>
+                <span class="uic-color-name">Button Color</span>
+              </div>
+            </div>
+            <div class="uic-tip" style="margin-top:10px">💡 These adjustments override the current theme. Select any preset to reset them.</div>
+          </div>
         </div>
       </div>
 
@@ -2110,7 +2125,6 @@ async function loadStats() {
     document.getElementById('uptime').textContent    = fmtUptime(d.uptime);
     document.getElementById('status-txt').textContent = 'System OK';
     document.getElementById('dot').style.background  = '#16a34a';
-    document.getElementById('kvm-status').textContent = 'KVM Virtualisation Active';
   } catch (e) {
     document.getElementById('status-txt').textContent = 'Offline';
     document.getElementById('dot').style.background  = '#dc2626';
@@ -2305,15 +2319,39 @@ async function checkKvmStatus() {
     if (!d.functional) {
       document.getElementById('kvm-banner-msg').textContent = d.message;
       banner.classList.add('show');
-      topText.textContent = '⚠ ' + d.message;
+      topText.textContent = '⚠ KVM not available';
       // Disable all VPS action buttons
       document.querySelectorAll('.btn-start,.btn-stop,.btn-restart,.btn-delete,.btn-ssh,.qa-start,.qa-stop,.qa-restart,.qa-ssh').forEach(b => {
-        b.disabled = true;
-        b.title = d.message;
+        b.disabled = true; b.title = d.message;
       });
+      // Overlay VPS list with clear message
+      const vl = document.getElementById('vps-list');
+      if (vl) vl.innerHTML = `<li style="padding:24px 12px;text-align:center">
+        <div style="font-size:28px;margin-bottom:10px">⚠️</div>
+        <div style="font-weight:700;font-size:15px;color:var(--red);margin-bottom:6px">KVM Not Available on This Host</div>
+        <div style="font-size:13px;color:var(--muted);line-height:1.6">${d.message}<br><br>
+        To create real VPS instances, your server must support KVM hardware virtualisation.<br>
+        Most shared VPS providers do not allow nested KVM.<br>
+        You need a <strong>dedicated server or bare-metal host</strong> with KVM enabled.</div>
+      </li>`;
+      // Disable create form
+      const cf = document.getElementById('create-form');
+      if (cf) {
+        const sub = cf.querySelector('button[type=submit]');
+        if (sub) { sub.disabled = true; sub.textContent = '⚠ KVM Not Available'; }
+        if (!document.getElementById('kvm-create-notice')) {
+          const notice = document.createElement('div');
+          notice.id = 'kvm-create-notice';
+          notice.style.cssText = 'background:#fef3c7;border:1px solid #f59e0b;border-radius:10px;padding:14px 18px;margin-bottom:18px;font-size:13px;color:#92400e;line-height:1.6';
+          notice.innerHTML = `<strong>⚠ KVM virtualisation is not available on this host.</strong><br>Creating VPS instances requires a dedicated/bare-metal server with KVM enabled. Your current host does not support it.`;
+          cf.insertBefore(notice, cf.firstChild);
+        }
+      }
     } else {
       banner.classList.remove('show');
       topText.textContent = 'KVM Virtualisation Active';
+      const notice = document.getElementById('kvm-create-notice');
+      if (notice) notice.remove();
     }
   } catch(e) {}
 }
@@ -2978,7 +3016,7 @@ const UIC_PRESETS = {
   cyber:    { label:'⚡ Cyber',      bg:'#000d0d', sidebar:'#001a1a', card:'#001a1a', blue:'#00ffcc', text:'#ccffee', muted:'#00aa88', border:'#004433', green:'#00ffaa', red:'#ff4466', amber:'#ffcc00' },
   candy:    { label:'🍬 Candy',      bg:'#fff0ff', sidebar:'#ffe0ff', card:'#fff0ff', blue:'#a855f7', text:'#2e1065', muted:'#c084fc', border:'#f5d0fe', green:'#22c55e', red:'#ef4444', amber:'#f59e0b' },
   steel:    { label:'🔩 Steel',      bg:'#1c1f26', sidebar:'#22262f', card:'#22262f', blue:'#60a5fa', text:'#e2e8f0', muted:'#94a3b8', border:'#2d333b', green:'#4ade80', red:'#f87171', amber:'#fbbf24' },
-  glass:    { label:'💎 Light Transparent', bg:'rgba(255,255,255,0.06)', sidebar:'rgba(255,255,255,0.14)', card:'rgba(255,255,255,0.10)', blue:'#60a5fa', text:'#f8fafc', muted:'#cbd5e1', border:'rgba(255,255,255,0.22)', green:'#4ade80', red:'#f87171', amber:'#fbbf24' },
+  glass:    { label:'💎 Light Transparent', bg:'transparent', sidebar:'rgba(255,255,255,0.15)', card:'rgba(255,255,255,0.12)', blue:'#60a5fa', text:'#f8fafc', muted:'#e2e8f0', border:'rgba(255,255,255,0.25)', green:'#4ade80', red:'#f87171', amber:'#fbbf24' },
 };
 
 // Background handled via file uploads — no preset gallery
@@ -3006,6 +3044,7 @@ function uicRenderPage() {
   if (sizeEl) { sizeEl.value = savedSize; const v=document.getElementById('uic-size-val'); if(v)v.textContent=savedSize+'px'; }
   const savedRadius = uicSettings.radius || '12px';
   document.querySelectorAll('.uic-radius-opt').forEach(b => b.classList.toggle('active', b.dataset.r===savedRadius));
+  uicSyncPickers();
   // Restore image upload preview if saved
   const savedImg = localStorage.getItem('cpm_ui_bg_img');
   if (savedImg) {
