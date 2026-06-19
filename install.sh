@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CPM Panel — One-Shot Installer  (v1)
+#  CPM Panel — One-Shot Installer  (v1 — owner-key security fix)
 #  GitHub : https://github.com/Amir565-ux/CPM-Panel
 #  Usage  : sudo bash install.sh
 #  ⚡POWERED BY ABDULLAH
@@ -27,7 +27,7 @@ cat <<'BANNER'
   ╚██████╗██║     ██║ ╚═╝ ██║    ██║     ██║  ██║██║ ╚████║███████╗███████╗
    ╚═════╝╚═╝     ╚═╝     ╚═╝    ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝
 BANNER
-echo -e "${N}  KVM VPS Management Panel — Installer v1\n"
+echo -e "${N}  KVM VPS Management Panel — Installer v2\n"
 
 # ─── 1. System packages ───────────────────────────────────────────────────────
 sep "1/4  System packages"
@@ -470,6 +470,7 @@ _DEFAULT_FEATURES = {
     "file_manager":  {"name":"File Manager",         "category":"Storage",      "tier":"premium", "usage":0},
     "file_upload":   {"name":"Upload File",          "category":"Storage",      "tier":"premium", "usage":0},
     "file_download": {"name":"Download File",        "category":"Storage",      "tier":"premium", "usage":0},
+    "ui_customize":  {"name":"UI Customization",     "category":"Appearance",   "tier":"premium", "usage":0},
 }
 
 def _hash(k): return hashlib.sha256(k.encode()).hexdigest()
@@ -1311,9 +1312,54 @@ else
   .search-inp{background:#fff;border:1.5px solid var(--border);border-radius:8px;padding:8px 12px;font-size:13px;outline:none;transition:.2s;width:220px}
   .search-inp:focus{border-color:var(--blue);box-shadow:0 0 0 2px rgba(37,99,235,.1)}
   @media(max-width:600px){.owner-tabs{flex-wrap:wrap}.owner-tab{flex:1;min-width:80px;text-align:center;font-size:11px;padding:7px 8px}.gen-row{flex-direction:column}}
+
+  /* ── UI Customization ── */
+  .uic-section{margin-bottom:22px}
+  .uic-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-bottom:10px;display:flex;align-items:center;gap:6px}
+  .uic-presets{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:4px}
+  .uic-preset{padding:8px 16px;border-radius:20px;border:2px solid var(--border);background:var(--card);color:var(--text);font-size:13px;font-weight:600;cursor:pointer;transition:.2s}
+  .uic-preset:hover{border-color:var(--blue);color:var(--blue)}
+  .uic-preset.active{border-color:var(--blue);background:var(--blue);color:#fff}
+  .uic-color-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(175px,1fr));gap:10px}
+  .uic-color-row{display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--blue-light);border:1px solid var(--blue-mid);border-radius:10px}
+  .uic-swatch{width:36px;height:36px;border-radius:8px;border:2px solid var(--border);cursor:pointer;flex-shrink:0;padding:0;overflow:hidden;position:relative}
+  .uic-swatch input[type=color]{position:absolute;inset:-4px;width:calc(100% + 8px);height:calc(100% + 8px);border:none;cursor:pointer;padding:0}
+  .uic-color-name{font-size:12px;font-weight:600;color:var(--text);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .uic-bg-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px;margin-bottom:12px}
+  .uic-bg-card{border-radius:12px;overflow:hidden;cursor:pointer;border:3px solid transparent;transition:.2s;box-shadow:var(--shadow)}
+  .uic-bg-card:hover{border-color:var(--blue);transform:translateY(-2px)}
+  .uic-bg-card.active{border-color:var(--blue);box-shadow:0 0 0 3px rgba(37,99,235,.25)}
+  .uic-bg-thumb{height:80px;width:100%;display:block;background-size:cover;background-position:center;background-size:200% 200%;animation:cpm-thumb-idle 6s ease infinite}
+  .uic-bg-name{padding:6px 10px;font-size:12px;font-weight:600;background:var(--card);color:var(--text);text-align:center}
+  .uic-custom-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px}
+  .uic-url-inp{flex:1;min-width:200px;padding:9px 12px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;background:var(--card);color:var(--text);outline:none;transition:.2s}
+  .uic-url-inp:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(37,99,235,.1)}
+  .uic-apply-btn{padding:9px 18px;border-radius:8px;border:none;background:var(--blue);color:#fff;font-size:13px;font-weight:600;cursor:pointer;transition:.2s;white-space:nowrap}
+  .uic-apply-btn:hover{background:#1d4ed8}
+  .uic-font-row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  .uic-select{padding:9px 12px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;background:var(--card);color:var(--text);outline:none;transition:.2s;cursor:pointer;width:100%;max-width:340px}
+  .uic-select:focus{border-color:var(--blue)}
+  .uic-range-row{display:flex;align-items:center;gap:12px}
+  .uic-range{flex:1;accent-color:var(--blue);height:5px;max-width:300px}
+  .uic-range-val{font-size:13px;font-weight:700;color:var(--blue);min-width:40px}
+  .uic-action-bar{display:flex;gap:12px;flex-wrap:wrap;padding-top:8px}
+  .uic-save-btn{padding:11px 26px;background:var(--blue);color:#fff;border:none;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;transition:.2s}
+  .uic-save-btn:hover{background:#1d4ed8;transform:translateY(-1px)}
+  .uic-reset-btn{padding:11px 26px;background:var(--card);color:var(--muted);border:1.5px solid var(--border);border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;transition:.2s}
+  .uic-reset-btn:hover{border-color:#dc2626;color:#dc2626}
+  .uic-radius-row{display:flex;gap:8px;flex-wrap:wrap}
+  .uic-radius-opt{padding:8px 16px;border-radius:8px;border:2px solid var(--border);background:var(--card);color:var(--text);font-size:13px;font-weight:600;cursor:pointer;transition:.2s}
+  .uic-radius-opt:hover{border-color:var(--blue);color:var(--blue)}
+  .uic-radius-opt.active{border-color:var(--blue);background:var(--blue);color:#fff}
+  .uic-tip{font-size:12px;color:var(--muted);padding:8px 12px;background:var(--blue-light);border-radius:8px;margin-top:8px}
+  @keyframes cpm-grad{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
+  @keyframes cpm-thumb-idle{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
 </style>
 </head>
 <body>
+<div id="cpm-bg-layer" style="position:fixed;inset:0;z-index:-2;pointer-events:none;transition:background .6s,background-image .6s"></div>
+<div id="cpm-bg-style"></div>
+<video id="cpm-bg-video" autoplay loop muted playsinline style="display:none;position:fixed;inset:0;z-index:-3;width:100%;height:100%;object-fit:cover;pointer-events:none"></video>
 
 <!-- ── Activation overlay ────────────────────────────────────────────── -->
 <div class="act-overlay" id="act-overlay">
@@ -1389,6 +1435,10 @@ else
     <a onclick="openStorageWithCheck(this)">
       <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4.03 3-9 3S3 13.66 3 12"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/></svg>
       Cloud Storage
+    </a>
+    <a onclick="openUiCustomizeWithCheck(this)">
+      <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 22C6.5 22 2 17.5 2 12c0-5.5 4.5-10 10-10 4.5 0 8 3.1 8 7 0 2.8-2.2 5-5 5h-1.4c-.6 0-1 .5-1 1.1 0 .3.1.5.1.8.1.5-.2 1-.7 1.1z"/><circle cx="8.5" cy="9.5" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="7" r="1.5" fill="currentColor" stroke="none"/><circle cx="15.5" cy="9.5" r="1.5" fill="currentColor" stroke="none"/></svg>
+      UI Customize 🎨
     </a>
   </nav>
   <a onclick="enterOwnerPanel()" id="nav-owner" style="display:none;margin-top:auto;background:linear-gradient(135deg,#fef3c7,#fde68a);color:#92400e;border-radius:8px;margin:0 10px 8px">
@@ -1755,6 +1805,160 @@ else
 
       <!-- Hidden file input -->
       <input type="file" id="storage-file-input" style="display:none" multiple onchange="storageDoUpload(this)"/>
+    </section>
+
+    <!-- UI CUSTOMIZATION -->
+    <section class="page" id="page-uicustom">
+      <h1>🎨 UI Customization</h1>
+      <p class="subtitle">Personalize every aspect of your panel's appearance — changes apply live instantly.</p>
+
+      <!-- Color Themes -->
+      <div class="card" style="margin-bottom:20px">
+        <div class="card-header">
+          <div class="card-title">
+            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 22C6.5 22 2 17.5 2 12c0-5.5 4.5-10 10-10 4.5 0 8 3.1 8 7 0 2.8-2.2 5-5 5h-1.4c-.6 0-1 .5-1 1.1 0 .3.1.5.1.8.1.5-.2 1-.7 1.1z"/><circle cx="8.5" cy="9.5" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="7" r="1.5" fill="currentColor" stroke="none"/><circle cx="15.5" cy="9.5" r="1.5" fill="currentColor" stroke="none"/></svg>
+            Color Themes
+          </div>
+          <p class="card-desc">One-click presets that style the whole panel instantly</p>
+        </div>
+        <div class="card-body">
+          <div class="uic-section">
+            <div class="uic-label">Theme Presets</div>
+            <div class="uic-presets" id="uic-preset-btns"></div>
+          </div>
+          <div class="uic-section">
+            <div class="uic-label">Custom Colors — click any swatch to open color picker</div>
+            <div class="uic-color-grid">
+              <div class="uic-color-row">
+                <div class="uic-swatch" id="sw-bg"><input type="color" id="uic-clr-bg" oninput="uicPickColor('bg',this)" onchange="uicPickColor('bg',this)"/></div>
+                <span class="uic-color-name">Page Background</span>
+              </div>
+              <div class="uic-color-row">
+                <div class="uic-swatch" id="sw-sidebar"><input type="color" id="uic-clr-sidebar" oninput="uicPickColor('sidebar',this)" onchange="uicPickColor('sidebar',this)"/></div>
+                <span class="uic-color-name">Sidebar</span>
+              </div>
+              <div class="uic-color-row">
+                <div class="uic-swatch" id="sw-card"><input type="color" id="uic-clr-card" oninput="uicPickColor('card',this)" onchange="uicPickColor('card',this)"/></div>
+                <span class="uic-color-name">Card Background</span>
+              </div>
+              <div class="uic-color-row">
+                <div class="uic-swatch" id="sw-blue"><input type="color" id="uic-clr-blue" oninput="uicPickColor('blue',this)" onchange="uicPickColor('blue',this)"/></div>
+                <span class="uic-color-name">Accent / Buttons</span>
+              </div>
+              <div class="uic-color-row">
+                <div class="uic-swatch" id="sw-text"><input type="color" id="uic-clr-text" oninput="uicPickColor('text',this)" onchange="uicPickColor('text',this)"/></div>
+                <span class="uic-color-name">Primary Text</span>
+              </div>
+              <div class="uic-color-row">
+                <div class="uic-swatch" id="sw-muted"><input type="color" id="uic-clr-muted" oninput="uicPickColor('muted',this)" onchange="uicPickColor('muted',this)"/></div>
+                <span class="uic-color-name">Muted Text</span>
+              </div>
+              <div class="uic-color-row">
+                <div class="uic-swatch" id="sw-border"><input type="color" id="uic-clr-border" oninput="uicPickColor('border',this)" onchange="uicPickColor('border',this)"/></div>
+                <span class="uic-color-name">Borders / Dividers</span>
+              </div>
+              <div class="uic-color-row">
+                <div class="uic-swatch" id="sw-green"><input type="color" id="uic-clr-green" oninput="uicPickColor('green',this)" onchange="uicPickColor('green',this)"/></div>
+                <span class="uic-color-name">Running / Success</span>
+              </div>
+              <div class="uic-color-row">
+                <div class="uic-swatch" id="sw-red"><input type="color" id="uic-clr-red" oninput="uicPickColor('red',this)" onchange="uicPickColor('red',this)"/></div>
+                <span class="uic-color-name">Error / Stop / Delete</span>
+              </div>
+              <div class="uic-color-row">
+                <div class="uic-swatch" id="sw-amber"><input type="color" id="uic-clr-amber" oninput="uicPickColor('amber',this)" onchange="uicPickColor('amber',this)"/></div>
+                <span class="uic-color-name">Warning / Restart</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Background -->
+      <div class="card" style="margin-bottom:20px">
+        <div class="card-header">
+          <div class="card-title">
+            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+            Background
+          </div>
+          <p class="card-desc">Animated gradients, custom images, or video — all built in, no internet needed for animations</p>
+        </div>
+        <div class="card-body">
+          <div class="uic-label">Built-in Backgrounds (🎌 Anime-inspired &amp; more)</div>
+          <div class="uic-bg-grid" id="uic-bg-grid"></div>
+          <div id="uic-custom-img-row" class="uic-custom-row" style="display:none">
+            <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+            <input class="uic-url-inp" id="uic-img-url" placeholder="https://example.com/bg.jpg  or  /local/path.jpg" type="url"/>
+            <button class="uic-apply-btn" onclick="uicApplyCustomImage()">Apply Image</button>
+          </div>
+          <div id="uic-custom-vid-row" class="uic-custom-row" style="display:none">
+            <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+            <input class="uic-url-inp" id="uic-vid-url" placeholder="https://example.com/bg.mp4  (video file URL)" type="url"/>
+            <button class="uic-apply-btn" onclick="uicApplyCustomVideo()">Apply Video</button>
+          </div>
+          <div class="uic-tip">💡 Tip: After picking a background, use a dark color theme like Dark, Ocean, or Midnight so text stays readable on top.</div>
+        </div>
+      </div>
+
+      <!-- Typography -->
+      <div class="card" style="margin-bottom:20px">
+        <div class="card-header">
+          <div class="card-title">
+            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg>
+            Typography
+          </div>
+          <p class="card-desc">Font family and base size</p>
+        </div>
+        <div class="card-body">
+          <div class="uic-section">
+            <div class="uic-label">Font Family</div>
+            <div class="uic-font-row">
+              <select class="uic-select" id="uic-font-select" onchange="uicApplyFont()">
+                <option value="">System Default (Segoe UI)</option>
+                <option value="Inter">Inter</option>
+                <option value="Roboto">Roboto</option>
+                <option value="Poppins">Poppins</option>
+                <option value="Nunito">Nunito</option>
+                <option value="Raleway">Raleway</option>
+                <option value="'JetBrains Mono','Fira Code',monospace">JetBrains Mono (Code)</option>
+                <option value="'Courier New',monospace">Courier New (Monospace)</option>
+                <option value="Georgia,serif">Georgia (Serif)</option>
+              </select>
+            </div>
+          </div>
+          <div class="uic-section">
+            <div class="uic-label">Font Size — <span id="uic-size-val" style="color:var(--blue);font-size:13px">14px</span></div>
+            <div class="uic-range-row">
+              <input type="range" class="uic-range" id="uic-font-size" min="11" max="20" value="14" oninput="uicApplyFont()"/>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Corner Style -->
+      <div class="card" style="margin-bottom:20px">
+        <div class="card-header">
+          <div class="card-title">
+            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="5"/></svg>
+            Corner Style
+          </div>
+          <p class="card-desc">Controls roundness of cards and buttons across the whole panel</p>
+        </div>
+        <div class="card-body">
+          <div class="uic-radius-row">
+            <button class="uic-radius-opt" data-r="0px" onclick="uicApplyRadius('0px')">⬜ Sharp</button>
+            <button class="uic-radius-opt" data-r="6px" onclick="uicApplyRadius('6px')">▫️ Slight</button>
+            <button class="uic-radius-opt active" data-r="12px" onclick="uicApplyRadius('12px')">🔲 Rounded (Default)</button>
+            <button class="uic-radius-opt" data-r="20px" onclick="uicApplyRadius('20px')">⭕ Extra Round</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Save / Reset -->
+      <div class="uic-action-bar">
+        <button class="uic-save-btn" onclick="saveUiCustomize()">💾 Save Settings</button>
+        <button class="uic-reset-btn" onclick="resetUiCustomize()">↩ Reset to Default</button>
+      </div>
     </section>
 
   </main>
@@ -2788,6 +2992,297 @@ function pollTunnel(tries=0) {
   });
 }
 
+// ── UI Customization ──────────────────────────────────────────────────────
+const UIC_PRESETS = {
+  default:  { label:'☀️ Default',    bg:'#f0f4f8', sidebar:'#ffffff', card:'#ffffff', blue:'#2563eb', text:'#0f172a', muted:'#64748b', border:'#e2e8f0', green:'#16a34a', red:'#dc2626', amber:'#d97706' },
+  dark:     { label:'🌙 Dark',       bg:'#0f172a', sidebar:'#1e293b', card:'#1e293b', blue:'#3b82f6', text:'#f1f5f9', muted:'#94a3b8', border:'#334155', green:'#22c55e', red:'#ef4444', amber:'#f59e0b' },
+  ocean:    { label:'🌊 Ocean',      bg:'#0c1a2e', sidebar:'#0f2744', card:'#122f50', blue:'#38bdf8', text:'#e0f2fe', muted:'#7dd3fc', border:'#1e4976', green:'#34d399', red:'#f87171', amber:'#fbbf24' },
+  sakura:   { label:'🌸 Sakura',     bg:'#fff0f5', sidebar:'#ffe4ef', card:'#fff8fb', blue:'#e879a0', text:'#4a1942', muted:'#be8aac', border:'#f9c6db', green:'#22c55e', red:'#ef4444', amber:'#f59e0b' },
+  forest:   { label:'🌿 Forest',     bg:'#0a1f0f', sidebar:'#0f2b15', card:'#122b18', blue:'#4ade80', text:'#dcfce7', muted:'#86efac', border:'#1a4225', green:'#86efac', red:'#f87171', amber:'#fbbf24' },
+  sunset:   { label:'🌅 Sunset',     bg:'#1c0a00', sidebar:'#2d1a00', card:'#2d1a00', blue:'#f97316', text:'#fff7ed', muted:'#fdba74', border:'#431a00', green:'#86efac', red:'#f87171', amber:'#fbbf24' },
+  midnight: { label:'🌃 Midnight',   bg:'#0a0a1a', sidebar:'#0d0d2b', card:'#12122e', blue:'#818cf8', text:'#e0e7ff', muted:'#a5b4fc', border:'#1e1e4a', green:'#4ade80', red:'#f87171', amber:'#fbbf24' },
+  cyber:    { label:'⚡ Cyber',      bg:'#000d0d', sidebar:'#001a1a', card:'#001a1a', blue:'#00ffcc', text:'#ccffee', muted:'#00aa88', border:'#004433', green:'#00ffaa', red:'#ff4466', amber:'#ffcc00' },
+  candy:    { label:'🍬 Candy',      bg:'#fff0ff', sidebar:'#ffe0ff', card:'#fff0ff', blue:'#a855f7', text:'#2e1065', muted:'#c084fc', border:'#f5d0fe', green:'#22c55e', red:'#ef4444', amber:'#f59e0b' },
+  steel:    { label:'🔩 Steel',      bg:'#1c1f26', sidebar:'#22262f', card:'#22262f', blue:'#60a5fa', text:'#e2e8f0', muted:'#94a3b8', border:'#2d333b', green:'#4ade80', red:'#f87171', amber:'#fbbf24' },
+};
+
+const UIC_BACKGROUNDS = [
+  { id:'none',     label:'None',          emoji:'⬜', thumb:'linear-gradient(135deg,#f0f4f8,#e2e8f0)',                                              css:null },
+  { id:'wave',     label:'Ocean Wave',    emoji:'🌊', thumb:'linear-gradient(-45deg,#0c1a2e,#0f2744,#1a3f6e,#0c3060)',                             css:'background:linear-gradient(-45deg,#0c1a2e,#0f2744,#1a3f6e,#0c3060);background-size:400% 400%;animation:cpm-grad 8s ease infinite' },
+  { id:'sakura',   label:'Sakura',        emoji:'🌸', thumb:'linear-gradient(-45deg,#ffe4ef,#ffb7c5,#ff8fab,#ffc2d1)',                             css:'background:linear-gradient(-45deg,#ffe4ef,#ffb7c5,#ff8fab,#ffc2d1,#ffb7d5);background-size:400% 400%;animation:cpm-grad 10s ease infinite' },
+  { id:'aurora',   label:'Aurora',        emoji:'🌌', thumb:'linear-gradient(-45deg,#0f172a,#1a1040,#0a2a1a,#1a0a3a)',                            css:'background:linear-gradient(-45deg,#0f172a,#1a1040,#0a2a1a,#1a0a3a,#0a0f3a);background-size:400% 400%;animation:cpm-grad 12s ease infinite' },
+  { id:'sunset',   label:'Sunset',        emoji:'🌅', thumb:'linear-gradient(-45deg,#8b1a00,#ff6b35,#f7931e,#ff2d6b)',                            css:'background:linear-gradient(-45deg,#1c0a00,#8b1a00,#ff6b35,#f7931e,#ff2d6b);background-size:400% 400%;animation:cpm-grad 8s ease infinite' },
+  { id:'cyber',    label:'Cyber Grid',    emoji:'⚡', thumb:'linear-gradient(-45deg,#000d0d,#001a1a,#004433,#001a0a)',                             css:'background:linear-gradient(-45deg,#000d0d,#001a1a,#004433,#001a0a,#002020);background-size:400% 400%;animation:cpm-grad 15s ease infinite' },
+  { id:'midnight', label:'Midnight',      emoji:'🌃', thumb:'linear-gradient(-45deg,#0a0a1a,#0d0d2b,#1a0a2e,#0a1a2e)',                           css:'background:linear-gradient(-45deg,#0a0a1a,#0d0d2b,#1a0a2e,#0a1a2e,#0d0d2b);background-size:400% 400%;animation:cpm-grad 10s ease infinite' },
+  { id:'forest',   label:'Deep Forest',   emoji:'🌿', thumb:'linear-gradient(-45deg,#0a1f0f,#0f2b15,#1a3a20,#0a2a1a)',                           css:'background:linear-gradient(-45deg,#0a1f0f,#0f2b15,#1a3a20,#0a2a1a,#122b18);background-size:400% 400%;animation:cpm-grad 12s ease infinite' },
+  { id:'neon',     label:'Neon City',     emoji:'🎮', thumb:'linear-gradient(-45deg,#0a0020,#200a40,#0a2040,#1a0030)',                            css:'background:linear-gradient(-45deg,#0a0020,#200a40,#0a2040,#1a0030,#300a20);background-size:400% 400%;animation:cpm-grad 8s ease infinite' },
+  { id:'anime',    label:'Anime Sky',     emoji:'🎌', thumb:'linear-gradient(-45deg,#87ceeb,#ffd4e8,#b8e8ff,#ffe4b8)',                            css:'background:linear-gradient(-45deg,#87ceeb,#ffd4e8,#b8e8ff,#ffe4b8,#ffc8e8);background-size:400% 400%;animation:cpm-grad 12s ease infinite' },
+  { id:'nebula',   label:'Nebula',        emoji:'✨', thumb:'linear-gradient(-45deg,#0a001a,#200a40,#401040,#201040)',                             css:'background:linear-gradient(-45deg,#0a001a,#200a40,#401040,#201040,#0a1040);background-size:400% 400%;animation:cpm-grad 14s ease infinite' },
+  { id:'candy',    label:'Candy Pop',     emoji:'🍬', thumb:'linear-gradient(-45deg,#ff9de2,#ffb3d9,#b39ddb,#9dc8ff)',                            css:'background:linear-gradient(-45deg,#ff9de2,#ffb3d9,#b39ddb,#9dc8ff,#ffd9b3);background-size:400% 400%;animation:cpm-grad 9s ease infinite' },
+  { id:'lava',     label:'Lava',          emoji:'🔥', thumb:'linear-gradient(-45deg,#4a0000,#8b0000,#ff4500,#ff6600)',                             css:'background:linear-gradient(-45deg,#4a0000,#8b0000,#ff4500,#ff6600,#cc0000);background-size:400% 400%;animation:cpm-grad 7s ease infinite' },
+  { id:'custom-img', label:'Custom Image',emoji:'🖼️', thumb:'linear-gradient(135deg,#667eea,#764ba2)', css:null, custom:true },
+  { id:'custom-vid', label:'Custom Video',emoji:'🎬', thumb:'linear-gradient(135deg,#2c3e50,#3498db)', css:null, customVid:true },
+];
+
+let uicCurrentPreset = 'default';
+let uicCurrentBg = 'none';
+let uicSettings = {};
+
+function openUiCustomizeWithCheck(el) {
+  requirePremium('ui_customize', () => { showPage('uicustom', el); uicRenderPage(); });
+}
+
+function uicRenderPage() {
+  const presetEl = document.getElementById('uic-preset-btns');
+  if (presetEl) {
+    presetEl.innerHTML = Object.entries(UIC_PRESETS).map(([key, p]) =>
+      `<button class="uic-preset ${uicCurrentPreset===key?'active':''}" onclick="uicApplyPreset('${key}')">${p.label}</button>`
+    ).join('');
+  }
+  const bgEl = document.getElementById('uic-bg-grid');
+  if (bgEl) {
+    bgEl.innerHTML = UIC_BACKGROUNDS.map(bg =>
+      `<div class="uic-bg-card ${uicCurrentBg===bg.id?'active':''}" onclick="uicApplyBackground('${bg.id}')">
+        <div class="uic-bg-thumb" style="background:${bg.thumb}"></div>
+        <div class="uic-bg-name">${bg.emoji} ${bg.label}</div>
+      </div>`
+    ).join('');
+  }
+  uicSyncPickers();
+  const savedFont = uicSettings.fontFamily || '';
+  const savedSize = uicSettings.fontSize || '14';
+  const fontEl = document.getElementById('uic-font-select');
+  if (fontEl) fontEl.value = savedFont;
+  const sizeEl = document.getElementById('uic-font-size');
+  if (sizeEl) { sizeEl.value = savedSize; const v=document.getElementById('uic-size-val'); if(v)v.textContent=savedSize+'px'; }
+  const savedRadius = uicSettings.radius || '12px';
+  document.querySelectorAll('.uic-radius-opt').forEach(b => b.classList.toggle('active', b.dataset.r===savedRadius));
+}
+
+function uicSyncPickers() {
+  const pairs = [['bg','sw-bg'],['sidebar','sw-sidebar'],['card','sw-card'],['blue','sw-blue'],['text','sw-text'],['muted','sw-muted'],['border','sw-bord'],['green','sw-green'],['red','sw-red'],['amber','sw-amber']];
+  pairs.forEach(([varN, swId]) => {
+    const inp = document.getElementById('uic-clr-' + varN);
+    const sw  = document.getElementById(swId);
+    if (!inp) return;
+    const val = getComputedStyle(document.documentElement).getPropertyValue('--' + varN).trim();
+    const hex = uicToHex(val);
+    inp.value = hex;
+    if (sw) sw.style.background = hex;
+  });
+}
+
+function uicToHex(color) {
+  if (!color) return '#000000';
+  const m = color.trim().match(/^#([0-9a-fA-F]{6})/);
+  if (m) return '#' + m[1];
+  const m3 = color.trim().match(/^#([0-9a-fA-F]{3})$/);
+  if (m3) { const [r,g,b]=m3[1].split('').map(c=>c+c); return '#'+r+g+b; }
+  const tmp = document.createElement('canvas').getContext('2d');
+  tmp.fillStyle = color;
+  const c = tmp.fillStyle;
+  if (c.startsWith('#')) return c.slice(0,7);
+  const rgb = c.match(/\d+/g);
+  if (rgb) return '#'+rgb.slice(0,3).map(x=>parseInt(x).toString(16).padStart(2,'0')).join('');
+  return '#000000';
+}
+
+function uicPickColor(varName, el) {
+  const val = el.value;
+  document.documentElement.style.setProperty('--' + varName, val);
+  const sw = el.parentElement;
+  if (sw) sw.style.background = val;
+  uicCurrentPreset = 'custom';
+  document.querySelectorAll('.uic-preset').forEach(b => b.classList.remove('active'));
+  uicSettings.colors = uicSettings.colors || {};
+  uicSettings.colors['--' + varName] = val;
+}
+
+function uicHexAlpha(hex, a) {
+  if (!hex || !hex.startsWith('#')) return `rgba(0,0,0,${a})`;
+  const r=parseInt(hex.slice(1,3),16), g=parseInt(hex.slice(3,5),16), b=parseInt(hex.slice(5,7),16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+function uicApplyPreset(key) {
+  const p = UIC_PRESETS[key];
+  if (!p) return;
+  const root = document.documentElement;
+  root.style.setProperty('--bg',     p.bg);
+  root.style.setProperty('--sidebar',p.sidebar);
+  root.style.setProperty('--card',   p.card);
+  root.style.setProperty('--blue',   p.blue);
+  root.style.setProperty('--blue-light', uicHexAlpha(p.blue, 0.12));
+  root.style.setProperty('--blue-mid',   uicHexAlpha(p.blue, 0.30));
+  root.style.setProperty('--text',   p.text);
+  root.style.setProperty('--muted',  p.muted);
+  root.style.setProperty('--border', p.border);
+  root.style.setProperty('--green',  p.green);
+  root.style.setProperty('--red',    p.red);
+  root.style.setProperty('--amber',  p.amber);
+  uicCurrentPreset = key;
+  uicSettings.preset = key;
+  uicSettings.colors = null;
+  document.querySelectorAll('.uic-preset').forEach((b,i) => {
+    b.classList.toggle('active', Object.keys(UIC_PRESETS)[i] === key);
+  });
+  uicSyncPickers();
+  toast(`Theme applied: ${p.label}`, true);
+}
+
+function uicApplyBackground(bgId) {
+  const bg = UIC_BACKGROUNDS.find(b => b.id === bgId);
+  if (!bg) return;
+  uicCurrentBg = bgId;
+  uicSettings.background = bgId;
+  const bgLayer = document.getElementById('cpm-bg-layer');
+  const bgVid   = document.getElementById('cpm-bg-video');
+  if (bgVid) { bgVid.style.display='none'; bgVid.src=''; }
+  document.getElementById('uic-custom-img-row').style.display = (bg.custom ? 'flex' : 'none');
+  document.getElementById('uic-custom-vid-row').style.display = (bg.customVid ? 'flex' : 'none');
+  if (bg.custom || bg.customVid) {
+    document.querySelectorAll('.uic-bg-card').forEach((c,i) => c.classList.toggle('active', UIC_BACKGROUNDS[i].id===bgId));
+    return;
+  }
+  if (bgId === 'none') {
+    if (bgLayer) bgLayer.style.cssText = 'position:fixed;inset:0;z-index:-2;pointer-events:none';
+    document.getElementById('cpm-bg-style').innerHTML = '';
+    document.documentElement.style.removeProperty('--bg');
+    if (uicSettings.preset && UIC_PRESETS[uicSettings.preset]) {
+      document.documentElement.style.setProperty('--bg', UIC_PRESETS[uicSettings.preset].bg);
+    }
+  } else if (bg.css) {
+    if (bgLayer) bgLayer.style.cssText = `position:fixed;inset:0;z-index:-2;pointer-events:none;${bg.css}`;
+    document.getElementById('cpm-bg-style').innerHTML = '';
+    document.documentElement.style.setProperty('--bg', 'transparent');
+  }
+  document.querySelectorAll('.uic-bg-card').forEach((c,i) => c.classList.toggle('active', UIC_BACKGROUNDS[i].id===bgId));
+  if (bgId !== 'none') toast(`Background: ${bg.emoji} ${bg.label}`, true);
+}
+
+function uicApplyCustomImage() {
+  const url = document.getElementById('uic-img-url').value.trim();
+  if (!url) { toast('Enter an image URL first', false); return; }
+  const bgLayer = document.getElementById('cpm-bg-layer');
+  if (bgLayer) bgLayer.style.cssText = `position:fixed;inset:0;z-index:-2;pointer-events:none;background-image:url('${url.replace(/'/g,"\\'")}');background-size:cover;background-position:center;background-repeat:no-repeat`;
+  document.getElementById('cpm-bg-style').innerHTML = '';
+  document.documentElement.style.setProperty('--bg', 'transparent');
+  uicSettings.customImgUrl = url;
+  toast('🖼️ Image background applied', true);
+}
+
+function uicApplyCustomVideo() {
+  const url = document.getElementById('uic-vid-url').value.trim();
+  if (!url) { toast('Enter a video URL first', false); return; }
+  const vid = document.getElementById('cpm-bg-video');
+  if (vid) { vid.src = url; vid.style.display = 'block'; vid.load(); vid.play().catch(()=>{}); }
+  const bgLayer = document.getElementById('cpm-bg-layer');
+  if (bgLayer) bgLayer.style.cssText = 'position:fixed;inset:0;z-index:-2;pointer-events:none';
+  document.getElementById('cpm-bg-style').innerHTML = '';
+  document.documentElement.style.setProperty('--bg', 'transparent');
+  uicSettings.customVidUrl = url;
+  toast('🎬 Video background applied', true);
+}
+
+function uicApplyFont() {
+  const family = document.getElementById('uic-font-select').value;
+  const size   = document.getElementById('uic-font-size').value;
+  const valEl  = document.getElementById('uic-size-val');
+  if (valEl) valEl.textContent = size + 'px';
+  document.body.style.fontFamily = family ? (family + ',Segoe UI,system-ui,sans-serif') : '';
+  document.body.style.fontSize   = size ? size + 'px' : '';
+  uicSettings.fontFamily = family;
+  uicSettings.fontSize   = size;
+}
+
+function uicApplyRadius(r) {
+  document.documentElement.style.setProperty('--radius', r);
+  document.querySelectorAll('.uic-radius-opt').forEach(b => b.classList.toggle('active', b.dataset.r===r));
+  uicSettings.radius = r;
+}
+
+function saveUiCustomize() {
+  const root = document.documentElement;
+  const vars  = ['--bg','--sidebar','--card','--blue','--text','--muted','--border','--green','--red','--amber'];
+  const colors = {};
+  vars.forEach(v => { const val = root.style.getPropertyValue(v); if (val) colors[v] = val; });
+  uicSettings.savedColors    = colors;
+  uicSettings.preset         = uicCurrentPreset;
+  uicSettings.background     = uicCurrentBg;
+  uicSettings.radius         = root.style.getPropertyValue('--radius') || '12px';
+  uicSettings.fontFamily     = document.getElementById('uic-font-select')?.value || '';
+  uicSettings.fontSize       = document.getElementById('uic-font-size')?.value   || '14';
+  if (uicCurrentBg==='custom-img') uicSettings.customImgUrl = document.getElementById('uic-img-url')?.value||'';
+  if (uicCurrentBg==='custom-vid') uicSettings.customVidUrl = document.getElementById('uic-vid-url')?.value||'';
+  localStorage.setItem('cpm_ui_settings', JSON.stringify(uicSettings));
+  toast('✅ UI settings saved!', true);
+}
+
+function resetUiCustomize() {
+  if (!confirm('Reset all UI customizations to default?')) return;
+  localStorage.removeItem('cpm_ui_settings');
+  uicSettings = {}; uicCurrentPreset = 'default'; uicCurrentBg = 'none';
+  const root = document.documentElement;
+  ['--bg','--sidebar','--card','--blue','--blue-light','--blue-mid','--text','--muted','--border','--green','--red','--amber','--radius'].forEach(v=>root.style.removeProperty(v));
+  document.body.style.fontFamily = '';
+  document.body.style.fontSize   = '';
+  const bgLayer = document.getElementById('cpm-bg-layer');
+  if (bgLayer) bgLayer.style.cssText = 'position:fixed;inset:0;z-index:-2;pointer-events:none';
+  document.getElementById('cpm-bg-style').innerHTML = '';
+  const vid = document.getElementById('cpm-bg-video');
+  if (vid) { vid.style.display='none'; vid.src=''; }
+  uicRenderPage();
+  toast('↩ Reset to defaults', true);
+}
+
+function initUiCustomize() {
+  const raw = localStorage.getItem('cpm_ui_settings');
+  if (!raw) return;
+  try {
+    uicSettings = JSON.parse(raw);
+    uicCurrentPreset = uicSettings.preset || 'default';
+    uicCurrentBg     = uicSettings.background || 'none';
+    const root = document.documentElement;
+    // Apply saved inline color overrides
+    if (uicSettings.savedColors && Object.keys(uicSettings.savedColors).length) {
+      Object.entries(uicSettings.savedColors).forEach(([v, val]) => root.style.setProperty(v, val));
+    } else if (uicSettings.preset && UIC_PRESETS[uicSettings.preset]) {
+      // Silently reapply preset without toast
+      const p = UIC_PRESETS[uicSettings.preset];
+      root.style.setProperty('--bg',     p.bg);   root.style.setProperty('--sidebar',p.sidebar);
+      root.style.setProperty('--card',   p.card);  root.style.setProperty('--blue',   p.blue);
+      root.style.setProperty('--blue-light', uicHexAlpha(p.blue,0.12));
+      root.style.setProperty('--blue-mid',   uicHexAlpha(p.blue,0.30));
+      root.style.setProperty('--text',   p.text);  root.style.setProperty('--muted',  p.muted);
+      root.style.setProperty('--border', p.border); root.style.setProperty('--green',  p.green);
+      root.style.setProperty('--red',    p.red);   root.style.setProperty('--amber',  p.amber);
+    }
+    // Apply background
+    const bgId = uicSettings.background;
+    if (bgId && bgId !== 'none') {
+      const bgLayer = document.getElementById('cpm-bg-layer');
+      if (bgId === 'custom-img' && uicSettings.customImgUrl) {
+        if (bgLayer) bgLayer.style.cssText = `position:fixed;inset:0;z-index:-2;pointer-events:none;background-image:url('${uicSettings.customImgUrl.replace(/'/g,"\\'")}');background-size:cover;background-position:center`;
+        root.style.setProperty('--bg','transparent');
+      } else if (bgId === 'custom-vid' && uicSettings.customVidUrl) {
+        const vid = document.getElementById('cpm-bg-video');
+        if (vid) { vid.src=uicSettings.customVidUrl; vid.style.display='block'; vid.play().catch(()=>{}); }
+        root.style.setProperty('--bg','transparent');
+      } else {
+        const bg = UIC_BACKGROUNDS.find(b=>b.id===bgId);
+        if (bg && bg.css) {
+          if (bgLayer) bgLayer.style.cssText = `position:fixed;inset:0;z-index:-2;pointer-events:none;${bg.css}`;
+          root.style.setProperty('--bg','transparent');
+        }
+      }
+    }
+    // Apply radius, font
+    if (uicSettings.radius) root.style.setProperty('--radius', uicSettings.radius);
+    if (uicSettings.fontFamily) document.body.style.fontFamily = uicSettings.fontFamily+',Segoe UI,system-ui,sans-serif';
+    if (uicSettings.fontSize)   document.body.style.fontSize   = uicSettings.fontSize+'px';
+  } catch(e) { localStorage.removeItem('cpm_ui_settings'); }
+}
+
 // ── Logout / Switch Account ───────────────────────────────────────────────
 function logoutPanel() {
   if (!confirm('Log out and return to the startup screen?')) return;
@@ -2797,6 +3292,7 @@ function logoutPanel() {
 
 // ── init & poll ───────────────────────────────────────────────────────────
 activationInit();
+initUiCustomize();
 checkKvmStatus();
 loadStats(); loadVps();
 pollTunnel();
@@ -2990,10 +3486,18 @@ echo -e "${G}  Installation complete!${N}"
 echo -e "${G}═══════════════════════════════════════════════${N}"
 echo ""
 echo -e "  Start the panel:"
-echo -e "  bash run.sh & lt --port 5000
-           ⚡POWERED BY ABDULLAH
-echo -e "    
+echo -e "    ${Y}bash run.sh${N}"
 echo ""
 echo -e "  Then open:"
 echo -e "    ${Y}http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo localhost):5000${N}"
+echo ""
+echo -e "  ${Y}FIRST-TIME SETUP:${N}"
+echo -e "    Click 'Owner Panel' in the sidebar and create your secret owner key."
+echo -e "    No default key is pre-set — you choose your own on first run."
+echo ""
+echo -e "  ${Y}SUPABASE:${N}"
+echo -e "    Run this SQL in Supabase Dashboard → SQL Editor:"
+echo -e "    ${Y}https://supabase.com/dashboard/project/vompmplmluxwtwgofgks/editor${N}"
+echo -e "    SQL file: copy from ${Y}supabase_tables.sql${N} (provided separately)"
+echo ""
 [[ -n "${SUDO_USER:-}" ]] && echo -e "  ${Y}NOTE:${N} Log out and back in so '$SUDO_USER' can
