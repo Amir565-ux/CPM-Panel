@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CPM Panel — One-Shot Installer
+#  CPM Panel — One-Shot Installer  (v1 — owner-key security fix)
 #  GitHub : https://github.com/Amir565-ux/CPM-Panel
 #  Usage  : sudo bash install.sh
 #  ⚡POWERED BY ABDULLAH
@@ -2978,6 +2978,7 @@ const UIC_PRESETS = {
   cyber:    { label:'⚡ Cyber',      bg:'#000d0d', sidebar:'#001a1a', card:'#001a1a', blue:'#00ffcc', text:'#ccffee', muted:'#00aa88', border:'#004433', green:'#00ffaa', red:'#ff4466', amber:'#ffcc00' },
   candy:    { label:'🍬 Candy',      bg:'#fff0ff', sidebar:'#ffe0ff', card:'#fff0ff', blue:'#a855f7', text:'#2e1065', muted:'#c084fc', border:'#f5d0fe', green:'#22c55e', red:'#ef4444', amber:'#f59e0b' },
   steel:    { label:'🔩 Steel',      bg:'#1c1f26', sidebar:'#22262f', card:'#22262f', blue:'#60a5fa', text:'#e2e8f0', muted:'#94a3b8', border:'#2d333b', green:'#4ade80', red:'#f87171', amber:'#fbbf24' },
+  glass:    { label:'💎 Light Transparent', bg:'rgba(255,255,255,0.06)', sidebar:'rgba(255,255,255,0.14)', card:'rgba(255,255,255,0.10)', blue:'#60a5fa', text:'#f8fafc', muted:'#cbd5e1', border:'rgba(255,255,255,0.22)', green:'#4ade80', red:'#f87171', amber:'#fbbf24' },
 };
 
 // Background handled via file uploads — no preset gallery
@@ -3466,5 +3467,10 @@ echo -e "    ${Y}bash run.sh${N}"
 echo ""
 echo -e "  Then open:"
 echo -e "    ${Y}http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo localhost):5000${N}"
+echo ""
+echo -e "  ${Y}FIRST-TIME SETUP:${N}"
+echo -e "    Click 'Owner Panel' in the sidebar and create your secret owner key."
+echo -e "    No default key is pre-set — you choose your own on first run."
+echo ""
 echo ""
 [[ -n "${SUDO_USER:-}" ]] && echo -e "  ${Y}NOTE:${N} Log out and back in so '$SUDO_USER' can
