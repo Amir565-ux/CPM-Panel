@@ -27,7 +27,7 @@ cat <<'BANNER'
   ╚██████╗██║     ██║ ╚═╝ ██║    ██║     ██║  ██║██║ ╚████║███████╗███████╗
    ╚═════╝╚═╝     ╚═╝     ╚═╝    ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝
 BANNER
-echo -e "${N}  KVM VPS Management Panel — Installer v2\n"
+echo -e "${N}  KVM VPS Management Panel — Installer v1\n"
 
 # ─── 1. System packages ───────────────────────────────────────────────────────
 sep "1/4  System packages"
@@ -1351,6 +1351,11 @@ else
   .uic-radius-opt{padding:8px 16px;border-radius:8px;border:2px solid var(--border);background:var(--card);color:var(--text);font-size:13px;font-weight:600;cursor:pointer;transition:.2s}
   .uic-radius-opt:hover{border-color:var(--blue);color:var(--blue)}
   .uic-radius-opt.active{border-color:var(--blue);background:var(--blue);color:#fff}
+  .uic-upload-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:14px}
+  .uic-upload-drop{border:2px dashed var(--border);border-radius:12px;height:140px;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:.2s;overflow:hidden;background:var(--blue-light);margin-bottom:8px}
+  .uic-upload-drop:hover{border-color:var(--blue)}
+  .uic-clear-btn{width:100%;padding:8px;border:none;border-radius:8px;background:#fee2e2;color:#dc2626;font-size:12px;font-weight:600;cursor:pointer;transition:.15s}
+  .uic-clear-btn:hover{background:#fca5a5}
   .uic-tip{font-size:12px;color:var(--muted);padding:8px 12px;background:var(--blue-light);border-radius:8px;margin-top:8px}
   @keyframes cpm-grad{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
   @keyframes cpm-thumb-idle{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
@@ -1438,7 +1443,7 @@ else
     </a>
     <a onclick="openUiCustomizeWithCheck(this)">
       <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 22C6.5 22 2 17.5 2 12c0-5.5 4.5-10 10-10 4.5 0 8 3.1 8 7 0 2.8-2.2 5-5 5h-1.4c-.6 0-1 .5-1 1.1 0 .3.1.5.1.8.1.5-.2 1-.7 1.1z"/><circle cx="8.5" cy="9.5" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="7" r="1.5" fill="currentColor" stroke="none"/><circle cx="15.5" cy="9.5" r="1.5" fill="currentColor" stroke="none"/></svg>
-      UI Customize 🎨
+      UI Customize
     </a>
   </nav>
   <a onclick="enterOwnerPanel()" id="nav-owner" style="display:none;margin-top:auto;background:linear-gradient(135deg,#fef3c7,#fde68a);color:#92400e;border-radius:8px;margin:0 10px 8px">
@@ -1826,51 +1831,6 @@ else
             <div class="uic-label">Theme Presets</div>
             <div class="uic-presets" id="uic-preset-btns"></div>
           </div>
-          <div class="uic-section">
-            <div class="uic-label">Custom Colors — click any swatch to open color picker</div>
-            <div class="uic-color-grid">
-              <div class="uic-color-row">
-                <div class="uic-swatch" id="sw-bg"><input type="color" id="uic-clr-bg" oninput="uicPickColor('bg',this)" onchange="uicPickColor('bg',this)"/></div>
-                <span class="uic-color-name">Page Background</span>
-              </div>
-              <div class="uic-color-row">
-                <div class="uic-swatch" id="sw-sidebar"><input type="color" id="uic-clr-sidebar" oninput="uicPickColor('sidebar',this)" onchange="uicPickColor('sidebar',this)"/></div>
-                <span class="uic-color-name">Sidebar</span>
-              </div>
-              <div class="uic-color-row">
-                <div class="uic-swatch" id="sw-card"><input type="color" id="uic-clr-card" oninput="uicPickColor('card',this)" onchange="uicPickColor('card',this)"/></div>
-                <span class="uic-color-name">Card Background</span>
-              </div>
-              <div class="uic-color-row">
-                <div class="uic-swatch" id="sw-blue"><input type="color" id="uic-clr-blue" oninput="uicPickColor('blue',this)" onchange="uicPickColor('blue',this)"/></div>
-                <span class="uic-color-name">Accent / Buttons</span>
-              </div>
-              <div class="uic-color-row">
-                <div class="uic-swatch" id="sw-text"><input type="color" id="uic-clr-text" oninput="uicPickColor('text',this)" onchange="uicPickColor('text',this)"/></div>
-                <span class="uic-color-name">Primary Text</span>
-              </div>
-              <div class="uic-color-row">
-                <div class="uic-swatch" id="sw-muted"><input type="color" id="uic-clr-muted" oninput="uicPickColor('muted',this)" onchange="uicPickColor('muted',this)"/></div>
-                <span class="uic-color-name">Muted Text</span>
-              </div>
-              <div class="uic-color-row">
-                <div class="uic-swatch" id="sw-border"><input type="color" id="uic-clr-border" oninput="uicPickColor('border',this)" onchange="uicPickColor('border',this)"/></div>
-                <span class="uic-color-name">Borders / Dividers</span>
-              </div>
-              <div class="uic-color-row">
-                <div class="uic-swatch" id="sw-green"><input type="color" id="uic-clr-green" oninput="uicPickColor('green',this)" onchange="uicPickColor('green',this)"/></div>
-                <span class="uic-color-name">Running / Success</span>
-              </div>
-              <div class="uic-color-row">
-                <div class="uic-swatch" id="sw-red"><input type="color" id="uic-clr-red" oninput="uicPickColor('red',this)" onchange="uicPickColor('red',this)"/></div>
-                <span class="uic-color-name">Error / Stop / Delete</span>
-              </div>
-              <div class="uic-color-row">
-                <div class="uic-swatch" id="sw-amber"><input type="color" id="uic-clr-amber" oninput="uicPickColor('amber',this)" onchange="uicPickColor('amber',this)"/></div>
-                <span class="uic-color-name">Warning / Restart</span>
-              </div>
-            </div>
-          </div>
         </div>
       </div>
 
@@ -1881,22 +1841,36 @@ else
             <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
             Background
           </div>
-          <p class="card-desc">Animated gradients, custom images, or video — all built in, no internet needed for animations</p>
+          <p class="card-desc">Upload your own image or video as a full-screen panel background</p>
         </div>
         <div class="card-body">
-          <div class="uic-label">Built-in Backgrounds (🎌 Anime-inspired &amp; more)</div>
-          <div class="uic-bg-grid" id="uic-bg-grid"></div>
-          <div id="uic-custom-img-row" class="uic-custom-row" style="display:none">
-            <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
-            <input class="uic-url-inp" id="uic-img-url" placeholder="https://example.com/bg.jpg  or  /local/path.jpg" type="url"/>
-            <button class="uic-apply-btn" onclick="uicApplyCustomImage()">Apply Image</button>
+          <div class="uic-upload-grid">
+            <div>
+              <div class="uic-label">📷 Background Image</div>
+              <div class="uic-upload-drop" id="uic-img-drop" onclick="document.getElementById('uic-img-file').click()" ondragover="event.preventDefault()" ondrop="uicDropImage(event)">
+                <div id="uic-img-preview-wrap" style="display:flex;flex-direction:column;align-items:center;gap:8px;color:var(--muted)">
+                  <svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+                  <span style="font-size:13px;font-weight:600">Click or drag an image here</span>
+                  <span style="font-size:11px">JPG, PNG, GIF, WebP — max 8 MB</span>
+                </div>
+              </div>
+              <input type="file" id="uic-img-file" accept="image/*" style="display:none" onchange="uicUploadImage(this)"/>
+              <button id="uic-img-clear-btn" class="uic-clear-btn" onclick="uicClearImage()" style="display:none">✕ Remove Image</button>
+            </div>
+            <div>
+              <div class="uic-label">🎬 Background Video</div>
+              <div class="uic-upload-drop" id="uic-vid-drop" onclick="document.getElementById('uic-vid-file').click()" ondragover="event.preventDefault()" ondrop="uicDropVideo(event)">
+                <div id="uic-vid-preview-wrap" style="display:flex;flex-direction:column;align-items:center;gap:8px;color:var(--muted)">
+                  <svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+                  <span style="font-size:13px;font-weight:600">Click or drag a video here</span>
+                  <span style="font-size:11px">MP4, WebM — resets on page reload</span>
+                </div>
+              </div>
+              <input type="file" id="uic-vid-file" accept="video/*" style="display:none" onchange="uicUploadVideo(this)"/>
+              <button id="uic-vid-clear-btn" class="uic-clear-btn" onclick="uicClearVideo()" style="display:none">✕ Remove Video</button>
+            </div>
           </div>
-          <div id="uic-custom-vid-row" class="uic-custom-row" style="display:none">
-            <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
-            <input class="uic-url-inp" id="uic-vid-url" placeholder="https://example.com/bg.mp4  (video file URL)" type="url"/>
-            <button class="uic-apply-btn" onclick="uicApplyCustomVideo()">Apply Video</button>
-          </div>
-          <div class="uic-tip">💡 Tip: After picking a background, use a dark color theme like Dark, Ocean, or Midnight so text stays readable on top.</div>
+          <div class="uic-tip">💡 Tip: After setting a background, pick a dark theme (Dark, Ocean, Midnight) so text stays readable on top.</div>
         </div>
       </div>
 
@@ -3006,23 +2980,7 @@ const UIC_PRESETS = {
   steel:    { label:'🔩 Steel',      bg:'#1c1f26', sidebar:'#22262f', card:'#22262f', blue:'#60a5fa', text:'#e2e8f0', muted:'#94a3b8', border:'#2d333b', green:'#4ade80', red:'#f87171', amber:'#fbbf24' },
 };
 
-const UIC_BACKGROUNDS = [
-  { id:'none',     label:'None',          emoji:'⬜', thumb:'linear-gradient(135deg,#f0f4f8,#e2e8f0)',                                              css:null },
-  { id:'wave',     label:'Ocean Wave',    emoji:'🌊', thumb:'linear-gradient(-45deg,#0c1a2e,#0f2744,#1a3f6e,#0c3060)',                             css:'background:linear-gradient(-45deg,#0c1a2e,#0f2744,#1a3f6e,#0c3060);background-size:400% 400%;animation:cpm-grad 8s ease infinite' },
-  { id:'sakura',   label:'Sakura',        emoji:'🌸', thumb:'linear-gradient(-45deg,#ffe4ef,#ffb7c5,#ff8fab,#ffc2d1)',                             css:'background:linear-gradient(-45deg,#ffe4ef,#ffb7c5,#ff8fab,#ffc2d1,#ffb7d5);background-size:400% 400%;animation:cpm-grad 10s ease infinite' },
-  { id:'aurora',   label:'Aurora',        emoji:'🌌', thumb:'linear-gradient(-45deg,#0f172a,#1a1040,#0a2a1a,#1a0a3a)',                            css:'background:linear-gradient(-45deg,#0f172a,#1a1040,#0a2a1a,#1a0a3a,#0a0f3a);background-size:400% 400%;animation:cpm-grad 12s ease infinite' },
-  { id:'sunset',   label:'Sunset',        emoji:'🌅', thumb:'linear-gradient(-45deg,#8b1a00,#ff6b35,#f7931e,#ff2d6b)',                            css:'background:linear-gradient(-45deg,#1c0a00,#8b1a00,#ff6b35,#f7931e,#ff2d6b);background-size:400% 400%;animation:cpm-grad 8s ease infinite' },
-  { id:'cyber',    label:'Cyber Grid',    emoji:'⚡', thumb:'linear-gradient(-45deg,#000d0d,#001a1a,#004433,#001a0a)',                             css:'background:linear-gradient(-45deg,#000d0d,#001a1a,#004433,#001a0a,#002020);background-size:400% 400%;animation:cpm-grad 15s ease infinite' },
-  { id:'midnight', label:'Midnight',      emoji:'🌃', thumb:'linear-gradient(-45deg,#0a0a1a,#0d0d2b,#1a0a2e,#0a1a2e)',                           css:'background:linear-gradient(-45deg,#0a0a1a,#0d0d2b,#1a0a2e,#0a1a2e,#0d0d2b);background-size:400% 400%;animation:cpm-grad 10s ease infinite' },
-  { id:'forest',   label:'Deep Forest',   emoji:'🌿', thumb:'linear-gradient(-45deg,#0a1f0f,#0f2b15,#1a3a20,#0a2a1a)',                           css:'background:linear-gradient(-45deg,#0a1f0f,#0f2b15,#1a3a20,#0a2a1a,#122b18);background-size:400% 400%;animation:cpm-grad 12s ease infinite' },
-  { id:'neon',     label:'Neon City',     emoji:'🎮', thumb:'linear-gradient(-45deg,#0a0020,#200a40,#0a2040,#1a0030)',                            css:'background:linear-gradient(-45deg,#0a0020,#200a40,#0a2040,#1a0030,#300a20);background-size:400% 400%;animation:cpm-grad 8s ease infinite' },
-  { id:'anime',    label:'Anime Sky',     emoji:'🎌', thumb:'linear-gradient(-45deg,#87ceeb,#ffd4e8,#b8e8ff,#ffe4b8)',                            css:'background:linear-gradient(-45deg,#87ceeb,#ffd4e8,#b8e8ff,#ffe4b8,#ffc8e8);background-size:400% 400%;animation:cpm-grad 12s ease infinite' },
-  { id:'nebula',   label:'Nebula',        emoji:'✨', thumb:'linear-gradient(-45deg,#0a001a,#200a40,#401040,#201040)',                             css:'background:linear-gradient(-45deg,#0a001a,#200a40,#401040,#201040,#0a1040);background-size:400% 400%;animation:cpm-grad 14s ease infinite' },
-  { id:'candy',    label:'Candy Pop',     emoji:'🍬', thumb:'linear-gradient(-45deg,#ff9de2,#ffb3d9,#b39ddb,#9dc8ff)',                            css:'background:linear-gradient(-45deg,#ff9de2,#ffb3d9,#b39ddb,#9dc8ff,#ffd9b3);background-size:400% 400%;animation:cpm-grad 9s ease infinite' },
-  { id:'lava',     label:'Lava',          emoji:'🔥', thumb:'linear-gradient(-45deg,#4a0000,#8b0000,#ff4500,#ff6600)',                             css:'background:linear-gradient(-45deg,#4a0000,#8b0000,#ff4500,#ff6600,#cc0000);background-size:400% 400%;animation:cpm-grad 7s ease infinite' },
-  { id:'custom-img', label:'Custom Image',emoji:'🖼️', thumb:'linear-gradient(135deg,#667eea,#764ba2)', css:null, custom:true },
-  { id:'custom-vid', label:'Custom Video',emoji:'🎬', thumb:'linear-gradient(135deg,#2c3e50,#3498db)', css:null, customVid:true },
-];
+// Background handled via file uploads — no preset gallery
 
 let uicCurrentPreset = 'default';
 let uicCurrentBg = 'none';
@@ -3039,16 +2997,6 @@ function uicRenderPage() {
       `<button class="uic-preset ${uicCurrentPreset===key?'active':''}" onclick="uicApplyPreset('${key}')">${p.label}</button>`
     ).join('');
   }
-  const bgEl = document.getElementById('uic-bg-grid');
-  if (bgEl) {
-    bgEl.innerHTML = UIC_BACKGROUNDS.map(bg =>
-      `<div class="uic-bg-card ${uicCurrentBg===bg.id?'active':''}" onclick="uicApplyBackground('${bg.id}')">
-        <div class="uic-bg-thumb" style="background:${bg.thumb}"></div>
-        <div class="uic-bg-name">${bg.emoji} ${bg.label}</div>
-      </div>`
-    ).join('');
-  }
-  uicSyncPickers();
   const savedFont = uicSettings.fontFamily || '';
   const savedSize = uicSettings.fontSize || '14';
   const fontEl = document.getElementById('uic-font-select');
@@ -3057,6 +3005,14 @@ function uicRenderPage() {
   if (sizeEl) { sizeEl.value = savedSize; const v=document.getElementById('uic-size-val'); if(v)v.textContent=savedSize+'px'; }
   const savedRadius = uicSettings.radius || '12px';
   document.querySelectorAll('.uic-radius-opt').forEach(b => b.classList.toggle('active', b.dataset.r===savedRadius));
+  // Restore image upload preview if saved
+  const savedImg = localStorage.getItem('cpm_ui_bg_img');
+  if (savedImg) {
+    const wrap = document.getElementById('uic-img-preview-wrap');
+    if (wrap) wrap.innerHTML = `<img src="${savedImg}" style="width:100%;height:100%;object-fit:cover;border-radius:10px"/>`;
+    const btn = document.getElementById('uic-img-clear-btn');
+    if (btn) btn.style.display = 'block';
+  }
 }
 
 function uicSyncPickers() {
@@ -3130,59 +3086,92 @@ function uicApplyPreset(key) {
   toast(`Theme applied: ${p.label}`, true);
 }
 
-function uicApplyBackground(bgId) {
-  const bg = UIC_BACKGROUNDS.find(b => b.id === bgId);
-  if (!bg) return;
-  uicCurrentBg = bgId;
-  uicSettings.background = bgId;
-  const bgLayer = document.getElementById('cpm-bg-layer');
-  const bgVid   = document.getElementById('cpm-bg-video');
-  if (bgVid) { bgVid.style.display='none'; bgVid.src=''; }
-  document.getElementById('uic-custom-img-row').style.display = (bg.custom ? 'flex' : 'none');
-  document.getElementById('uic-custom-vid-row').style.display = (bg.customVid ? 'flex' : 'none');
-  if (bg.custom || bg.customVid) {
-    document.querySelectorAll('.uic-bg-card').forEach((c,i) => c.classList.toggle('active', UIC_BACKGROUNDS[i].id===bgId));
-    return;
-  }
-  if (bgId === 'none') {
-    if (bgLayer) bgLayer.style.cssText = 'position:fixed;inset:0;z-index:-2;pointer-events:none';
-    document.getElementById('cpm-bg-style').innerHTML = '';
-    document.documentElement.style.removeProperty('--bg');
-    if (uicSettings.preset && UIC_PRESETS[uicSettings.preset]) {
-      document.documentElement.style.setProperty('--bg', UIC_PRESETS[uicSettings.preset].bg);
-    }
-  } else if (bg.css) {
-    if (bgLayer) bgLayer.style.cssText = `position:fixed;inset:0;z-index:-2;pointer-events:none;${bg.css}`;
+function uicUploadImage(input) {
+  const file = input.files[0];
+  if (!file) return;
+  if (file.size > 8 * 1024 * 1024) { toast('Image too large — max 8 MB', false); return; }
+  const reader = new FileReader();
+  reader.onload = e => {
+    const dataUrl = e.target.result;
+    const bgLayer = document.getElementById('cpm-bg-layer');
+    if (bgLayer) bgLayer.style.cssText = `position:fixed;inset:0;z-index:-2;pointer-events:none;background-image:url('${dataUrl}');background-size:cover;background-position:center`;
     document.getElementById('cpm-bg-style').innerHTML = '';
     document.documentElement.style.setProperty('--bg', 'transparent');
-  }
-  document.querySelectorAll('.uic-bg-card').forEach((c,i) => c.classList.toggle('active', UIC_BACKGROUNDS[i].id===bgId));
-  if (bgId !== 'none') toast(`Background: ${bg.emoji} ${bg.label}`, true);
+    const wrap = document.getElementById('uic-img-preview-wrap');
+    if (wrap) wrap.innerHTML = `<img src="${dataUrl}" style="width:100%;height:100%;object-fit:cover;border-radius:10px"/>`;
+    const btn = document.getElementById('uic-img-clear-btn');
+    if (btn) btn.style.display = 'block';
+    uicClearVideoSilent();
+    try { localStorage.setItem('cpm_ui_bg_img', dataUrl); } catch(e2) {}
+    uicSettings.background = 'upload-img';
+    toast('🖼️ Image background applied', true);
+  };
+  reader.readAsDataURL(file);
 }
 
-function uicApplyCustomImage() {
-  const url = document.getElementById('uic-img-url').value.trim();
-  if (!url) { toast('Enter an image URL first', false); return; }
-  const bgLayer = document.getElementById('cpm-bg-layer');
-  if (bgLayer) bgLayer.style.cssText = `position:fixed;inset:0;z-index:-2;pointer-events:none;background-image:url('${url.replace(/'/g,"\\'")}');background-size:cover;background-position:center;background-repeat:no-repeat`;
-  document.getElementById('cpm-bg-style').innerHTML = '';
-  document.documentElement.style.setProperty('--bg', 'transparent');
-  uicSettings.customImgUrl = url;
-  toast('🖼️ Image background applied', true);
+function uicDropImage(ev) {
+  ev.preventDefault();
+  const file = ev.dataTransfer.files[0];
+  if (!file || !file.type.startsWith('image/')) { toast('Please drop an image file', false); return; }
+  const fakeInput = { files:[file] };
+  uicUploadImage(fakeInput);
 }
 
-function uicApplyCustomVideo() {
-  const url = document.getElementById('uic-vid-url').value.trim();
-  if (!url) { toast('Enter a video URL first', false); return; }
+function uicUploadVideo(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const url = URL.createObjectURL(file);
   const vid = document.getElementById('cpm-bg-video');
   if (vid) { vid.src = url; vid.style.display = 'block'; vid.load(); vid.play().catch(()=>{}); }
   const bgLayer = document.getElementById('cpm-bg-layer');
   if (bgLayer) bgLayer.style.cssText = 'position:fixed;inset:0;z-index:-2;pointer-events:none';
   document.getElementById('cpm-bg-style').innerHTML = '';
   document.documentElement.style.setProperty('--bg', 'transparent');
-  uicSettings.customVidUrl = url;
-  toast('🎬 Video background applied', true);
+  const wrap = document.getElementById('uic-vid-preview-wrap');
+  if (wrap) wrap.innerHTML = `<video src="${url}" autoplay loop muted playsinline style="width:100%;height:100%;object-fit:cover;border-radius:10px"></video>`;
+  const btn = document.getElementById('uic-vid-clear-btn');
+  if (btn) btn.style.display = 'block';
+  uicClearImageSilent();
+  uicSettings.background = 'upload-vid';
+  toast('🎬 Video background applied (resets on page reload)', true);
 }
+
+function uicDropVideo(ev) {
+  ev.preventDefault();
+  const file = ev.dataTransfer.files[0];
+  if (!file || !file.type.startsWith('video/')) { toast('Please drop a video file', false); return; }
+  const fakeInput = { files:[file] };
+  uicUploadVideo(fakeInput);
+}
+
+function uicClearImageSilent() {
+  localStorage.removeItem('cpm_ui_bg_img');
+  const bgLayer = document.getElementById('cpm-bg-layer');
+  if (bgLayer) bgLayer.style.cssText = 'position:fixed;inset:0;z-index:-2;pointer-events:none';
+  document.documentElement.style.removeProperty('--bg');
+  if (uicSettings.preset && UIC_PRESETS[uicSettings.preset]) {
+    document.documentElement.style.setProperty('--bg', UIC_PRESETS[uicSettings.preset].bg);
+  }
+  const wrap = document.getElementById('uic-img-preview-wrap');
+  if (wrap) wrap.innerHTML = `<svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg><span style="font-size:13px;font-weight:600">Click or drag an image here</span><span style="font-size:11px">JPG, PNG, GIF, WebP — max 8 MB</span>`;
+  const btn = document.getElementById('uic-img-clear-btn');
+  if (btn) btn.style.display = 'none';
+  if (uicSettings.background === 'upload-img') uicSettings.background = 'none';
+}
+
+function uicClearImage() { uicClearImageSilent(); toast('Image background removed', true); }
+
+function uicClearVideoSilent() {
+  const vid = document.getElementById('cpm-bg-video');
+  if (vid) { vid.style.display='none'; if(vid.src.startsWith('blob:'))URL.revokeObjectURL(vid.src); vid.src=''; }
+  const wrap = document.getElementById('uic-vid-preview-wrap');
+  if (wrap) wrap.innerHTML = `<svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg><span style="font-size:13px;font-weight:600">Click or drag a video here</span><span style="font-size:11px">MP4, WebM — resets on page reload</span>`;
+  const btn = document.getElementById('uic-vid-clear-btn');
+  if (btn) btn.style.display = 'none';
+  if (uicSettings.background === 'upload-vid') uicSettings.background = 'none';
+}
+
+function uicClearVideo() { uicClearVideoSilent(); toast('Video background removed', true); }
 
 function uicApplyFont() {
   const family = document.getElementById('uic-font-select').value;
@@ -3212,8 +3201,6 @@ function saveUiCustomize() {
   uicSettings.radius         = root.style.getPropertyValue('--radius') || '12px';
   uicSettings.fontFamily     = document.getElementById('uic-font-select')?.value || '';
   uicSettings.fontSize       = document.getElementById('uic-font-size')?.value   || '14';
-  if (uicCurrentBg==='custom-img') uicSettings.customImgUrl = document.getElementById('uic-img-url')?.value||'';
-  if (uicCurrentBg==='custom-vid') uicSettings.customVidUrl = document.getElementById('uic-vid-url')?.value||'';
   localStorage.setItem('cpm_ui_settings', JSON.stringify(uicSettings));
   toast('✅ UI settings saved!', true);
 }
@@ -3257,24 +3244,13 @@ function initUiCustomize() {
       root.style.setProperty('--border', p.border); root.style.setProperty('--green',  p.green);
       root.style.setProperty('--red',    p.red);   root.style.setProperty('--amber',  p.amber);
     }
-    // Apply background
-    const bgId = uicSettings.background;
-    if (bgId && bgId !== 'none') {
+    // Restore uploaded image background from localStorage
+    const savedImg = localStorage.getItem('cpm_ui_bg_img');
+    if (savedImg) {
       const bgLayer = document.getElementById('cpm-bg-layer');
-      if (bgId === 'custom-img' && uicSettings.customImgUrl) {
-        if (bgLayer) bgLayer.style.cssText = `position:fixed;inset:0;z-index:-2;pointer-events:none;background-image:url('${uicSettings.customImgUrl.replace(/'/g,"\\'")}');background-size:cover;background-position:center`;
-        root.style.setProperty('--bg','transparent');
-      } else if (bgId === 'custom-vid' && uicSettings.customVidUrl) {
-        const vid = document.getElementById('cpm-bg-video');
-        if (vid) { vid.src=uicSettings.customVidUrl; vid.style.display='block'; vid.play().catch(()=>{}); }
-        root.style.setProperty('--bg','transparent');
-      } else {
-        const bg = UIC_BACKGROUNDS.find(b=>b.id===bgId);
-        if (bg && bg.css) {
-          if (bgLayer) bgLayer.style.cssText = `position:fixed;inset:0;z-index:-2;pointer-events:none;${bg.css}`;
-          root.style.setProperty('--bg','transparent');
-        }
-      }
+      if (bgLayer) bgLayer.style.cssText = `position:fixed;inset:0;z-index:-2;pointer-events:none;background-image:url('${savedImg}');background-size:cover;background-position:center`;
+      root.style.setProperty('--bg','transparent');
+      uicSettings.background = 'upload-img';
     }
     // Apply radius, font
     if (uicSettings.radius) root.style.setProperty('--radius', uicSettings.radius);
@@ -3495,9 +3471,5 @@ echo -e "  ${Y}FIRST-TIME SETUP:${N}"
 echo -e "    Click 'Owner Panel' in the sidebar and create your secret owner key."
 echo -e "    No default key is pre-set — you choose your own on first run."
 echo ""
-echo -e "  ${Y}SUPABASE:${N}"
-echo -e "    Run this SQL in Supabase Dashboard → SQL Editor:"
-echo -e "    ${Y}https://supabase.com/dashboard/project/vompmplmluxwtwgofgks/editor${N}"
-echo -e "    SQL file: copy from ${Y}supabase_tables.sql${N} (provided separately)"
 echo ""
 [[ -n "${SUDO_USER:-}" ]] && echo -e "  ${Y}NOTE:${N} Log out and back in so '$SUDO_USER' can
