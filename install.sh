@@ -977,6 +977,128 @@ def _start_localtunnel(port):
 def tunnel_status():
     return jsonify({"ready": _tunnel_ready, "url": _tunnel_url})
 
+
+# ── UI Settings (server-side persistence) ─────────────────────────────────────
+
+_UI_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ui_data')
+_UI_SETS = os.path.join(_UI_DIR, 'settings.json')
+_ALLOWED_BG_MIME = {'image/jpeg','image/png','image/gif','image/webp','video/mp4','video/webm','video/ogg'}
+
+def _ui_ensure():
+    os.makedirs(_UI_DIR, exist_ok=True)
+    if not os.path.exists(_UI_SETS):
+        with open(_UI_SETS, 'w') as f: json.dump({}, f)
+
+def _ui_load_all():
+    _ui_ensure()
+    try:
+        with open(_UI_SETS) as f: return json.load(f)
+    except Exception:
+        return {}
+
+def _ui_save_all(d):
+    _ui_ensure()
+    try:
+        tmp = _UI_SETS + '.tmp'
+        with open(tmp, 'w') as f: json.dump(d, f, indent=2)
+        os.replace(tmp, _UI_SETS)
+    except Exception as e:
+        log.error(f"UI settings save failed: {e}")
+
+def _ui_token():
+    t = (request.headers.get('X-Client-Token') or '').strip()
+    # Only allow safe characters; ignore obviously invalid tokens
+    return t[:128] if re.match(r'^[a-zA-Z0-9_\-]{8,128}$', t) else ''
+
+@app.route('/api/ui/settings', methods=['GET'])
+def ui_settings_get():
+    token = _ui_token()
+    if not token: return jsonify({}), 200
+    all_s = _ui_load_all()
+    return jsonify(all_s.get(token, {}))
+
+@app.route('/api/ui/settings', methods=['POST'])
+def ui_settings_save():
+    token = _ui_token()
+    if not token: return jsonify({'error': 'No token'}), 400
+    data = request.get_json() or {}
+    # Strip out base64 blobs if somehow sent
+    data.pop('cpm_ui_bg_img', None)
+    data.pop('cpm_ui_bg_video', None)
+    all_s = _ui_load_all()
+    existing = all_s.get(token, {})
+    # Preserve server-side bg fields (set only by background upload route)
+    for k in ('bg_url', 'bg_type'):
+        if k not in data and k in existing:
+            data[k] = existing[k]
+    data['updated_at'] = _now()
+    all_s[token] = data
+    _ui_save_all(all_s)
+    return jsonify({'ok': True})
+
+@app.route('/api/ui/background', methods=['POST'])
+def ui_bg_upload():
+    token = _ui_token()
+    if not token: return jsonify({'error': 'No token'}), 400
+    f = request.files.get('file')
+    if not f: return jsonify({'error': 'No file'}), 400
+    if f.mimetype not in _ALLOWED_BG_MIME:
+        return jsonify({'error': 'File type not allowed'}), 400
+    ext = (f.filename.rsplit('.', 1)[-1].lower() if f.filename and '.' in f.filename else 'bin')
+    ext = re.sub(r'[^a-z0-9]', '', ext)[:6] or 'bin'
+    safe_tok = re.sub(r'[^a-zA-Z0-9]', '', token)[:24]
+    fname = f'{safe_tok}_bg.{ext}'
+    _ui_ensure()
+    save_path = os.path.join(_UI_DIR, fname)
+    # Remove old bg file for this token
+    all_s = _ui_load_all()
+    old = all_s.get(token, {}).get('bg_url', '')
+    if old:
+        old_fname = old.split('/')[-1]
+        old_path = os.path.join(_UI_DIR, old_fname)
+        try:
+            if os.path.exists(old_path): os.remove(old_path)
+        except Exception: pass
+    f.save(save_path)
+    bg_url = f'/api/ui/assets/{fname}'
+    bg_type = 'video' if f.mimetype.startswith('video') else 'image'
+    s = all_s.get(token, {})
+    s['bg_url'] = bg_url
+    s['bg_type'] = bg_type
+    s['updated_at'] = _now()
+    all_s[token] = s
+    _ui_save_all(all_s)
+    log.info(f"UI background saved for token ..{token[-6:]}: {fname}")
+    return jsonify({'ok': True, 'url': bg_url, 'type': bg_type})
+
+@app.route('/api/ui/background', methods=['DELETE'])
+def ui_bg_delete():
+    token = _ui_token()
+    if not token: return jsonify({'error': 'No token'}), 400
+    all_s = _ui_load_all()
+    s = all_s.get(token, {})
+    old_url = s.pop('bg_url', None)
+    s.pop('bg_type', None)
+    s['updated_at'] = _now()
+    all_s[token] = s
+    _ui_save_all(all_s)
+    if old_url:
+        fname = old_url.split('/')[-1]
+        fpath = os.path.join(_UI_DIR, fname)
+        try:
+            if os.path.exists(fpath): os.remove(fpath)
+        except Exception: pass
+    return jsonify({'ok': True})
+
+@app.route('/api/ui/assets/<path:filename>')
+def ui_assets(filename):
+    _ui_ensure()
+    fname = os.path.basename(filename)
+    fpath = os.path.join(_UI_DIR, fname)
+    if not os.path.exists(fpath): return '', 404
+    return send_file(fpath)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log.info(f"CPM Panel listening on port {port}")
@@ -2096,9 +2218,22 @@ function drawMeter(svgId, pct, label, sub) {
     <text x="${cx}" y="${cy+32}" text-anchor="middle" font-size="11" fill="#94a3b8">${sub}</text>`;
 }
 
+// ── client token (only a lookup key — actual data lives on server) ──────────
+function getClientToken() {
+  let t = localStorage.getItem('cpm_client_token');
+  if (!t || t.length < 16) {
+    const arr = new Uint8Array(24);
+    crypto.getRandomValues(arr);
+    t = Array.from(arr, b => b.toString(16).padStart(2,'0')).join('');
+    localStorage.setItem('cpm_client_token', t);
+  }
+  return t;
+}
+
 // ── fetch helpers ──────────────────────────────────────────────────────────
 async function api(path, opts={}) {
-  const r = await fetch(path, {headers:{'Content-Type':'application/json'},...opts});
+  const hdrs = {'Content-Type':'application/json','X-Client-Token':getClientToken(),...(opts.headers||{})};
+  const r = await fetch(path, {...opts, headers:hdrs});
   return r.json();
 }
 
@@ -3045,19 +3180,17 @@ function uicRenderPage() {
   const savedRadius = uicSettings.radius || '12px';
   document.querySelectorAll('.uic-radius-opt').forEach(b => b.classList.toggle('active', b.dataset.r===savedRadius));
   uicSyncPickers();
-  // Restore image upload preview if saved
-  const savedImg = localStorage.getItem('cpm_ui_bg_img');
-  if (savedImg) {
+  // Restore image preview from server settings
+  if (uicSettings.bg_type === 'image' && uicSettings.bg_url) {
     const wrap = document.getElementById('uic-img-preview-wrap');
-    if (wrap) wrap.innerHTML = `<img src="${savedImg}" style="width:100%;height:100%;object-fit:cover;border-radius:10px"/>`;
+    if (wrap) wrap.innerHTML = `<img src="${uicSettings.bg_url}" style="width:100%;height:100%;object-fit:cover;border-radius:10px"/>`;
     const btn = document.getElementById('uic-img-clear-btn');
     if (btn) btn.style.display = 'block';
   }
-  // Restore video upload preview if saved
-  const savedVid = localStorage.getItem('cpm_ui_bg_video');
-  if (savedVid) {
+  // Restore video preview from server settings
+  if (uicSettings.bg_type === 'video' && uicSettings.bg_url) {
     const wrap = document.getElementById('uic-vid-preview-wrap');
-    if (wrap) wrap.innerHTML = `<video src="${savedVid}" autoplay loop muted playsinline style="width:100%;height:100%;object-fit:cover;border-radius:10px"></video>`;
+    if (wrap) wrap.innerHTML = `<video src="${uicSettings.bg_url}" autoplay loop muted playsinline style="width:100%;height:100%;object-fit:cover;border-radius:10px"></video>`;
     const btn = document.getElementById('uic-vid-clear-btn');
     if (btn) btn.style.display = 'block';
   }
@@ -3137,24 +3270,29 @@ function uicApplyPreset(key) {
 function uicUploadImage(input) {
   const file = input.files[0];
   if (!file) return;
-  if (file.size > 8 * 1024 * 1024) { toast('Image too large — max 8 MB', false); return; }
-  const reader = new FileReader();
-  reader.onload = e => {
-    const dataUrl = e.target.result;
+  if (file.size > 20 * 1024 * 1024) { toast('Image too large — max 20 MB', false); return; }
+  toast('⏳ Uploading image…', true);
+  const form = new FormData();
+  form.append('file', file);
+  fetch('/api/ui/background', {
+    method: 'POST',
+    headers: {'X-Client-Token': getClientToken()},
+    body: form
+  }).then(r => r.json()).then(d => {
+    if (!d.ok) { toast('❌ Upload failed: ' + (d.error||''), false); return; }
     const bgLayer = document.getElementById('cpm-bg-layer');
-    if (bgLayer) bgLayer.style.cssText = `position:fixed;inset:0;z-index:-2;pointer-events:none;background-image:url('${dataUrl}');background-size:cover;background-position:center`;
+    if (bgLayer) bgLayer.style.cssText = `position:fixed;inset:0;z-index:-2;pointer-events:none;background-image:url('${d.url}');background-size:cover;background-position:center`;
     document.getElementById('cpm-bg-style').innerHTML = '';
     document.documentElement.style.setProperty('--bg', 'transparent');
     const wrap = document.getElementById('uic-img-preview-wrap');
-    if (wrap) wrap.innerHTML = `<img src="${dataUrl}" style="width:100%;height:100%;object-fit:cover;border-radius:10px"/>`;
+    if (wrap) wrap.innerHTML = `<img src="${d.url}" style="width:100%;height:100%;object-fit:cover;border-radius:10px"/>`;
     const btn = document.getElementById('uic-img-clear-btn');
     if (btn) btn.style.display = 'block';
     uicClearVideoSilent();
-    try { localStorage.setItem('cpm_ui_bg_img', dataUrl); } catch(e2) {}
-    uicSettings.background = 'upload-img';
-    toast('🖼️ Image background applied', true);
-  };
-  reader.readAsDataURL(file);
+    uicSettings.bg_url = d.url; uicSettings.bg_type = 'image'; uicSettings.background = 'upload-img';
+    uicCurrentBg = 'upload-img';
+    toast('🖼️ Image background saved on server!', true);
+  }).catch(() => toast('❌ Upload failed', false));
 }
 
 function uicDropImage(ev) {
@@ -3168,28 +3306,31 @@ function uicDropImage(ev) {
 function uicUploadVideo(input) {
   const file = input.files[0];
   if (!file) return;
-  if (file.size > 20 * 1024 * 1024) { toast('Video too large — max 20 MB for saved backgrounds', false); return; }
-  const reader = new FileReader();
-  reader.onload = e => {
-    const dataUrl = e.target.result;
+  if (file.size > 100 * 1024 * 1024) { toast('Video too large — max 100 MB', false); return; }
+  toast('⏳ Uploading video… please wait', true);
+  const form = new FormData();
+  form.append('file', file);
+  fetch('/api/ui/background', {
+    method: 'POST',
+    headers: {'X-Client-Token': getClientToken()},
+    body: form
+  }).then(r => r.json()).then(d => {
+    if (!d.ok) { toast('❌ Upload failed: ' + (d.error||''), false); return; }
     const vid = document.getElementById('cpm-bg-video');
-    if (vid) { vid.src = dataUrl; vid.style.display = 'block'; vid.load(); vid.play().catch(()=>{}); }
+    if (vid) { vid.src = d.url; vid.style.display = 'block'; vid.load(); vid.play().catch(()=>{}); }
     const bgLayer = document.getElementById('cpm-bg-layer');
     if (bgLayer) bgLayer.style.cssText = 'position:fixed;inset:0;z-index:-2;pointer-events:none';
     document.getElementById('cpm-bg-style').innerHTML = '';
     document.documentElement.style.setProperty('--bg', 'transparent');
     const wrap = document.getElementById('uic-vid-preview-wrap');
-    if (wrap) wrap.innerHTML = `<video src="${dataUrl}" autoplay loop muted playsinline style="width:100%;height:100%;object-fit:cover;border-radius:10px"></video>`;
+    if (wrap) wrap.innerHTML = `<video src="${d.url}" autoplay loop muted playsinline style="width:100%;height:100%;object-fit:cover;border-radius:10px"></video>`;
     const btn = document.getElementById('uic-vid-clear-btn');
     if (btn) btn.style.display = 'block';
     uicClearImageSilent();
-    try { localStorage.setItem('cpm_ui_bg_video', dataUrl); } catch(e2) {
-      toast('⚠ Video saved but storage full — use a smaller file (<5 MB) to persist across reloads', false);
-    }
-    uicSettings.background = 'upload-vid';
-    toast('🎬 Video background applied & saved!', true);
-  };
-  reader.readAsDataURL(file);
+    uicSettings.bg_url = d.url; uicSettings.bg_type = 'video'; uicSettings.background = 'upload-vid';
+    uicCurrentBg = 'upload-vid';
+    toast('🎬 Video background saved on server!', true);
+  }).catch(() => toast('❌ Upload failed', false));
 }
 
 function uicDropVideo(ev) {
@@ -3201,7 +3342,11 @@ function uicDropVideo(ev) {
 }
 
 function uicClearImageSilent() {
-  localStorage.removeItem('cpm_ui_bg_img');
+  if (uicSettings.bg_type === 'image') {
+    fetch('/api/ui/background', {method:'DELETE', headers:{'X-Client-Token':getClientToken()}}).catch(()=>{});
+    uicSettings.bg_url = null; uicSettings.bg_type = null;
+  }
+  uicSettings.background = 'none'; uicCurrentBg = 'none';
   const bgLayer = document.getElementById('cpm-bg-layer');
   if (bgLayer) bgLayer.style.cssText = 'position:fixed;inset:0;z-index:-2;pointer-events:none';
   document.documentElement.style.removeProperty('--bg');
@@ -3209,23 +3354,25 @@ function uicClearImageSilent() {
     document.documentElement.style.setProperty('--bg', UIC_PRESETS[uicSettings.preset].bg);
   }
   const wrap = document.getElementById('uic-img-preview-wrap');
-  if (wrap) wrap.innerHTML = `<svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg><span style="font-size:13px;font-weight:600">Click or drag an image here</span><span style="font-size:11px">JPG, PNG, GIF, WebP — max 8 MB</span>`;
+  if (wrap) wrap.innerHTML = `<svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg><span style="font-size:13px;font-weight:600">Click or drag an image here</span><span style="font-size:11px">JPG, PNG, GIF, WebP — max 20 MB</span>`;
   const btn = document.getElementById('uic-img-clear-btn');
   if (btn) btn.style.display = 'none';
-  if (uicSettings.background === 'upload-img') uicSettings.background = 'none';
 }
 
 function uicClearImage() { uicClearImageSilent(); toast('Image background removed', true); }
 
 function uicClearVideoSilent() {
+  if (uicSettings.bg_type === 'video') {
+    fetch('/api/ui/background', {method:'DELETE', headers:{'X-Client-Token':getClientToken()}}).catch(()=>{});
+    uicSettings.bg_url = null; uicSettings.bg_type = null;
+  }
+  uicSettings.background = 'none'; uicCurrentBg = 'none';
   const vid = document.getElementById('cpm-bg-video');
   if (vid) { vid.style.display='none'; vid.src=''; }
-  localStorage.removeItem('cpm_ui_bg_video');
   const wrap = document.getElementById('uic-vid-preview-wrap');
-  if (wrap) wrap.innerHTML = `<svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg><span style="font-size:13px;font-weight:600">Click or drag a video here</span><span style="font-size:11px">MP4, WebM — max 20 MB</span>`;
+  if (wrap) wrap.innerHTML = `<svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg><span style="font-size:13px;font-weight:600">Click or drag a video here</span><span style="font-size:11px">MP4, WebM, OGG — max 100 MB</span>`;
   const btn = document.getElementById('uic-vid-clear-btn');
   if (btn) btn.style.display = 'none';
-  if (uicSettings.background === 'upload-vid') uicSettings.background = 'none';
 }
 
 function uicClearVideo() { uicClearVideoSilent(); toast('Video background removed', true); }
@@ -3247,24 +3394,31 @@ function uicApplyRadius(r) {
   uicSettings.radius = r;
 }
 
-function saveUiCustomize() {
+async function saveUiCustomize() {
   const root = document.documentElement;
   const vars  = ['--bg','--sidebar','--card','--blue','--text','--muted','--border','--green','--red','--amber'];
   const colors = {};
   vars.forEach(v => { const val = root.style.getPropertyValue(v); if (val) colors[v] = val; });
-  uicSettings.savedColors    = colors;
-  uicSettings.preset         = uicCurrentPreset;
-  uicSettings.background     = uicCurrentBg;
-  uicSettings.radius         = root.style.getPropertyValue('--radius') || '12px';
-  uicSettings.fontFamily     = document.getElementById('uic-font-select')?.value || '';
-  uicSettings.fontSize       = document.getElementById('uic-font-size')?.value   || '14';
-  localStorage.setItem('cpm_ui_settings', JSON.stringify(uicSettings));
-  toast('✅ UI settings saved!', true);
+  uicSettings.savedColors = colors;
+  uicSettings.preset      = uicCurrentPreset;
+  uicSettings.background  = uicCurrentBg;
+  uicSettings.radius      = root.style.getPropertyValue('--radius') || '12px';
+  uicSettings.fontFamily  = document.getElementById('uic-font-select')?.value || '';
+  uicSettings.fontSize    = document.getElementById('uic-font-size')?.value   || '14';
+  try {
+    const d = await api('/api/ui/settings', {method:'POST', body:JSON.stringify(uicSettings)});
+    if (d.ok) toast('✅ UI settings saved on server!', true);
+    else toast('❌ Save failed', false);
+  } catch(e) { toast('❌ Save failed', false); }
 }
 
-function resetUiCustomize() {
+async function resetUiCustomize() {
   if (!confirm('Reset all UI customizations to default?')) return;
-  localStorage.removeItem('cpm_ui_settings');
+  // Delete server settings + background
+  try {
+    await api('/api/ui/settings', {method:'POST', body:JSON.stringify({})});
+    await fetch('/api/ui/background', {method:'DELETE', headers:{'X-Client-Token':getClientToken()}}).catch(()=>{});
+  } catch(e) {}
   uicSettings = {}; uicCurrentPreset = 'default'; uicCurrentBg = 'none';
   const root = document.documentElement;
   ['--bg','--sidebar','--card','--blue','--blue-light','--blue-mid','--text','--muted','--border','--green','--red','--amber','--radius'].forEach(v=>root.style.removeProperty(v));
@@ -3279,51 +3433,49 @@ function resetUiCustomize() {
   toast('↩ Reset to defaults', true);
 }
 
-function initUiCustomize() {
-  const raw = localStorage.getItem('cpm_ui_settings');
-  if (!raw) return;
+async function initUiCustomize() {
   try {
-    uicSettings = JSON.parse(raw);
-    uicCurrentPreset = uicSettings.preset || 'default';
-    uicCurrentBg     = uicSettings.background || 'none';
+    const d = await api('/api/ui/settings');
+    if (!d || !Object.keys(d).length) return;
+    uicSettings      = d;
+    uicCurrentPreset = d.preset || 'default';
+    uicCurrentBg     = d.background || 'none';
     const root = document.documentElement;
-    // Apply saved inline color overrides
-    if (uicSettings.savedColors && Object.keys(uicSettings.savedColors).length) {
-      Object.entries(uicSettings.savedColors).forEach(([v, val]) => root.style.setProperty(v, val));
-    } else if (uicSettings.preset && UIC_PRESETS[uicSettings.preset]) {
-      // Silently reapply preset without toast
-      const p = UIC_PRESETS[uicSettings.preset];
-      root.style.setProperty('--bg',     p.bg);   root.style.setProperty('--sidebar',p.sidebar);
-      root.style.setProperty('--card',   p.card);  root.style.setProperty('--blue',   p.blue);
+    // Apply saved color overrides
+    if (d.savedColors && Object.keys(d.savedColors).length) {
+      Object.entries(d.savedColors).forEach(([v, val]) => root.style.setProperty(v, val));
+    } else if (d.preset && UIC_PRESETS[d.preset]) {
+      const p = UIC_PRESETS[d.preset];
+      root.style.setProperty('--bg',         p.bg);
+      root.style.setProperty('--sidebar',    p.sidebar);
+      root.style.setProperty('--card',       p.card);
+      root.style.setProperty('--blue',       p.blue);
       root.style.setProperty('--blue-light', uicHexAlpha(p.blue,0.12));
       root.style.setProperty('--blue-mid',   uicHexAlpha(p.blue,0.30));
-      root.style.setProperty('--text',   p.text);  root.style.setProperty('--muted',  p.muted);
-      root.style.setProperty('--border', p.border); root.style.setProperty('--green',  p.green);
-      root.style.setProperty('--red',    p.red);   root.style.setProperty('--amber',  p.amber);
+      root.style.setProperty('--text',       p.text);
+      root.style.setProperty('--muted',      p.muted);
+      root.style.setProperty('--border',     p.border);
+      root.style.setProperty('--green',      p.green);
+      root.style.setProperty('--red',        p.red);
+      root.style.setProperty('--amber',      p.amber);
     }
-    // Restore uploaded image background from localStorage
-    const savedImg = localStorage.getItem('cpm_ui_bg_img');
-    if (savedImg) {
+    // Restore background from server URL
+    if (d.bg_url && d.bg_type === 'image') {
       const bgLayer = document.getElementById('cpm-bg-layer');
-      if (bgLayer) bgLayer.style.cssText = `position:fixed;inset:0;z-index:-2;pointer-events:none;background-image:url('${savedImg}');background-size:cover;background-position:center`;
+      if (bgLayer) bgLayer.style.cssText = `position:fixed;inset:0;z-index:-2;pointer-events:none;background-image:url('${d.bg_url}');background-size:cover;background-position:center`;
       root.style.setProperty('--bg','transparent');
-      uicSettings.background = 'upload-img';
-    }
-    // Restore uploaded video background from localStorage
-    const savedVid = localStorage.getItem('cpm_ui_bg_video');
-    if (savedVid && !savedImg) {
+    } else if (d.bg_url && d.bg_type === 'video') {
       const vid = document.getElementById('cpm-bg-video');
-      if (vid) { vid.src = savedVid; vid.style.display = 'block'; vid.load(); vid.play().catch(()=>{}); }
+      if (vid) { vid.src = d.bg_url; vid.style.display = 'block'; vid.load(); vid.play().catch(()=>{}); }
       const bgLayer = document.getElementById('cpm-bg-layer');
       if (bgLayer) bgLayer.style.cssText = 'position:fixed;inset:0;z-index:-2;pointer-events:none';
       root.style.setProperty('--bg','transparent');
-      uicSettings.background = 'upload-vid';
     }
     // Apply radius, font
-    if (uicSettings.radius) root.style.setProperty('--radius', uicSettings.radius);
-    if (uicSettings.fontFamily) document.body.style.fontFamily = uicSettings.fontFamily+',Segoe UI,system-ui,sans-serif';
-    if (uicSettings.fontSize)   document.body.style.fontSize   = uicSettings.fontSize+'px';
-  } catch(e) { localStorage.removeItem('cpm_ui_settings'); }
+    if (d.radius)     root.style.setProperty('--radius', d.radius);
+    if (d.fontFamily) document.body.style.fontFamily = d.fontFamily+',Segoe UI,system-ui,sans-serif';
+    if (d.fontSize)   document.body.style.fontSize   = d.fontSize+'px';
+  } catch(e) {}
 }
 
 // ── Logout / Switch Account ───────────────────────────────────────────────
@@ -3335,7 +3487,7 @@ function logoutPanel() {
 
 // ── init & poll ───────────────────────────────────────────────────────────
 activationInit();
-initUiCustomize();
+initUiCustomize().then(() => uicRenderPage());
 checkKvmStatus();
 loadStats(); loadVps();
 pollTunnel();
