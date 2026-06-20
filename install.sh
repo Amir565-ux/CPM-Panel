@@ -1878,7 +1878,7 @@ else
                 <div id="uic-vid-preview-wrap" style="display:flex;flex-direction:column;align-items:center;gap:8px;color:var(--muted)">
                   <svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
                   <span style="font-size:13px;font-weight:600">Click or drag a video here</span>
-                  <span style="font-size:11px">MP4, WebM — resets on page reload</span>
+                  <span style="font-size:11px">MP4, WebM — max 20 MB</span>
                 </div>
               </div>
               <input type="file" id="uic-vid-file" accept="video/*" style="display:none" onchange="uicUploadVideo(this)"/>
@@ -3053,6 +3053,14 @@ function uicRenderPage() {
     const btn = document.getElementById('uic-img-clear-btn');
     if (btn) btn.style.display = 'block';
   }
+  // Restore video upload preview if saved
+  const savedVid = localStorage.getItem('cpm_ui_bg_video');
+  if (savedVid) {
+    const wrap = document.getElementById('uic-vid-preview-wrap');
+    if (wrap) wrap.innerHTML = `<video src="${savedVid}" autoplay loop muted playsinline style="width:100%;height:100%;object-fit:cover;border-radius:10px"></video>`;
+    const btn = document.getElementById('uic-vid-clear-btn');
+    if (btn) btn.style.display = 'block';
+  }
 }
 
 function uicSyncPickers() {
@@ -3160,20 +3168,28 @@ function uicDropImage(ev) {
 function uicUploadVideo(input) {
   const file = input.files[0];
   if (!file) return;
-  const url = URL.createObjectURL(file);
-  const vid = document.getElementById('cpm-bg-video');
-  if (vid) { vid.src = url; vid.style.display = 'block'; vid.load(); vid.play().catch(()=>{}); }
-  const bgLayer = document.getElementById('cpm-bg-layer');
-  if (bgLayer) bgLayer.style.cssText = 'position:fixed;inset:0;z-index:-2;pointer-events:none';
-  document.getElementById('cpm-bg-style').innerHTML = '';
-  document.documentElement.style.setProperty('--bg', 'transparent');
-  const wrap = document.getElementById('uic-vid-preview-wrap');
-  if (wrap) wrap.innerHTML = `<video src="${url}" autoplay loop muted playsinline style="width:100%;height:100%;object-fit:cover;border-radius:10px"></video>`;
-  const btn = document.getElementById('uic-vid-clear-btn');
-  if (btn) btn.style.display = 'block';
-  uicClearImageSilent();
-  uicSettings.background = 'upload-vid';
-  toast('🎬 Video background applied (resets on page reload)', true);
+  if (file.size > 20 * 1024 * 1024) { toast('Video too large — max 20 MB for saved backgrounds', false); return; }
+  const reader = new FileReader();
+  reader.onload = e => {
+    const dataUrl = e.target.result;
+    const vid = document.getElementById('cpm-bg-video');
+    if (vid) { vid.src = dataUrl; vid.style.display = 'block'; vid.load(); vid.play().catch(()=>{}); }
+    const bgLayer = document.getElementById('cpm-bg-layer');
+    if (bgLayer) bgLayer.style.cssText = 'position:fixed;inset:0;z-index:-2;pointer-events:none';
+    document.getElementById('cpm-bg-style').innerHTML = '';
+    document.documentElement.style.setProperty('--bg', 'transparent');
+    const wrap = document.getElementById('uic-vid-preview-wrap');
+    if (wrap) wrap.innerHTML = `<video src="${dataUrl}" autoplay loop muted playsinline style="width:100%;height:100%;object-fit:cover;border-radius:10px"></video>`;
+    const btn = document.getElementById('uic-vid-clear-btn');
+    if (btn) btn.style.display = 'block';
+    uicClearImageSilent();
+    try { localStorage.setItem('cpm_ui_bg_video', dataUrl); } catch(e2) {
+      toast('⚠ Video saved but storage full — use a smaller file (<5 MB) to persist across reloads', false);
+    }
+    uicSettings.background = 'upload-vid';
+    toast('🎬 Video background applied & saved!', true);
+  };
+  reader.readAsDataURL(file);
 }
 
 function uicDropVideo(ev) {
@@ -3203,9 +3219,10 @@ function uicClearImage() { uicClearImageSilent(); toast('Image background remove
 
 function uicClearVideoSilent() {
   const vid = document.getElementById('cpm-bg-video');
-  if (vid) { vid.style.display='none'; if(vid.src.startsWith('blob:'))URL.revokeObjectURL(vid.src); vid.src=''; }
+  if (vid) { vid.style.display='none'; vid.src=''; }
+  localStorage.removeItem('cpm_ui_bg_video');
   const wrap = document.getElementById('uic-vid-preview-wrap');
-  if (wrap) wrap.innerHTML = `<svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg><span style="font-size:13px;font-weight:600">Click or drag a video here</span><span style="font-size:11px">MP4, WebM — resets on page reload</span>`;
+  if (wrap) wrap.innerHTML = `<svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg><span style="font-size:13px;font-weight:600">Click or drag a video here</span><span style="font-size:11px">MP4, WebM — max 20 MB</span>`;
   const btn = document.getElementById('uic-vid-clear-btn');
   if (btn) btn.style.display = 'none';
   if (uicSettings.background === 'upload-vid') uicSettings.background = 'none';
@@ -3291,6 +3308,16 @@ function initUiCustomize() {
       if (bgLayer) bgLayer.style.cssText = `position:fixed;inset:0;z-index:-2;pointer-events:none;background-image:url('${savedImg}');background-size:cover;background-position:center`;
       root.style.setProperty('--bg','transparent');
       uicSettings.background = 'upload-img';
+    }
+    // Restore uploaded video background from localStorage
+    const savedVid = localStorage.getItem('cpm_ui_bg_video');
+    if (savedVid && !savedImg) {
+      const vid = document.getElementById('cpm-bg-video');
+      if (vid) { vid.src = savedVid; vid.style.display = 'block'; vid.load(); vid.play().catch(()=>{}); }
+      const bgLayer = document.getElementById('cpm-bg-layer');
+      if (bgLayer) bgLayer.style.cssText = 'position:fixed;inset:0;z-index:-2;pointer-events:none';
+      root.style.setProperty('--bg','transparent');
+      uicSettings.background = 'upload-vid';
     }
     // Apply radius, font
     if (uicSettings.radius) root.style.setProperty('--radius', uicSettings.radius);
