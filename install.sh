@@ -49,3458 +49,2261 @@ sep "3/4  Writing backend (app.py) and frontend (index.html)"
 # Copy pre-fixed app.py if running from the extracted package,
 # otherwise write it inline below.
 if [[ -f "$DIR/app.py" ]]; then
-  ok "app.py already present (using pre-fixed version)"
-else
-cat > "$DIR/app.py" << 'PYEOF'
-"""
-CPM Panel — Flask backend
-GitHub: https://github.com/Amir565-ux/CPM-Panel
-"""
-import os, re, shutil, subprocess, logging, time, hashlib, json, uuid, secrets, threading
-from datetime import datetime, timedelta, timezone
-from flask import Flask, jsonify, request, send_file
-
-try:
-    from flask_cors import CORS
-    HAS_CORS = True
-except ImportError:
-    HAS_CORS = False
-
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
-
-# ── Supabase client ────────────────────────────────────────────────────────────
-try:
-    from supabase import create_client, Client as SupabaseClient
-    _SB_URL = os.environ.get("SUPABASE_URL", "https://vompmplmluxwtwgofgks.supabase.co")
-    _SB_KEY = os.environ.get("SUPABASE_KEY", "sb_secret_9E5gznEQ0m-6w2zkYT2j4Q_OEBJyWO8")
-    _sb: SupabaseClient = create_client(_SB_URL, _SB_KEY)
-    HAS_SUPABASE = True
-    logging.getLogger(__name__).info("Supabase connected ✓")
-except Exception as _sb_err:
-    _sb = None
-    HAS_SUPABASE = False
-    logging.getLogger(__name__).warning(f"Supabase not available ({_sb_err}) — using local JSON fallback")
-
-app = Flask(__name__)
-if HAS_CORS:
-    CORS(app)
-
-@app.after_request
-def add_cors(r):
-    r.headers["Access-Control-Allow-Origin"]  = "*"
-    r.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    r.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-    return r
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
-
-VM_RE = re.compile(r'^[a-zA-Z0-9_\-]{1,64}$')
-
-
-# ── helpers ───────────────────────────────────────────────────────────────────
-
-def kvm_supported():
-    try:
-        with open("/proc/cpuinfo") as f:
-            return bool(re.search(r'vmx|svm', f.read()))
-    except Exception:
-        return False
-
-def virsh_ok():
-    return shutil.which("virsh") is not None
-
-def kvm_functional():
-    return kvm_supported() and virsh_ok()
-
-def run_virsh(*args, timeout=15):
-    try:
-        r = subprocess.run(["virsh"] + list(args), capture_output=True, text=True, timeout=timeout)
-        return {"success": r.returncode == 0, "output": r.stdout.strip(), "error": r.stderr.strip()}
-    except Exception as e:
-        return {"success": False, "output": "", "error": str(e)}
-
-def vm_state(s):
-    s = s.lower()
-    if "running" in s:                       return "running"
-    if "shut off" in s or "shutoff" in s:    return "stopped"
-    if "paused" in s:                         return "paused"
-    if "crashed" in s:                        return "crashed"
-    return "unknown"
-
-def cpu_model():
-    try:
-        for line in open("/proc/cpuinfo"):
-            if line.startswith("model name"):
-                return line.split(":", 1)[1].strip()
-    except Exception:
-        pass
-    return "Unknown CPU"
-
-def uptime():
-    try:
-        return float(open("/proc/uptime").read().split()[0])
-    except Exception:
-        return 0.0
-
-def mem_stats():
-    if HAS_PSUTIL:
-        m = psutil.virtual_memory()
-        return {"used": m.used, "free": m.available, "total": m.total, "percent": round(m.percent, 1)}
-    try:
-        info = {}
-        for line in open("/proc/meminfo"):
-            k, v = line.split(":", 1)
-            info[k.strip()] = int(v.strip().split()[0]) * 1024
-        total = info.get("MemTotal", 0)
-        free  = info.get("MemAvailable", info.get("MemFree", 0))
-        used  = total - free
-        return {"used": used, "free": free, "total": total,
-                "percent": round(used / total * 100, 1) if total else 0}
-    except Exception:
-        return {"used": 0, "free": 0, "total": 0, "percent": 0}
-
-def disk_stats():
-    if HAS_PSUTIL:
-        d = psutil.disk_usage("/")
-        return {"used": d.used, "free": d.free, "total": d.total, "percent": round(d.percent, 1)}
-    try:
-        r = subprocess.run(["df", "-B1", "/"], capture_output=True, text=True, timeout=5)
-        p = r.stdout.strip().splitlines()[-1].split()
-        total, used, free = int(p[1]), int(p[2]), int(p[3])
-        return {"used": used, "free": free, "total": total,
-                "percent": round(used / total * 100, 1) if total else 0}
-    except Exception:
-        return {"used": 0, "free": 0, "total": 0, "percent": 0}
-
-def cpu_percent():
-    if HAS_PSUTIL:
-        return round(psutil.cpu_percent(interval=0.5), 1)
-    try:
-        def read_cpu():
-            with open("/proc/stat") as f:
-                line = f.readline()
-            vals = list(map(int, line.split()[1:]))
-            return vals[0]+vals[2], sum(vals)   # active, total
-        a1, t1 = read_cpu(); time.sleep(0.5); a2, t2 = read_cpu()
-        dt = t2 - t1
-        return round((a2 - a1) / dt * 100, 1) if dt else 0.0
-    except Exception:
-        return 0.0
-
-def net_stats():
-    if HAS_PSUTIL:
-        n = psutil.net_io_counters()
-        iface = next((k for k, s in psutil.net_if_stats().items()
-                      if k != "lo" and s.isup), "eth0")
-        return {"bytesSent": n.bytes_sent, "bytesRecv": n.bytes_recv, "interface": iface}
-    try:
-        for line in open("/proc/net/dev"):
-            parts = line.strip().split()
-            if not parts or not parts[0].endswith(":"): continue
-            iface = parts[0].rstrip(":")
-            if iface == "lo": continue
-            return {"bytesRecv": int(parts[1]), "bytesSent": int(parts[9]), "interface": iface}
-    except Exception:
-        pass
-    return {"bytesSent": 0, "bytesRecv": 0, "interface": "unknown"}
-
-def list_vms():
-    if not kvm_functional():
-        return []
-    r = run_virsh("list", "--all", timeout=10)
-    if not r["success"]:
-        return []
-    vms = []
-    for line in r["output"].splitlines()[2:]:
-        parts = line.split(None, 2)
-        if len(parts) < 3: continue
-        name = parts[1]
-        vcpus = memory = None
-        info = run_virsh("dominfo", name, timeout=5)
-        if info["success"]:
-            cm = re.search(r"CPU\(s\):\s+(\d+)", info["output"])
-            mm = re.search(r"Max memory:\s+(\d+)\s+KiB", info["output"])
-            if cm: vcpus  = int(cm.group(1))
-            if mm: memory = round(int(mm.group(1)) / 1024)
-        vms.append({"id": parts[0], "name": name, "state": vm_state(parts[2]),
-                    "vcpus": vcpus, "memory": memory})
-    return vms
-
-
-# ── routes ────────────────────────────────────────────────────────────────────
-
-@app.route("/")
-def index():
-    here = os.path.dirname(os.path.abspath(__file__))
-    return send_file(os.path.join(here, "index.html"))
-
-@app.route("/api/healthz")
-def healthz():
-    return jsonify({"status": "ok"})
-
-@app.route("/api/kvm/status")
-def kvm_status():
-    hw  = kvm_supported()
-    vsh = virsh_ok()
-    return jsonify({
-        "kvm_supported":  hw,
-        "virsh_available": vsh,
-        "functional":     hw and vsh,
-        "message": (
-            "KVM fully operational" if hw and vsh else
-            "virsh not found — install libvirt-clients" if hw and not vsh else
-            "Hardware virtualisation (VT-x/AMD-V) not detected — KVM unavailable" if not hw and vsh else
-            "KVM not supported and virsh not found on this host"
-        )
-    })
-
-@app.route("/api/system")
-def system_stats():
-    return jsonify({
-        "ram":     mem_stats(),
-        "cpu":     {"percent": cpu_percent(), "cores": os.cpu_count() or 1, "model": cpu_model()},
-        "disk":    disk_stats(),
-        "network": net_stats(),
-        "uptime":  uptime(),
-    })
-
-@app.route("/api/vps/list")
-def vps_list():
-    return jsonify({"vps": list_vms(), "kvm_functional": kvm_functional()})
-
-def _require_kvm():
-    if not kvm_functional():
-        return jsonify({"error": "KVM not supported on this host — VPS actions unavailable"}), 503
-    return None
-
-def _action(req, virsh_cmd):
-    err = _require_kvm()
-    if err: return err
-    data = req.get_json() or {}
-    name = data.get("name", "")
-    if not VM_RE.match(name):
-        return jsonify({"error": "Invalid VM name"}), 400
-    r = run_virsh(virsh_cmd, name)
-    if r["success"]:
-        return jsonify({"success": True, "message": f"VPS '{name}' — {virsh_cmd} OK"})
-    return jsonify({"error": r["error"]}), 400
-
-@app.route("/api/vps/start",   methods=["POST"])
-def start():   return _action(request, "start")
-
-@app.route("/api/vps/stop",    methods=["POST"])
-def stop():
-    """Force-off (virsh destroy). Checks current state first to give a clear error."""
-    err = _require_kvm()
-    if err: return err
-    data = request.get_json() or {}
-    name = data.get("name", "")
-    if not VM_RE.match(name):
-        return jsonify({"error": "Invalid VM name"}), 400
-    info = run_virsh("domstate", name, timeout=5)
-    if info["success"]:
-        state = info["output"].strip().lower()
-        if "shut off" in state or "shutoff" in state:
-            return jsonify({"success": True, "message": f"VPS '{name}' is already stopped"})
-    r = run_virsh("destroy", "--graceful", name, timeout=20)
-    if not r["success"]:
-        r = run_virsh("destroy", name, timeout=20)
-    if r["success"]:
-        return jsonify({"success": True, "message": f"VPS '{name}' stopped (force-off)"})
-    return jsonify({"error": r["error"] or "virsh destroy failed"}), 400
-
-@app.route("/api/vps/shutdown", methods=["POST"])
-def shutdown():
-    """Graceful ACPI shutdown — may not work if guest lacks ACPI support."""
-    return _action(request, "shutdown")
-
-@app.route("/api/vps/restart", methods=["POST"])
-def restart():
-    """Hard reset (virsh reset) — always works regardless of guest ACPI support."""
-    err = _require_kvm()
-    if err: return err
-    data = request.get_json() or {}
-    name = data.get("name", "")
-    if not VM_RE.match(name):
-        return jsonify({"error": "Invalid VM name"}), 400
-    info = run_virsh("domstate", name, timeout=5)
-    if info["success"]:
-        state = info["output"].strip().lower()
-        if "shut off" in state or "shutoff" in state:
-            r = run_virsh("start", name, timeout=30)
-            if r["success"]:
-                return jsonify({"success": True, "message": f"VPS '{name}' was stopped — started"})
-            return jsonify({"error": r["error"]}), 400
-    r = run_virsh("reset", name, timeout=20)
-    if r["success"]:
-        return jsonify({"success": True, "message": f"VPS '{name}' restarted (hard reset)"})
-    run_virsh("destroy", name, timeout=20)
-    time.sleep(1)
-    r2 = run_virsh("start", name, timeout=30)
-    if r2["success"]:
-        return jsonify({"success": True, "message": f"VPS '{name}' restarted (destroy+start)"})
-    return jsonify({"error": r["error"] or "restart failed"}), 400
-
-@app.route("/api/vps/delete",  methods=["POST"])
-def delete():
-    err = _require_kvm()
-    if err: return err
-    data = request.get_json() or {}
-    name = data.get("name", "")
-    if not VM_RE.match(name):
-        return jsonify({"error": "Invalid VM name"}), 400
-    run_virsh("destroy", name)
-    r = run_virsh("undefine", "--nvram", name)
-    if not r["success"]:
-        r = run_virsh("undefine", name)
-    return (jsonify({"success": True, "message": f"VPS '{name}' deleted"})
-            if r["success"] else (jsonify({"error": r["error"]}), 400))
-
-@app.route("/api/vps/create",  methods=["POST"])
-def create():
-    err = _require_kvm()
-    if err: return err
-    d = request.get_json() or {}
-    name = d.get("name", "")
-    if not VM_RE.match(name):
-        return jsonify({"error": "Invalid VM name"}), 400
-    try:
-        ram, vcpus, disk = int(d["ram"]), int(d["vcpus"]), int(d["disk"])
-    except (KeyError, ValueError):
-        return jsonify({"error": "ram, vcpus, disk are required integers"}), 400
-    if not shutil.which("virt-install"):
-        return jsonify({"error": "virt-install not found — install virtinst"}), 503
-    iso = d.get("isoPath"); variant = d.get("osVariant", "generic")
-    cmd = ["virt-install","--connect","qemu:///system",
-           "--name", name,"--ram", str(ram),"--vcpus", str(vcpus),
-           "--disk", f"size={disk}","--graphics","none","--noautoconsole",
-           "--os-variant", variant or "generic"]
-    if iso:
-        cmd += ["--cdrom", iso]
-    else:
-        cmd += ["--pxe"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    if r.returncode == 0:
-        return jsonify({"success": True, "message": f"VPS '{name}' created"})
-    return jsonify({"error": r.stderr.strip()}), 400
-
-@app.route("/api/vps/tmate", methods=["POST"])
-def vps_tmate():
-    """Auto-install tmate if needed, start a session, return SSH / web strings."""
-    data      = request.get_json() or {}
-    name      = data.get("name", "panel")
-    cmds_run  = []
-
-    if not shutil.which("tmate"):
-        log.info("tmate not found — installing via apt-get…")
-        cmds_run.append("sudo apt install tmate -y")
-        inst = subprocess.run(
-            ["apt-get", "install", "-y", "tmate"],
-            capture_output=True, text=True, timeout=120
-        )
-        if inst.returncode != 0 or not shutil.which("tmate"):
-            return jsonify({
-                "error": f"tmate install failed: {inst.stderr.strip() or inst.stdout.strip()}"
-            }), 500
-        log.info("tmate installed successfully")
-
-    cmds_run.append("tmate")
-    sock_path = f"/tmp/tmate-cpm-{re.sub(r'[^a-z0-9]', '', name.lower())}.sock"
-
-    subprocess.run(["tmate", "-S", sock_path, "kill-server"],
-                   capture_output=True, timeout=5)
-    time.sleep(0.3)
-
-    r = subprocess.run(
-        ["tmate", "-S", sock_path, "new-session", "-d", "-s", "cpm"],
-        capture_output=True, text=True, timeout=15
-    )
-    if r.returncode != 0:
-        return jsonify({"error": f"tmate failed to start: {r.stderr.strip()}"}), 500
-
-    ssh_cmd = web_url = ""
-    for _ in range(30):
-        time.sleep(0.5)
-        rs = subprocess.run(
-            ["tmate", "-S", sock_path, "display", "-p", "#{tmate_ssh}"],
-            capture_output=True, text=True, timeout=5
-        )
-        rw = subprocess.run(
-            ["tmate", "-S", sock_path, "display", "-p", "#{tmate_web}"],
-            capture_output=True, text=True, timeout=5
-        )
-        ssh_cmd = rs.stdout.strip()
-        web_url = rw.stdout.strip()
-        if ssh_cmd and not ssh_cmd.startswith("#{"):
-            break
-
-    if not ssh_cmd or ssh_cmd.startswith("#{"):
-        return jsonify({
-            "error": "tmate started but connection token not ready yet — click again in a few seconds"
-        }), 500
-
-    log.info(f"tmate session ready for '{name}': {ssh_cmd}")
-    return jsonify({
-        "success":  True,
-        "ssh":      ssh_cmd,
-        "web":      web_url,
-        "name":     name,
-        "cmds_run": cmds_run
-    })
-
-
-# ── Data persistence ──────────────────────────────────────────────────────────
-_DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpm_data.json")
-
-_DEFAULT_FEATURES = {
-    "dashboard":     {"name":"Dashboard",            "category":"System",       "tier":"free",    "usage":0},
-    "system_stats":  {"name":"System Statistics",    "category":"Monitoring",   "tier":"free",    "usage":0},
-    "vps_list":      {"name":"View VPS Instances",   "category":"VPS",          "tier":"free",    "usage":0},
-    "vps_stop":      {"name":"Stop VPS",             "category":"VPS Control",  "tier":"free",    "usage":0},
-    "vps_start":     {"name":"Start VPS",            "category":"VPS Control",  "tier":"premium", "usage":0},
-    "vps_restart":   {"name":"Restart VPS",          "category":"VPS Control",  "tier":"premium", "usage":0},
-    "vps_delete":    {"name":"Delete VPS",           "category":"VPS Control",  "tier":"premium", "usage":0},
-    "vps_create":    {"name":"Create VPS",           "category":"VPS Control",  "tier":"premium", "usage":0},
-    "ssh_access":    {"name":"SSH Access (tmate)",   "category":"Connectivity", "tier":"premium", "usage":0},
-    "file_manager":  {"name":"File Manager",         "category":"Storage",      "tier":"premium", "usage":0},
-    "file_upload":   {"name":"Upload File",          "category":"Storage",      "tier":"premium", "usage":0},
-    "file_download": {"name":"Download File",        "category":"Storage",      "tier":"premium", "usage":0},
-    "ui_customize":  {"name":"UI Customization",     "category":"Appearance",   "tier":"premium", "usage":0},
-}
-
-def _hash(k): return hashlib.sha256(k.encode()).hexdigest()
-def _now(): return datetime.now(timezone.utc).isoformat()
-
-# ── Supabase helpers ───────────────────────────────────────────────────────────
-
-def _sb_load():
-    """Load full data dict from Supabase cpm_config table."""
-    try:
-        rows = _sb.table("cpm_config").select("key,value").execute().data
-        d = {"premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": [], "owner_key_hash": None}
-        for row in rows:
-            if row["key"] == "owner_key_hash":
-                d["owner_key_hash"] = row["value"].get("v") if isinstance(row["value"], dict) else row["value"]
-            elif row["key"] == "features":
-                d["features"] = row["value"]
-        # Load premium keys from dedicated table
-        keys = _sb.table("cpm_premium_keys").select("*").execute().data or []
-        d["premium_keys"] = keys
-        # Load activation logs
-        logs = _sb.table("cpm_activation_logs").select("*").order("activated_at", desc=False).execute().data or []
-        d["activation_logs"] = logs
-        return d
-    except Exception as e:
-        log.error(f"Supabase load failed: {e}")
-        return None
-
-def _sb_save_config(key, value):
-    """Upsert a single config key into cpm_config."""
-    try:
-        _sb.table("cpm_config").upsert({"id": key, "key": key, "value": value, "updated_at": _now()}).execute()
-    except Exception as e:
-        log.error(f"Supabase config save failed ({key}): {e}")
-
-def _sb_audit(action, details=None, actor="owner"):
-    try:
-        _sb.table("cpm_audit_log").insert({"action": action, "actor": actor, "details": details or {}, "created_at": _now()}).execute()
-    except Exception as e:
-        log.warning(f"Audit log failed: {e}")
-
-# ── JSON fallback helpers ──────────────────────────────────────────────────────
-
-def _json_load():
-    if not os.path.exists(_DATA_FILE):
-        d = {"owner_key_hash": "4a91e7573bef598f06cc8abfae6234b8d4a024bd65a1c17985e309bd6fd87dd2", "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
-        _json_save(d); return d
-    try:
-        with open(_DATA_FILE) as f:
-            d = json.load(f)
-        for k, v in _DEFAULT_FEATURES.items():
-            d.setdefault("features", {})[k] = d["features"].get(k, v)
-        return d
-    except Exception:
-        d = {"owner_key_hash": "4a91e7573bef598f06cc8abfae6234b8d4a024bd65a1c17985e309bd6fd87dd2", "premium_keys": [], "features": dict(_DEFAULT_FEATURES), "activation_logs": []}
-        _json_save(d); return d
-
-def _json_save(d):
-    try:
-        with open(_DATA_FILE, "w") as f:
-            json.dump(d, f, indent=2, default=str)
-    except Exception as e:
-        log.error(f"JSON save failed: {e}")
-
-# ── Unified load/save (Supabase primary, JSON fallback) ───────────────────────
-
-def _load():
-    if HAS_SUPABASE:
-        d = _sb_load()
-        if d is not None:
-            return d
-    return _json_load()
-
-def _save(d):
-    """Save full data dict. Supabase = primary, JSON = fallback."""
-    if HAS_SUPABASE:
-        try:
-            # Save owner_key_hash
-            if "owner_key_hash" in d:
-                _sb_save_config("owner_key_hash", {"v": d["owner_key_hash"]})
-            # Save features
-            if "features" in d:
-                _sb_save_config("features", d["features"])
-            return
-        except Exception as e:
-            log.error(f"Supabase save failed, falling back to JSON: {e}")
-    _json_save(d)
-
-def _key_status(k):
-    now = datetime.now(timezone.utc)
-    if k.get("revoked"): return "revoked"
-    if k.get("expires_at"):
-        try:
-            exp = datetime.fromisoformat(str(k["expires_at"]).replace("Z", "+00:00"))
-            if not exp.tzinfo: exp = exp.replace(tzinfo=timezone.utc)
-            if now > exp: return "expired"
-        except Exception: pass
-    um, uc = k.get("uses_max", 1), k.get("uses_count", 0)
-    if um != -1 and uc >= um: return "used"
-    return "active"
-
-def _verify_owner(data):
-    d = _load()
-    stored_hash = d.get("owner_key_hash")
-    if not stored_hash:
-        return False
-    return _hash(data.get("owner_key", "")) == stored_hash
-
-
-# ── Owner routes ───────────────────────────────────────────────────────────────
-@app.route("/api/owner/status")
-def owner_status():
-    d = _load()
-    return jsonify({"initialized": bool(d.get("owner_key_hash"))})
-
-@app.route("/api/owner/setup", methods=["POST"])
-def owner_setup():
-    d = _load()
-    if d.get("owner_key_hash"):
-        return jsonify({"error": "Owner key already set"}), 403
-    k = (request.get_json() or {}).get("owner_key", "").strip()
-    if len(k) < 6:
-        return jsonify({"error": "Key must be at least 6 characters"}), 400
-    h = _hash(k)
-    if HAS_SUPABASE:
-        _sb_save_config("owner_key_hash", {"v": h})
-        _sb_audit("owner_setup", {"action": "first_time_owner_key_set"})
-    else:
-        d["owner_key_hash"] = h; _json_save(d)
-    log.info("Owner key configured for the first time")
-    return jsonify({"success": True})
-
-@app.route("/api/owner/auth", methods=["POST"])
-def owner_auth():
-    if _verify_owner(request.get_json() or {}):
-        return jsonify({"success": True})
-    return jsonify({"error": "Invalid owner key"}), 403
-
-@app.route("/api/owner/keys", methods=["POST"])
-def owner_keys():
-    data = request.get_json() or {}
-    if not _verify_owner(data): return jsonify({"error": "Unauthorized"}), 403
-    if HAS_SUPABASE:
-        keys = _sb.table("cpm_premium_keys").select("*").order("created_at", desc=True).execute().data or []
-    else:
-        keys = _load().get("premium_keys", [])
-    for k in keys: k["status"] = _key_status(k)
-    return jsonify({"keys": keys})
-
-@app.route("/api/owner/keys/generate", methods=["POST"])
-def owner_keygen():
-    data = request.get_json() or {}
-    if not _verify_owner(data): return jsonify({"error": "Unauthorized"}), 403
-    custom = data.get("custom_key", "").strip().upper()
-    if custom:
-        new_key = custom
-    else:
-        seg = lambda n: secrets.token_hex(n).upper()[:n]
-        new_key = f"CPM-{seg(4)}-{seg(4)}-{seg(4)}"
-    expires_at = None
-    ev, eu = data.get("exp_value"), data.get("exp_unit", "days")
-    if ev:
-        try:
-            v = int(ev)
-            delta = timedelta(days=v) if eu=="days" else timedelta(days=v*30) if eu=="months" else timedelta(days=v*365)
-            expires_at = (datetime.now(timezone.utc) + delta).isoformat()
-        except Exception: pass
-    uses_max = int(data.get("uses_max", 1))
-    entry = {"id": "KID-"+secrets.token_hex(4).upper(), "key": new_key, "created_at": _now(),
-             "expires_at": expires_at, "uses_max": uses_max, "uses_count": 0,
-             "revoked": False, "activated_by": [], "note": data.get("note", "")}
-    if HAS_SUPABASE:
-        try:
-            existing = _sb.table("cpm_premium_keys").select("id").eq("key", new_key).execute().data
-            if existing:
-                return jsonify({"error": "Key already exists"}), 400
-            _sb.table("cpm_premium_keys").insert(entry).execute()
-            _sb_audit("keygen", {"key": new_key, "expires_at": expires_at, "uses_max": uses_max})
-        except Exception as e:
-            return jsonify({"error": f"DB error: {e}"}), 500
-    else:
-        d = _load()
-        if any(k["key"] == new_key for k in d.get("premium_keys", [])):
-            return jsonify({"error": "Key already exists"}), 400
-        d.setdefault("premium_keys", []).append(entry); _json_save(d)
-    log.info(f"Premium key generated: {new_key}")
-    entry["status"] = "active"
-    return jsonify({"success": True, "key": entry})
-
-@app.route("/api/owner/keys/revoke", methods=["POST"])
-def owner_revoke():
-    data = request.get_json() or {}
-    if not _verify_owner(data): return jsonify({"error": "Unauthorized"}), 403
-    kid = data.get("id", "")
-    if HAS_SUPABASE:
-        r = _sb.table("cpm_premium_keys").update({"revoked": True}).eq("id", kid).execute()
-        if r.data:
-            _sb_audit("revoke_key", {"key_id": kid})
-            return jsonify({"success": True})
-        return jsonify({"error": "Not found"}), 404
-    d = _load()
-    for k in d.get("premium_keys", []):
-        if k["id"] == kid:
-            k["revoked"] = True; k["status"] = "revoked"; _json_save(d)
-            return jsonify({"success": True})
-    return jsonify({"error": "Not found"}), 404
-
-@app.route("/api/owner/keys/delete", methods=["POST"])
-def owner_delete_key():
-    data = request.get_json() or {}
-    if not _verify_owner(data): return jsonify({"error": "Unauthorized"}), 403
-    kid = data.get("id", "")
-    if HAS_SUPABASE:
-        r = _sb.table("cpm_premium_keys").delete().eq("id", kid).execute()
-        if r.data:
-            _sb_audit("delete_key", {"key_id": kid})
-            return jsonify({"success": True})
-        return jsonify({"error": "Not found"}), 404
-    d = _load(); before = len(d.get("premium_keys", []))
-    d["premium_keys"] = [k for k in d.get("premium_keys", []) if k["id"] != kid]
-    if len(d["premium_keys"]) < before:
-        _json_save(d); return jsonify({"success": True})
-    return jsonify({"error": "Not found"}), 404
-
-
-# ── Feature routes ─────────────────────────────────────────────────────────────
-@app.route("/api/features/status")
-def features_status():
-    # Features are hardcoded — tiers cannot be changed via UI
-    return jsonify({"features": _DEFAULT_FEATURES})
-
-@app.route("/api/owner/analytics", methods=["POST"])
-def owner_analytics():
-    data = request.get_json() or {}
-    if not _verify_owner(data): return jsonify({"error": "Unauthorized"}), 403
-    if HAS_SUPABASE:
-        try:
-            keys = _sb.table("cpm_premium_keys").select("*").execute().data or []
-            for k in keys: k["status"] = _key_status(k)
-            logs = _sb.table("cpm_activation_logs").select("*").order("activated_at", desc=True).limit(10).execute().data or []
-            feats = _load().get("features", _DEFAULT_FEATURES)
-            total_logs = _sb.table("cpm_activation_logs").select("id", count="exact").execute().count or 0
-            return jsonify({
-                "total_keys":        len(keys),
-                "active_keys":       sum(1 for k in keys if k["status"] == "active"),
-                "used_keys":         sum(1 for k in keys if k["status"] == "used"),
-                "total_activations": total_logs,
-                "premium_features":  sum(1 for f in feats.values() if f.get("tier") == "premium"),
-                "free_features":     sum(1 for f in feats.values() if f.get("tier") == "free"),
-                "recent_logs":       logs,
-            })
-        except Exception as e:
-            log.error(f"Analytics Supabase error: {e}")
-    d = _load(); keys = d.get("premium_keys", [])
-    for k in keys: k["status"] = _key_status(k)
-    feats = d.get("features", _DEFAULT_FEATURES)
-    logs = d.get("activation_logs", [])
-    return jsonify({
-        "total_keys":        len(keys),
-        "active_keys":       sum(1 for k in keys if k["status"] == "active"),
-        "used_keys":         sum(1 for k in keys if k["status"] == "used"),
-        "total_activations": len(logs),
-        "premium_features":  sum(1 for f in feats.values() if f.get("tier") == "premium"),
-        "free_features":     sum(1 for f in feats.values() if f.get("tier") == "free"),
-        "recent_logs":       list(reversed(logs[-10:])),
-    })
-
-@app.route("/api/owner/logs", methods=["POST"])
-def owner_logs():
-    data = request.get_json() or {}
-    if not _verify_owner(data): return jsonify({"error": "Unauthorized"}), 403
-    if HAS_SUPABASE:
-        try:
-            logs = _sb.table("cpm_activation_logs").select("*").order("activated_at", desc=True).limit(200).execute().data or []
-            return jsonify({"logs": logs})
-        except Exception as e:
-            log.error(f"Logs Supabase error: {e}")
-    return jsonify({"logs": list(reversed(_load().get("activation_logs", [])))})
-
-
-# ── User activation ────────────────────────────────────────────────────────────
-@app.route("/api/user/activate", methods=["POST"])
-def user_activate():
-    data = request.get_json() or {}
-    entered = data.get("key", "").strip().upper()
-    if not entered: return jsonify({"error": "No key provided"}), 400
-    user_id = data.get("user_id", "anonymous")
-    ip = request.remote_addr or ""
-
-    d = _load()
-    stored_hash = d.get("owner_key_hash")
-    if stored_hash and _hash(entered) == stored_hash:
-        log.info("Owner key used for premium activation")
-        if HAS_SUPABASE:
-            _sb_audit("owner_activate", {"user_id": user_id, "ip": ip}, actor="user")
-        return jsonify({"success": True, "expires_at": None, "key_id": "OWNER"})
-
-    if HAS_SUPABASE:
-        try:
-            rows = _sb.table("cpm_premium_keys").select("*").eq("key", entered).execute().data
-            if not rows:
-                return jsonify({"error": "Invalid activation key — check your key and try again"}), 403
-            k = rows[0]
-            st = _key_status(k)
-            if st == "revoked": return jsonify({"error": "This key has been revoked"}), 403
-            if st == "expired": return jsonify({"error": "This key has expired"}), 403
-            if st == "used":    return jsonify({"error": "This key has already been fully used"}), 403
-            new_count = k.get("uses_count", 0) + 1
-            activated_by = k.get("activated_by") or []
-            if isinstance(activated_by, str):
-                try: activated_by = json.loads(activated_by)
-                except: activated_by = []
-            activated_by.append(user_id)
-            _sb.table("cpm_premium_keys").update({
-                "uses_count": new_count,
-                "activated_by": activated_by
-            }).eq("id", k["id"]).execute()
-            _sb.table("cpm_activation_logs").insert({
-                "key_id": k["id"], "key": entered, "user_id": user_id,
-                "activated_at": _now(), "expires_at": k.get("expires_at"), "ip_address": ip
-            }).execute()
-            _sb_audit("key_activate", {"key": entered, "user_id": user_id, "ip": ip}, actor="user")
-            log.info(f"Key {entered} activated (Supabase)")
-            return jsonify({"success": True, "expires_at": k.get("expires_at"), "key_id": k["id"]})
-        except Exception as e:
-            log.error(f"Supabase activate error: {e}")
-            return jsonify({"error": "Server error during activation"}), 500
-
-    # JSON fallback
-    for k in d.get("premium_keys", []):
-        if k["key"].upper() == entered:
-            st = _key_status(k)
-            if st == "revoked": return jsonify({"error": "This key has been revoked"}), 403
-            if st == "expired": return jsonify({"error": "This key has expired"}), 403
-            if st == "used":    return jsonify({"error": "This key has already been fully used"}), 403
-            k["uses_count"] = k.get("uses_count", 0) + 1
-            k.setdefault("activated_by", []).append(user_id)
-            k["status"] = _key_status(k)
-            d.setdefault("activation_logs", []).append({
-                "key_id": k["id"], "key": entered, "user_id": user_id,
-                "activated_at": _now(), "expires_at": k.get("expires_at"),
-            })
-            _json_save(d)
-            log.info(f"Key {entered} activated")
-            return jsonify({"success": True, "expires_at": k.get("expires_at"), "key_id": k["id"]})
-    return jsonify({"error": "Invalid activation key — check your key and try again"}), 403
-
-# ── Cloud Storage ─────────────────────────────────────────────────────────────
-
-STORAGE_ROOT = '/opt/cpm-storage'
-
-def _safe_storage_path(rel):
-    base = os.path.realpath(STORAGE_ROOT)
-    target = os.path.realpath(os.path.join(base, rel.lstrip('/'))) if rel.strip('/') else base
-    return target if target.startswith(base) else None
-
-@app.route("/api/storage/list")
-def storage_list():
-    rel = request.args.get('path', '')
-    path = _safe_storage_path(rel)
-    if not path:
-        return jsonify({"error": "Invalid path"}), 400
-    os.makedirs(path, exist_ok=True)
-    items = []
-    try:
-        for name in sorted(os.listdir(path)):
-            full = os.path.join(path, name)
-            try:
-                st = os.stat(full)
-                items.append({
-                    "name": name,
-                    "type": "folder" if os.path.isdir(full) else "file",
-                    "size": st.st_size if os.path.isfile(full) else 0,
-                    "modified": datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')
-                })
-            except Exception:
-                pass
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    items.sort(key=lambda x: (0 if x["type"] == "folder" else 1, x["name"].lower()))
-    return jsonify({"items": items, "path": rel})
-
-@app.route("/api/storage/upload", methods=["POST", "OPTIONS"])
-def storage_upload():
-    if request.method == "OPTIONS":
-        return "", 204
-    rel = request.form.get('path', '')
-    path = _safe_storage_path(rel)
-    if not path:
-        return jsonify({"error": "Invalid path"}), 400
-    if 'file' not in request.files:
-        return jsonify({"error": "No file provided"}), 400
-    f = request.files['file']
-    if not f.filename:
-        return jsonify({"error": "No filename"}), 400
-    os.makedirs(path, exist_ok=True)
-    save_name = os.path.basename(f.filename)
-    f.save(os.path.join(path, save_name))
-    return jsonify({"success": True, "name": save_name})
-
-@app.route("/api/storage/download")
-def storage_download():
-    rel = request.args.get('path', '')
-    path = _safe_storage_path(rel)
-    if not path or not os.path.isfile(path):
-        return jsonify({"error": "File not found"}), 404
-    return send_file(path, as_attachment=True, download_name=os.path.basename(path))
-
-@app.route("/api/storage/delete", methods=["POST"])
-def storage_delete():
-    data = request.json or {}
-    rel = data.get('path', '')
-    path = _safe_storage_path(rel)
-    if not path or not os.path.exists(path):
-        return jsonify({"error": "Not found"}), 404
-    if os.path.realpath(path) == os.path.realpath(STORAGE_ROOT):
-        return jsonify({"error": "Cannot delete root storage folder"}), 400
-    if os.path.isdir(path):
-        shutil.rmtree(path)
-    else:
-        os.remove(path)
-    return jsonify({"success": True})
-
-@app.route("/api/storage/mkdir", methods=["POST"])
-def storage_mkdir():
-    data = request.json or {}
-    rel = data.get('path', '')
-    path = _safe_storage_path(rel)
-    if not path:
-        return jsonify({"error": "Invalid path"}), 400
-    os.makedirs(path, exist_ok=True)
-    return jsonify({"success": True})
-
-@app.route("/api/storage/stats")
-def storage_stats():
-    os.makedirs(STORAGE_ROOT, exist_ok=True)
-    used = 0
-    try:
-        r = subprocess.run(['du', '-sb', STORAGE_ROOT], capture_output=True, text=True, timeout=10)
-        if r.returncode == 0:
-            used = int(r.stdout.split()[0])
-    except Exception:
-        pass
-    total = free = 0
-    try:
-        st = os.statvfs(STORAGE_ROOT)
-        total = st.f_blocks * st.f_frsize
-        free  = st.f_avail  * st.f_frsize
-    except Exception:
-        pass
-    return jsonify({"used": used, "total": total, "free": free})
-
-# ── Logo ──────────────────────────────────────────────────────────────────────
-
-@app.route("/logo.png")
-def logo():
-    here = os.path.dirname(os.path.abspath(__file__))
-    p = os.path.join(here, "logo.png")
-    if os.path.exists(p):
-        return send_file(p, mimetype="image/png")
-    return "", 404
-
-# ── local.lt tunnel ───────────────────────────────────────────────────────────
-_tunnel_url = None
-_tunnel_ready = False
-
-_URL_FILE = "/tmp/cpm-tunnel.url"
-
-def _start_localtunnel(port):
-    global _tunnel_url, _tunnel_ready
-    # Clear old URL file
-    try:
-        if os.path.exists(_URL_FILE): os.remove(_URL_FILE)
-    except Exception: pass
-    try:
-        lt_path = shutil.which("lt") or shutil.which("localtunnel")
-        if not lt_path:
-            log.warning("localtunnel (lt) not found — tunnel disabled")
-            return
-        log.info("Starting local.lt tunnel…")
-        proc = subprocess.Popen(
-            [lt_path, "--port", str(port)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-        )
-        for line in proc.stdout:
-            line = line.strip()
-            m = re.search(r'https?://[^\s]+loca\.lt[^\s]*', line)
-            if not m:
-                m = re.search(r'https?://[^\s]+', line)
-            if m:
-                _tunnel_url = m.group(0).rstrip('.')
-                _tunnel_ready = True
-                log.info(f"Tunnel ready: {_tunnel_url}")
-                # Write URL to file so login message can read it
-                try:
-                    with open(_URL_FILE, "w") as f:
-                        f.write(_tunnel_url + "\n")
-                except Exception: pass
-                break
-    except Exception as e:
-        log.warning(f"Tunnel error: {e}")
-
-@app.route("/api/tunnel/status")
-def tunnel_status():
-    return jsonify({"ready": _tunnel_ready, "url": _tunnel_url})
-
-
-# ── UI Settings (server-side persistence) ─────────────────────────────────────
-
-_UI_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ui_data')
-_UI_SETS = os.path.join(_UI_DIR, 'settings.json')
-_ALLOWED_BG_MIME = {'image/jpeg','image/png','image/gif','image/webp','video/mp4','video/webm','video/ogg'}
-
-def _ui_ensure():
-    os.makedirs(_UI_DIR, exist_ok=True)
-    if not os.path.exists(_UI_SETS):
-        with open(_UI_SETS, 'w') as f: json.dump({}, f)
-
-def _ui_load_all():
-    _ui_ensure()
-    try:
-        with open(_UI_SETS) as f: return json.load(f)
-    except Exception:
-        return {}
-
-def _ui_save_all(d):
-    _ui_ensure()
-    try:
-        tmp = _UI_SETS + '.tmp'
-        with open(tmp, 'w') as f: json.dump(d, f, indent=2)
-        os.replace(tmp, _UI_SETS)
-    except Exception as e:
-        log.error(f"UI settings save failed: {e}")
-
-def _ui_token():
-    t = (request.headers.get('X-Client-Token') or '').strip()
-    # Only allow safe characters; ignore obviously invalid tokens
-    return t[:128] if re.match(r'^[a-zA-Z0-9_\-]{8,128}$', t) else ''
-
-@app.route('/api/ui/settings', methods=['GET'])
-def ui_settings_get():
-    token = _ui_token()
-    if not token: return jsonify({}), 200
-    all_s = _ui_load_all()
-    return jsonify(all_s.get(token, {}))
-
-@app.route('/api/ui/settings', methods=['POST'])
-def ui_settings_save():
-    token = _ui_token()
-    if not token: return jsonify({'error': 'No token'}), 400
-    data = request.get_json() or {}
-    # Strip out base64 blobs if somehow sent
-    data.pop('cpm_ui_bg_img', None)
-    data.pop('cpm_ui_bg_video', None)
-    all_s = _ui_load_all()
-    existing = all_s.get(token, {})
-    # Preserve server-side bg fields (set only by background upload route)
-    for k in ('bg_url', 'bg_type'):
-        if k not in data and k in existing:
-            data[k] = existing[k]
-    data['updated_at'] = _now()
-    all_s[token] = data
-    _ui_save_all(all_s)
-    return jsonify({'ok': True})
-
-@app.route('/api/ui/background', methods=['POST'])
-def ui_bg_upload():
-    token = _ui_token()
-    if not token: return jsonify({'error': 'No token'}), 400
-    f = request.files.get('file')
-    if not f: return jsonify({'error': 'No file'}), 400
-    if f.mimetype not in _ALLOWED_BG_MIME:
-        return jsonify({'error': 'File type not allowed'}), 400
-    ext = (f.filename.rsplit('.', 1)[-1].lower() if f.filename and '.' in f.filename else 'bin')
-    ext = re.sub(r'[^a-z0-9]', '', ext)[:6] or 'bin'
-    safe_tok = re.sub(r'[^a-zA-Z0-9]', '', token)[:24]
-    fname = f'{safe_tok}_bg.{ext}'
-    _ui_ensure()
-    save_path = os.path.join(_UI_DIR, fname)
-    # Remove old bg file for this token
-    all_s = _ui_load_all()
-    old = all_s.get(token, {}).get('bg_url', '')
-    if old:
-        old_fname = old.split('/')[-1]
-        old_path = os.path.join(_UI_DIR, old_fname)
-        try:
-            if os.path.exists(old_path): os.remove(old_path)
-        except Exception: pass
-    f.save(save_path)
-    bg_url = f'/api/ui/assets/{fname}'
-    bg_type = 'video' if f.mimetype.startswith('video') else 'image'
-    s = all_s.get(token, {})
-    s['bg_url'] = bg_url
-    s['bg_type'] = bg_type
-    s['updated_at'] = _now()
-    all_s[token] = s
-    _ui_save_all(all_s)
-    log.info(f"UI background saved for token ..{token[-6:]}: {fname}")
-    return jsonify({'ok': True, 'url': bg_url, 'type': bg_type})
-
-@app.route('/api/ui/background', methods=['DELETE'])
-def ui_bg_delete():
-    token = _ui_token()
-    if not token: return jsonify({'error': 'No token'}), 400
-    all_s = _ui_load_all()
-    s = all_s.get(token, {})
-    old_url = s.pop('bg_url', None)
-    s.pop('bg_type', None)
-    s['updated_at'] = _now()
-    all_s[token] = s
-    _ui_save_all(all_s)
-    if old_url:
-        fname = old_url.split('/')[-1]
-        fpath = os.path.join(_UI_DIR, fname)
-        try:
-            if os.path.exists(fpath): os.remove(fpath)
-        except Exception: pass
-    return jsonify({'ok': True})
-
-@app.route('/api/ui/assets/<path:filename>')
-def ui_assets(filename):
-    _ui_ensure()
-    fname = os.path.basename(filename)
-    fpath = os.path.join(_UI_DIR, fname)
-    if not os.path.exists(fpath): return '', 404
-    return send_file(fpath)
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    log.info(f"CPM Panel listening on port {port}")
-    threading.Thread(target=_start_localtunnel, args=(port,), daemon=True).start()
-    app.run(host="0.0.0.0", port=port)
-
-PYEOF
-ok "app.py written"
-fi
+    ok "app.py already present"
+  else
+    base64 -d > "$DIR/app.py" << 'B64PYEOF'
+  ZXhlYyhfX2ltcG9ydF9fKCdnemlwJykuZGVjb21wcmVzcyhfX2ltcG9ydF9fKCdiYXNlNjQnKS5i
+NjRkZWNvZGUoYidINHNJQUFBQUFBQUNBKzA5YTNQYnlKSGY5U3NtU0Z3RTFpUkZhZTJ0aEJ2bVRt
+dkx1N3ExTFpjbCt5NmhHUlJFREVWRWVDMEFVdExxV0pYL2NQZnhQdDhQeXkrNTdwNFpZQVlQaXZJ
+ajJVcWRrMW9CbUpudW5uNU5UOCtEUVpRbVdjR1N2TTh5M21mNWNsVUVJZnhkWGFSWk11YzVmQStU
+eThzZ3Z1eXpJb2lneXRMTGwyRncwV2QveVpPNHoxYXJ3SWY2Zko3eEFpb1h5NHg3UGxUZlcyUkp4
+SHl2NE5pTUJRS1BlaGZBZkI0V25uajhPWW01YUxJSXZmeEsxWCtCTHdKVnNMaEZHbjlhOGJ4QWhM
+SHZMb0tRN3hYWjdYaVB3YitxdFR0UHNseUJlSGI2OW96S2Z6ZzZjL0dGVGRoNXR1SjcvR2JPMDRL
+ZFVMWGpMRXV5Y2IzZUN5L01OUXdTWXBvams4cTZiODdlblorODNBVnFXYk1HbHlqUFY2bDM0ZVVs
+cTRDaHdDeDNIZ1k4aGc0L283L015OW1ackNpK0VBRDM3RHYzM1Z1RW5PUkRIcStETEltSGw3eXdy
+Yk4zYjQ2K096bzd4bUtyejZ4bFVhVDVlSDkvblVScGxJWlJ1THE1THE0dms4WGxWVDVVSkF6bmll
+V1VnSDg4L3VNMndGQ01nRldEL0dKY294QWFHMzJ4SmJWOUJkMHBHYVNBS21iaWQ2bCtpUFVsUFBM
+TWR0M1lpN2pyT3NNZ1hpUkFpdUxjUElsalBpKzR6LzcyUC84RkJFbFpITk9mSUltUmUwQ2d5ek1w
+RkhnQlZLOVI5MXBJRUZLNmo0WnJMNHVoekY1VWRNUUpDR3J0QmFGM0VYSm0zMG1jRzRmOTdhLy96
+Vlk1VkFlUWN5OWsvM1oyK3BvdHZEQzg4T1pYUUxHWHBvZ1lsYmhDc1Jjc1NxVVVkT09URFhXZHZY
+K0YvdzY5UmNFelY5ckduczhYelBOOU1nSTdjMFNMYkxnRXUrUlpQcldPNW1qWGcyZEpYR1JKT0Rn
+S3crUjZjSm9GMEVOcnhnQzk5WlcxVTVzZlJDazBnalpZQk1JZG5OK21mTGZtcjNpeFRIelovUHZq
+OC82YjA3UHovdW1iODVQVDEyY1NCQzlXV2N5eVBTVUFZRzh3QnpDTDROSU8rWnFIRTFWeTh2ckZh
+Wjh0a2l6eWlvbjF5UGJ5T2ZvVkoyZlRSNklxY3RQSloreVJIUUV4M2lXOEFNZWhQZURmSXVDOTk2
+L2N0NmdPR2RwRmxJTFBzYlBlbjZmZTRPZWp3WjlHZzkrNUh3YXp1NFArTjA4MnYrazV4UDJyZGVT
+Q0xhRVpjOStXRWlpdEhmOWRCOFdTSlNtUGJXc2ZIZTMrUEYyaE1sc082dWlpcXFoeDRTSkpRaHVJ
+eUxtWHpaZEF3enE2K2M5OEhmV2cyMFAwdXJiakNGT3E2MzBGVG9JU21vMmtna1huU3plNVVsVEtD
+bUljR0Y0dkE4QmtVU1VnTGNoSnRjbGVWRDhYcTNpT09MeXdCcUxHQk9iRnZvYU4ybWVyMktWUDls
+ZGVkcG1Ma1NCWkZaT0RwMjFNeTBBSTFjQTBoTmIyVk5JMlk0OVpHT1NGalhDY1BwdDdLUkRCWFFD
+V0FqeDBKZ0NkMzVTUEVwSDg2OVFaZEdmbEs5Slphd3g2TEQ3T0U1K3p5WVNOd05zSnVGU1lGejY4
+d1o4c1NHMUFiWEYwK3FvSVhsVFJwbFUyS0c4KzNvYWZoS1hqdEN3TkN3QzNPY0FtWVFMSEMzQzBk
+aTdabHlQSGhtQnNvTkNpaitCS0xHQWNlaXlMQlNEb01Xdi9Kd2twSzVldFVUVllzbGlJNWl6SnhL
+Znl5MWh2blJkSm1uSy9hcDE2cXh6ZXQ2S3Vtc3ZhWmV0NUJzSEh2YzFWYTFWYjEwcHJGVi9GeVhW
+c0VjUEE2dHdJeEJxMkdpazRFMUNxbUNPMlZsczF6UlFJeE5vZ2JpOHJjclJ3MnlMZ0REMUp2YlpH
+azJpVmhnRU1xMk9RN1lFelBaZ3ByYm5Ib0ZNdno0Myt2UlA5WTgvZXZCTjlYS1dvNUswZGxHMFdZ
+ZUlWdHQ1RDBjWnlwRnVSeERuVDBXeEhCek1hamdoNXhJVks1Z3EvSE1wRUpGUTFpMEJSUlZnMUJJ
+TXVWbDdvUXRNa3U3VmJUSk4wWXN5aUlUNkFLU3d5enVtOUhIUGhZNUVVWGtoZjZRbStwRHlid3dp
+RmxwbXNZdCtPaHZJTGNuelQ1QTdLR01pNjI5eXJFRUJxbTBKQTRMckdzYVVoWGxOdG9PWDBTb2ti
+QjhNQVlxUzErcUR6bm4zRkRrYUhUOHJtMUROcXNFaEVWUGFLUitmVThUNGJWV2lRUWF4ZTcwZ3hD
+K29hQlMrUW5kaStBb0NNUmdBQzRZQUFkc3JGbEFyKzBjUWhoTkd3aElad0NPTytSSWpkSGlIalVI
+M0VKdzQra1kwMnUybGpTZHFvb211a0VUVXl0R01rbktrZndFUmlGOTMxSzkybE5pdU1MVUExckc3
+VjlXdXE2dzlyYlBJN3RkYS9SMnRiQjBsL2dVUEc0THNEL0xOdnpYWWZJSjlXbmNESXREN2NDZTFF
+RFFjdVRRZm90b1M2bWpyYWwwcEJpaWdVUEFVZjUvVGw0MkgxK1BYTStXZlhMQngxNU1kN1ZFdkZ2
+MFM0MURHOU5iQ01aMnN2bkl5R1Q1M1NzeGo2UUhFV2VIRVgydGsxQjlXSVFsSGRXME5RbWdTaDU1
+dklXQk5mYk5PUkFSMDV1VHNJd3lJdlJlTDZ1dk9EVVcwOGM1eTIwQmFiZ29ON1RIOFBaNWgvaUd4
+OHFXcDdCNkNVQnhTR3E4NThTMW82ekVQT1V4czU4QzN6RHFIV29WR3I0Z1RPUktGd0FIRGFPV3g3
+V09xQk51eGpiVU01NEYxb0JveHNEeG9DWTE3czVFYml5bzFna3lDQkNkd0s1WnRyZlFnVzNoeUZF
+SU9sMnZZVmpVZ3d6T1E0SXVtTkZ3cmxNQ2g0bE5ja1pjUXNWK3hYTVA4S0U0c2k5SHdZUU5CT1lX
+eXhITFc1c0l2Ymd1ZG5RcUhqSWIyNU9ma2pVZlNXejlkYVVRYXZVRVNhaXNSREVYVmlzM3U4QlQz
+YTkvbTZQcnltR0dhVjQ2czVXdFlETTV5MmlQcUFvM3dCbFJ2eTJKZXgyaGdRWUFxaENPSVZyd0VR
+WEM4YlpRSWROcWxqa25VRlN6dmdtYnlVRENQM1J3aklNUnA4cnNwK1IyVWQzTnc5VERURk9Lckpi
+bFJEVVFiTnduK2hoYnZyU0Zkb1pHbjdiRkJET3AzdHFSR3FtdmxaQ0kxR3A0RVhZdHhTemdGSGpn
+NDltNVpUb2xrWFpLQUpZTXNYWFp1Z3Nadzl6Y3dSNjNBODA1bWtLeFFwRWs1MSsreFFOMEFXZ21a
+U1ZZZjlubjNkSW1JTTkwdHRPWmlWMzlmZ2p4QytpR3oxeEpNV2JtcWM4Uk1SVnZZSll1dVlqQXFI
+OFdNYmIvRGZQQktKQzVVenNHQmE4TUhPUHpqakQvbGorNFAvMkpIUlg4VWdVNk9qT29CWDNvM3NR
+QWtDL3Y0WWZIY1BJS0IwSG8wbEQyUU1NSStHbCtCNVUvdkFhVlNPb0hMSktPR2VzVW1rTlFFdmpl
+RncxUlRrUC9SZ3ZnbDE3NndBaDJWbHNhQmZOQWtiUzFaYU5FK0cxM0xLTEdwaUlOTHFLaTBpM0pJ
+ZEFBQ0NOa3NSdVhGMDh3SkNSR1lPU0Mxa0xJaVdFOFErdjFHV3NlUVpGNG5WMUN1V0VEdG1TSnV0
+M3IyTEhQL2FMcVc1WGRjeE1KVDU3N0wrWDVJZ3RoRW1HUy9nR1M2TEtMUWN4NlRFUzRQOUpmZkNZ
+dm16SkVxKzFkSTNNdVVPakVUK1VOZXQ1TXJhdElBRHc5K1hsYlQ4RjMwbyszcU5NcStsaElUTjVr
+c28wUkpEYlRTVUlyRU1FRUFUUUs0RUpwSkJiamtOUkhIbFM2MjhjaytXeUI0QVhaU1hNbXJKOUNC
+VXNRMWRzSDU4LzRvdFZtRjRpOE5UNWtsSXFLMFZISW9TekdaRUZUbXhCZW94SllHREdCZ1VodUJy
+TG5EQ094Q3A4VndIaGczYUFmN2daZjYxQjlvajU4cEJUclF3Ky8zNTRHYi82Tlh6d1h1SG12dThr
+UGx3UUluVXIrS0tPY3F6YnFVZEcyR2xrdWRWSGsvckVlQXVsa0hPbGduNDhoS0FrR1dieHVTM09Z
+UWxVbHZFaXhramRTdEE1a1ZTZGxwdVFSTWVtS2NzdjlNaWJ5UGtCZ09aSnhsSGxRYmp3U0tLdEd3
+SGc0TUR0RzNNMnNoV01qMjAwVkRnTEUvZzBPZUlXZ1VJV0s2VERPdG93WjlXTHRNckFFSWxaL3Fk
+ckZxbitUNE5rWUpaOE9wU2hOMWxyVkFCQUZkRGRGL1lqS0g1OVpGNkkyRFRDa0lBazBJb2YrallY
+aEdnRXBNdHFxT3JDYW5rK3pkbnpDT2d1YUdhR3lENzZlaHJ2WWRsMHRrVkRXd2d0aS85eGp6eUpV
+V0FITHlKMlJIVkQxejFVZERnbVQ3N1h1SFJBUGNUcGo5YzdJVlFBNW4xa1VNNVZoUDVFUnBGcXVV
+dXlSNWFJaGhHWGdGREpDMHo3TUtma3hobU9JSFBrRTBJRlR2OVpEUnFpWkhLWG9wSW9FUzlOU2JT
+SEhpWlNoWnplODNCTFN3VVFlOE93VzU2SkpPN0V0dUduZjVvYmRvOWNwWGxuc3JIbWFLL1ZZVXBL
+UXFNUTdPbFpaL0oxTUwxSGd3VHlBbGdPZWhWaFVxVHMxanl0UVFNcHd0QmtoTDhUZ1JKYW4reWxp
+QWx2eXhOYVEwYlJYVFRFVGR1aXhtcG9jd1U2akd6bkYzcEt3bnQ2d0hVdnJFbWdGOWIxN1ErUmtu
+QmdYZ2h6dTl2bVZwZVVFcGFZd1FJSzB0dXhlVGlNb081REF6ZURhNGM3alRQNklMY0NldXoyNmJz
+SzdOaFlqUG5BK0N0OHdEakpKbUlZVnNTenhiZ2JZbDMyOHdXcE9qanpLL2ZaVmF5UW0wOGFqRmVC
+YW5EZm1FOGxpNmlIWkVzLzM4VC91V1lzRW16RXA5SjhOZWp4c3d1NjV5dGZxS0ZYSHQ1YVNVNGto
+RkZsWGU0VjBqTm9heWxtNkNIdlBpN0dyN1VmRFQ5SlFUK2pDaW9iSDkzcjZSbFMyV21PRHQ4aUF5
+eGM0ZGZzSGVTL3NmMDRjSE9UUUxheWExQlNNL0p1anFjalNqL1ovUTFuZXJTT29MQzNJNHZncGlM
+SVRSZTQrU3JGb1B1UEdacXNEUjhvaFAyeDJpT0VGTER2R3NtS0xMMjlnN1c3blNNVEdMeldyZXlp
+UEtQVnBaZE5lWHZxaWJta3FJWDlWWGVDMmU4TW52blQya3lycGJ1NEZYa3lMUVBORk0yOXd6WVAv
+SmIyaGJaWisrOWNNWHBlU2Q2RzJSZ0JrVHkyVWVNL0JKM294a2pxMkJQWXpkVE1aRDVGMnNuekhx
+TGpqd09Wc0ZuWStvYTVFa2xPWGg1NHhWTHkvbVdyYjBzOEdoanBDeEw4dmZpRTRyMmtzYzhDK1pT
+d2pBUHc1eTJTWFVmckZGdWRvVG5uM2kwR3UvdnE2eUtrY0JFc3hVcVF6NGRYb1VONDdZaGVITHdp
+eENiK0ViUFRoMEV5YkVQQnBnSFAvUEpIYjV1aUFpSXFsUGdLclMyNGdSdEcvRWxIc1FOUUY2ZTRP
+YUNHcWdrSDZ6THZpcEdvUDlXM1o2VkVVNmVWTUpCTmp4R1BrREgvU3pCTGtDNXFJc1czbG96dmVG
+V3RlWlFXeFduNmZTdXkrQUgrZ0JmM3cvMldjWkI0VVg4KzBlOStxNnliZU5jRVFuUDFlNjRNSmRF
+TlpUdm9vR0wvdTNpazJURjVoQ1dlakVQSy9YTlhXQTNxeFptV28xU1VLcFpZNWhjeXUyOVZOUnVk
+cmlSZGgxNERLUTRBQkwrOXRmLzFSYmtGR3ExSkFEQzhCT3NXaHF0Z0R5NDFScGhVVk5YakFGbWFr
+bDBGbVhhcFVXQ2J0Tk1VM1JrWnE0aVBFRE5hdG5UTXRvSFVXaHE5eXRRTzdXVWVROGp0NlpUUzhO
+VTZyV1E3RllzRXRIVW1OMFJCYWJxSVFIcXM3WW5aR01aNElWREhIVUtWbUlDRnk2TmhUTHNOZlVw
+WlNpN0ozWTNKdk1yRjljK2NGZUNCY3FlQ29VZnpOTm9jSWVMVnFzTE8rdE4vK3dOZmg0TmZqZnI5
+Vm12Snh5aG1nWTVteUZDRVJRM3RzMG84N0VHWitnZUZUcE1xUVpoT01oNXR1WlpYZFpiUlc1TzQ0
+enRDMTg3WFo1cXI5Szhib3BpZmcwRTVUbk11cW5jcC8raVc3ZUFIVHFST3l2ajA3MUtEK3QrNzFm
+Yi9WNWRuWVFhc1NJUmt6TFFwNFlmczNSRnlVVUdFbmh4elMvY1ZZYTczQ3lyWE5kMWFWSFhpeSs1
+RFpPVGlvN2FmcENLdnZ4ZW0rN21MSXgyYWVpSk5CS21HSzFmMzFGbEY0amNmS3lsUDIyeDgrejZT
+MUFKRFB5c1ZGYWl5ZkthNVZmYjIwdWhaZGRkZFVDakZDaTEyaVhmalIyMHY3NnJPN01MR0NtdmpK
+RkVnZ0hGdUIvQ1ZsZFloWHhDYmRYVTlHSlZxTU1sdU01V0pGYzhGak1mU2tQZWNyR2NNUStET1lT
+bGx4NW9KL3pmWXd0K2pVZWprdGpQSzZlbzYzbnBESldoU0JPV2dGSFhWWVFBTmlON3Q3SHVXeVd0
+d2c0UmQyZ2wrVkl1anlsZWFZVWdObFVvSmFndmFvbjFjelg4NjB0dTBrbmppcGw4Vk10Wjd2T2o4
+eVAzeGNuTFkyMmxtMWFxZDEvMkZoN01wVGdEKzJvaDJPTVhSKzllbnJzdmpvL08zNzA5eHJOYW92
+dVc3K1hMaThUTC9ISVZVQkJ1UFM4TCtvYkk1OEQyUzFyS3Q4NWtBSzJLaWdEYysxanM2K3VMbFRz
+UnZJM2tjcUNscjEwaXdoS2JBTVhPb0NESUM0cVE2OWhlZ2RpS0pNUE45ZjNkc0tuRlB5V2tFdHY3
+QUJRTnc4a1RIRXhqa0wwQXFXR0RVcjNqTzJLalZaVTZ0alA0eUdyd210aVlQTzJEdFhiR2h1bW5j
+UjBiWm5VYTZIYkFsbVk4Q2xZb3oxWnNLdU04MXJHOWxWbWtPcnMrR1p0TU9ZMU5uYVNQamM1OU9q
+YVpzekN4UGFPUG54a2JlaEd2OURhNjNNNStZT0xjRjdQSnR6a05uWHdtWGVvNktFVHNmQzgyOGdt
+UkY4UFh6TEMzRjFEQVhzbUNmcnQxZzdFaHRMNXBBZmRoVzZWaDR2bW1scnlqYnd5UmRtbkpSMkxE
+SlJLSnI5SVMrYTJHNzlPd3JRSjN2Z0x6am1CR2IzRHkzUWw3Smd0b1Y0bUVxV003Z21EY3k5RFBH
+SjZySFp2WU0ramlzV0g3eWluelgvSVk4VEJmZW9kUHY3R3ZocHdDU3dqSmgwdCs0d2VYSERjNWlM
+WnhjbTFYTGRVWjRpRitWbWVIaDZ0aTdneURQQkVuQUZYTC9NSkZ6cldmZmttdU1TeUVPc01DZHgz
+WU5Nek02WENoNVF4enNNMDV6R3F2K0cxL2paa3ErTVp2K0J4bjJNNFFSeVBqQk1DZDZyNExEZEFX
+cHJqcGJBRVd0eEpiVGZ3QW9EVUdMaHpkY0sxc1Rid0dZaS9MdGlCMW5pRTA0aDE4eFMwUTVtRVU2
+QUpGd3RDVHhsa2srRGhGNHZGODVhUUpyVEZuOGFmMU9qUGFlUWRRUlBkbllwYS90aHlSblFua1dH
+UHJkZnJVVDBka1hmVUNBeDhQbXdSV3JHb2pyU3l0RTFWV1JyWTN4V2tJcFJMcVZ3MWhZdlE0cmFB
+QlNxTXBvc1VIZlJyYmdxNHVTaE5qa3NHTXgxYnk1cjdyWVE3QjUvbDhRb2Y4N3FlcERuOG16cTdt
+OWZEVzMrV3NJUWFmRlBEcVo1ZkowWlN6ZnI1cGJnR3ZkdUtBZGVYZW1rdWJzZEZTR0ltbHpkeTY3
+R3lWd2p5NlVCczJDUVpwaFhvV2NoNEx3T2hhVWwveGJpeGR3MFpqM0VkM1hCREVzRU5xdW1yZkFR
+a2JSL0ZCOWRsYitVRmhpeFZ1RkY4QnRmT0oyQ29NWDVOc0lpekoyb0VOQkF0bGFlRnBkc2tKQVJx
+NnAzQllCRlo4d015NUpaR2lXeEZQSWptSG9iTElJMzRxZTZwVDdVZElJWDZyYVFWeEErTnh3OFBL
+S1ptSzV2a05oS3U1WFUwRG5ISE5hN1o2T1V3aWZrNXZXbmxOUVRFSzJmYWRiMDF6NlRpaHJSSGZj
+aklHZTRFd2g4U0ZoV1A0WnpvQkNBNjZRYWc2bGxHREJkNmlBTDU2cXhBOFJ0bmJQa2pXbVY2aHJS
+dWVrUHd4b25CMk0vOWZLT3NyUlpKbDQ5MmtBUWl2V3c4cmtUajhWWlRhZU9Tc1Q3dXU0Mkp5aUxa
+S3ZKM2tSZlpnUjBGWE5XamV3YkNEbWdub0YwbVlYSzhpRWowUjR1dEg2MXRUdDc2eHUwWXpPK21W
+ZE01MUVtQ3dWRzMrcUdrQnFxdmZISUxydnI3ZURIVFV3cU1qTFZGRWMzMjIwcVpkc1dtMllKaEEy
+ODZPOHRNOXd1MGNDVFFoOStseURseG13QXM2TUgrSmFxQVBqSWJtQ21GZzErWDI5eXNwRXZERFlx
+bWtJM0pWY3JzU01WYkcxOGtWOTYwcTZDMC8xV3J5bXpRQVRxQzdkN1lJR3FycCtQSENtU3BXeG5X
+L3E2a09hb1ludjlQUWcrRE8raFBHODQ5SG8vRm9aRG10QjZ1ZzRiRDRHZE5ZWTRrSXZ5Z0FvbVRT
+N0s0QjVacjlBVnRWL1JYVStGYW5OTWZWb2FaVjFHZXJPVVpvZ2ltckhMb1JlVGQwMkxwdmZLV2Qz
+dFhwYU1DOWlqQ1pQVGlnTENSQStjTUVQbFYwVkJjUXFDL2s1Ymc0WE8rdWVSWXNibDNTZVJ0ak5y
+V1VocmF1R2ZydU50aytMZGtXeC81RWt4VG9GTWN6Vzl6dm5LZm9XellhVTRiZE5ndFVMaDdETTVI
+MVhISXdqZHRrbGRFblpDTjBTcVJCNVdyODErYTVlQkhDNDdrYzR6dXR2Sm5XVXljZHEwd3FZeGh2
+b2ZnY2Q1b2pRZUNGMkFYbm1GTVZyZHBvcW1Bcnhkc1p0bXF3SGF3OEo3eVZ5UVpZdGNlVlNCZW5U
+Z2hHRzVxWVh3dk5ydGxBcGUzc01Uc3dtbFNUa0l2YnFwWCsxWEpxODQ5eVhiNmMrZW5WYWY5QXl5
+VVhxT0IxYkdYQWxCc2dtcWRVaGRFMzJ0ZUkwa3ZWU2lIMFAzTUQzd1M1M2FqRXpLSnRkVlJqNXJo
+aWRzdGhjNE4vSnRtMVJWRXkyd0NUMGVCNjRlK3NIcVIzVFJnYU0wdzFiV2hTZzZZa1psVUNSVG16
+a282Q0VqWEVKbkc0SHArMmRrcWJWUFNaUG1DTTI4WWpYQjVQWGMvM001RWRETklHRDdwNkxPZFkx
+QU9Gbm1LTSsrbEhwSVJzVTg3R3NLaDJVbGRiZVBrUkRPNU9RdHhVSW1PMkNnZ2N5M25nM3ZVZE9G
+T1hqUllsZld6Y29raG5WRktmdlc5M1BXZTBsaTFhTW4rRnF4S2FyemZXWm1saVE0R2I2SmhoUlgy
+d1RjMEpZS0Fpa3p4Z1hpa3V1YU0zbE53ZS83LzcveXp1SDFpc2Vhalo3b1BBbFRIaE5Kd1hDWEty
+TXdXczh0VG5iTHZnL0RZc3BRTXpFUDBDblZqTlo1bWV5Z2orSCtaZi9vNU81Y3VGZFdmbnAyK1B2
+ajkyMzU2ZW5vTVM5UGFUdE5qSDdUZTVXSkRvcWVucGdydnlFMjFZc0RNZVNqZEJycXRhSEFhdEQ2
+bUdEbHB1bC9FeTZIUmJYV05sR1FIaVRhSGhNQlI3RG5yN1BjZWhwRFYrckw2SkpEVlcxN2trc2VC
+OU1QU2s3eVdnMFVBMG95eG84MkNyNktOK1lsTjEyenkxR1dwYjdQRE9PaEpuRHp0QnU1UkVoK1hl
+cGc3MjdSbDNXeFRMaCt6NXhmckdUbG5nWU9TQmR3eXkzQlk3U2loMTV5Wlh0Q1ZFSXNPa1ZSVitO
+Uzd2b0cyQmVGaEVIUEFHbU5ocGdFa2duVnB3aUU2dHZpdEFvSzcyaDNmT2tzb0JJOEZOS0RDSlJX
+ak4rSkVvN25ZdStzWUdjMU9EVWFQQU95MkJlNHNrOUNHU1FLWXJxb01jdTBmSWhWN1FNcDdWQVNn
+WGkyMjBaYzdGRnhNVW5lZlhZSTA2d0VTSkh5d0NjWk9VUHFYSEIyQkdsTm9DQTMxd1VPTVhkTXk0
+OStpUGcwZlI0SkhQSHYwd2Z2U3ExK1JYemI5MVp4QWJGNHZzZHE5aFV5WGwvWVZhZkNGa2hqcUVL
+d3FUMElzdWZJL2RqSms5UW5iZFRJVTg1S3FSRkFueDY2Q1BwU1RQV2JuRHI4TUZFaGFNRS9FdmJW
+b3RsalRvaDYwSDFxVmR5OFhneG81YUFLQXVMcDJaWmk5YWFMbEJaZlVDQW5WQ05XMndDMjk2UEJ3
+OWFmRVptTHI1Ui9zTWdOTkRsZTBST0Z5SFZNVEJ4M3dYMEs4VGhuVlptaVhyd05kTzdaQi8wTHVM
+RUtjQ203R0xlRUZGS1BJSDRHc2NkOWpKKzFGQ1VwN0dVRGFMQXdKdFg2cm9FSlVYUTRvS1dweGJD
+YVpMTXhzRHYzUlFaY050Q2xydUh6QzFVSDMrb2dPUTJwQmNjMmprKzNlUkR1M2hLUGQ1U3dFOWFi
+LzFSUERTdzhpbjhPYkxDQlA4Z2wycXE4U3FTVU5RWWlUYXdrQjFOS3p6R0xsZ3FIRkNySGJpQy91
+bTdaWVh6QzczeVg5ZUpzc1Z0cDJaL0xxVnY5b3dWQVpWQkJMOTAvYlFiQmVrejd4WVhFZEMyNTJ5
+QkRkdGlvNHk2Y0JyZnNVY1htdWRreHZlczZqSXVCUm95emtRQUFFVDAyU3QxN2pIMXJZWlZuUUZs
+TnlyRmxUckg2QVZYejcyK3dUV2lkMlJKcU9NMjE1MEFuVGRhaVdFN20rY3NORnVWMS8yL0JVeWRa
+QmZ3QjhkOWdQdXdEd1lHWXQxVzg3L2FQVGhDYmpxdHN5ZDc4OHQ0eWwxdDZ1OE1yT2x1M3I0dTE3
+a0xSTW1IUTRPb3U1Rm1NeXZjdmFWZUZ0a0dJSTJib21sTXJxTGhiWFUzUDJPdVVwVnpPczd6UXM3
+amVzODYxb0VzK2hrbU1hWFVubnc5ZE51ejByckV3NTVZWmFHcU9hQmxIOXQramx0TUFLM0FMcUNZ
+ZW5FQ2lMVStRcVdGc3FodDNXTFZSenpVRzZQcDFtaytpUVNQdXAzQi9BbkV0VE9hWEc0QmVmVm91
+b1FXc3NGS0pxZHV2UnJBcUxNeHN0MkpMV1hZWElCMHRkdzlwbUJyZVhXNDBiWFMwS2NzZVpVcTY5
+Nzk2ek9HZUREUXAzWU1ZOHRoWVZZYnFoOXJicGxHVGFJZmsrQ2FpWkcxZDRWdlRtenc4S3BIU0tU
+Slg2UVkzcTlQU0hUY215Sk5pU1hQK0V3REFzSnlEeDlobDdJOUVkdmFQK0NlYUJEOW9HT1Y2UGM1
+Q2xNRW1IdHpJWndKUk1kNE1tYlk2eVB4MmowNzJmbnowL2ZuV3V1ck9VVWgzNDdJcmFUbnFyR1RI
+SGpxMzdCcG5rNW9IazNZSTkrWE9SZnh2djcwejkveUdlUGtUOGZnRC8wOWxWUFhBYmJ1b0ljTlNl
+Vzk4RHVndFlDeWJRNGRYL2d5RkczZVBhR0xSUGh1azBhYkd4SjhwMExYYUxxWTNhbjRhem40RHZU
+R2JWOUxzcStPcmU1R0xtVTRYVUdNMWxiNyt0alpuMklyYTQxdFZaVGJUOW04NkR0WXBJUnhoSkVJ
+eklRVkpxWEJrckt6WHNERzBNSk1Sanp0N3A4TUFXY2hkcFhaTHNESHZURWZYN3lsbjNLMFpQZUtx
+Q1RKejBCN3V6NC9Ld09UcUtCdWprdjBESGtGT3BoaTZPWEwwLy8vZmk1KzkzMzdxdVRWK2pKNzNw
+aWZQaEx5aTk3L1Y0NVdKVFBsOEdpZkw3bUZ5bTg0TlE0MlkvU0orVXpGRVRsUzNKNTJaT2JySUZZ
+SHVjUTA3UkZWaVdkYlptOTltMTdzc2RPNjBZc1dRajl2dTVKL2RTMlh1Rm14SVZUa2tVek1pOHNy
+NDdUU2QyNjNVdVJJQkZvQ21Ic3VMdi9wdTZLUlRTUlJscjhuWWlCb1JjRGNTWDl4NnczaEUrOUZt
+TGhjd2Mzekkxb2pqbEprZnRrc0hIWjNZZnVUbnQzd3BUMmRXNVNnMTdTeWJWeU56eDBTOTNRcEg2
+clI4eEYvbU1nZnJwcGNJNzFlelF5dzhURUdBUlV1bnc2UGpqODdVeGt0dVFWRk0yZngvbHRIeXB0
+ZmdOZVcrME43L1YwdDlBanQ3Q0NPWVBzUkUrYmFmVytQejd2eVlrV2lrOVdjWkZVMVJVNmtUZlIr
+NmpyTlgxcXJ1amhKT2hRVG9KQUg5eGNRcWlVdGMwSlVVM2lFNEdsM1puTzdwM0JhV05iYnloZjlF
+bmQ2WkV5OU1hczl6b1JkWHI2TkcrWGEybG9PcG9tTUNqaVhnUEFmbkhwQmhGNEo0cFVuYzQ2NUlt
+TVdsdjRTZDRGQTZnSmErT2x1Y2hzOXdBOCtIT2N4Y0VUeHRpOTJnS3pTajlTQjNHZGlob3FMTFV0
+dGxCSGJLVlY1ZkJXZG12YXEzYVg5MmhWazVZSnF3NU5pY3labkxpWHpxUDBLRlNwZmNMY1M2NTZi
+WFBsVWx0d2grRWwzWFM4VFYrUUcwWksrWXZvU2lQM0t2d0M1VjhOOEl0N1FGT0xXbkpuTVZTekpT
+VzUra0RabmM2b2dGTzJzQVRpNFUrS2NkOUFCZUV2ZXJncU5Rc1JIMDNFSWVLalg5bkIzNnVReXdT
+Q0xsV1J0QWhxSVczYVYrRzRMb0s0NTJnSU9pOGFnR0puT3Y2R3JxZWlWaktOdk9Bb3FFWkw0UzVW
+WTVJSk5EOThJcTh6bDVublJlOU9RZGlBTWd6dkFNdW0xejZNa1ZySzZWWjd5TEtvTXRaYkREWUov
+UTViRldwUldXaWxITkJHeThXRk1GTldxZlBRbC9rUVhJTkZHUmpWdHBKYnduRzI3bW11aFRFS3JE
+Ri9MVC91c3NGVVp2Tkxmb3BHb3Rza0UyWEQwSUFYK2Y3ZFFwelpWdFZJVFNkTUJHdzkwd2IwOVdW
+WlFRMlJGQVgyeWwveTZuU1crVlNKQUQyVGVOUUt5R2ZLRW54V1JUdjd1bnlybzlObVFSQ0ZWRjZN
+MU04blR5NTgxSEI0UncvVHdUZmoyUVpDRThFbDZ6NS9pVkU0OUcwc2V3YXYxS094NnMvRC9Pbno0
+NWZINThlbVJ6V3orVi9FbzI0eHI2MnlSVDBWV3BhTFFiYzB0bXFzclVxSU1VYlJaeE96c0duRXJT
+MzZWemFOQlYxMnZkalZCKzFvMEl1R05TOTJOdVVIRDh2U3BIOVB1U1kxRlB5aFY2cVBLTGZMNWIr
+T0tjV2ljK1hRWERmY2xWWHRNemJGR2RsTEhFZzZsOUFrendDUStxMUxXb3gyM2NnTFl0ZVZxOUgw
+VzdRaW5WMy9DZGczcDI5eDVmdnBhS1IrSzB4ekJjL2V2R0p2OENJb3VvdWNZM1lBNy84bWNIZjRY
+MlgzNVM4R0Q4L3B5UmJiYmliTnpHYWY0VUxsaExKamZUQXQzd1BoeDJJV081UzN3d3E5UmltdVlo
+dnZHWjlZb3lIOUR5akZoaFBLcmUzOUgrazFhTHo0ZUFBQScpKS5kZWNvZGUoKSk=
+  B64PYEOF
+    ok "app.py written"
+  fi
 
 # Copy pre-extracted index.html if present, otherwise write it inline
 if [[ -f "$DIR/index.html" ]]; then
-  ok "index.html already present"
-else
-  cat > "$DIR/index.html" << 'HTMLEOF'
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>CPM Panel - KVM VPS Management System</title>
-<meta name="description" content="Modern VPS management panel with KVM virtualization support"/>
-<meta name="keywords" content="VPS panel, KVM manager, cloud VPS, Linux VPS control panel"/>
-<style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  :root{
-    --bg:#f0f4f8;--sidebar:#ffffff;--card:#ffffff;
-    --blue:#2563eb;--blue-light:#eff6ff;--blue-mid:#bfdbfe;
-    --text:#0f172a;--muted:#64748b;--border:#e2e8f0;
-    --green:#16a34a;--red:#dc2626;--amber:#d97706;--gray:#94a3b8;
-    --radius:12px;--shadow:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.04);
-  }
-  html,body{overflow-x:hidden}
-  body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);display:flex;min-height:100vh;margin:0}
-
-  /* ── sidebar ── */
-  aside{width:220px;background:var(--sidebar);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:0 0 16px;flex-shrink:0;position:sticky;top:0;height:100vh}
-  .brand{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--border)}
-  .brand-logo{width:42px;height:42px;object-fit:contain;flex-shrink:0}
-  .brand-icon{width:36px;height:36px;background:var(--blue);border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:15px}
-  .brand-name{font-weight:700;font-size:15px;color:var(--text)}
-  /* ── KVM banner ── */
-  .kvm-banner{display:none;background:#fef3c7;border:1px solid #f59e0b;border-radius:10px;padding:12px 18px;margin-bottom:20px;font-size:13px;color:#92400e;align-items:center;gap:10px}
-  .kvm-banner.show{display:flex}
-  .kvm-banner svg{flex-shrink:0;color:#d97706}
-  /* ── SSH modal ── */
-  .ssh-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;align-items:center;justify-content:center;padding:16px}
-  .ssh-overlay.open{display:flex}
-  .ssh-window{background:#fff;border-radius:16px;width:min(580px,96vw);box-shadow:0 24px 70px rgba(0,0,0,.25);overflow:hidden}
-  .ssh-header{background:#0f172a;padding:14px 20px;display:flex;align-items:center;justify-content:space-between}
-  .ssh-title{color:#e2e8f0;font-size:14px;font-weight:600;display:flex;align-items:center;gap:8px}
-  .ssh-close{background:none;border:none;color:#64748b;cursor:pointer;font-size:20px;padding:0 4px;transition:.15s}
-  .ssh-close:hover{color:#f1f5f9}
-  .ssh-body{padding:24px}
-  .ssh-label{font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}
-  .ssh-box{background:#0f172a;border-radius:8px;padding:14px 16px;font-family:'Cascadia Code','Fira Code',monospace;font-size:13px;color:#60a5fa;word-break:break-all;position:relative;margin-bottom:16px}
-  .copy-btn{position:absolute;top:8px;right:8px;background:#1e293b;border:none;color:#94a3b8;font-size:11px;font-weight:600;padding:4px 10px;border-radius:6px;cursor:pointer;transition:.15s}
-  .copy-btn:hover{background:#334155;color:#e2e8f0}
-  .ssh-note{font-size:12px;color:var(--muted);line-height:1.6;background:var(--blue-light);border-radius:8px;padding:10px 14px}
-  .ssh-loading{text-align:center;padding:32px;color:var(--muted);font-size:14px}
-  .btn-ssh{background:#0f172a;color:#60a5fa}.btn-ssh:hover:not(:disabled){background:#1e293b}
-  .qa-ssh{background:#0f172a;color:#60a5fa}.qa-ssh:hover:not(:disabled){background:#1e293b}
-  nav{padding:12px 10px;flex:1}
-  nav a{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;text-decoration:none;color:var(--muted);font-size:14px;font-weight:500;transition:.15s;cursor:pointer;border:none;background:none;width:100%;text-align:left}
-  nav a:hover{background:var(--blue-light);color:var(--blue)}
-  nav a.active{background:var(--blue);color:#fff}
-  nav a svg{flex-shrink:0}
-  .sidebar-footer{padding:12px 16px;border-top:1px solid var(--border)}
-  .status-dot{width:8px;height:8px;border-radius:50%;background:var(--green);display:inline-block;margin-right:6px}
-  .status-label{font-size:12px;color:var(--muted)}
-  .version{font-size:11px;color:var(--gray);margin-top:4px}
-
-  /* ── header bar ── */
-  .topbar{background:var(--card);border-bottom:1px solid var(--border);padding:0 28px;height:52px;display:flex;align-items:center;gap:8px;position:sticky;top:0;z-index:10}
-  .topbar-icon{color:var(--blue);display:flex}
-  .topbar-text{font-size:13px;color:var(--muted)}
-
-  /* ── main ── */
-  .main{flex:1;display:flex;flex-direction:column;min-width:0}
-  .content{padding:28px;flex:1}
-  .page{display:none}.page.active{display:block}
-  h1{font-size:26px;font-weight:700;letter-spacing:-.5px}
-  .subtitle{color:var(--muted);font-size:14px;margin-top:4px;margin-bottom:24px}
-
-  /* ── cards ── */
-  .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)}
-  .card-header{padding:18px 20px 10px;border-bottom:1px solid var(--border)}
-  .card-title{font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px}
-  .card-title svg{color:var(--blue)}
-  .card-desc{font-size:12px;color:var(--muted);margin-top:3px}
-  .card-body{padding:20px}
-  .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:20px}
-  .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
-
-  /* ── arc meters ── */
-  .meter-wrap{display:flex;justify-content:center;align-items:center;padding:8px 0}
-
-  /* ── stat cards ── */
-  .stat-label{font-size:12px;color:var(--muted);font-weight:500;display:flex;justify-content:space-between;align-items:center}
-  .stat-value{font-size:26px;font-weight:700;margin-top:6px}
-  .stat-sub{font-size:12px;color:var(--muted);margin-top:3px}
-
-  /* ── vm summary ── */
-  .vm-summary{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;background:var(--blue-light);border-radius:10px;margin-top:4px}
-  .vm-total{font-size:34px;font-weight:700}
-  .vm-counts{display:flex;gap:24px}
-  .vm-count{text-align:center}
-  .vm-count-num{font-size:22px;font-weight:700}
-  .vm-count-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-top:2px}
-
-  /* ── vps manager ── */
-  .two-panel{display:grid;grid-template-columns:1fr minmax(0,380px);gap:20px;align-items:start}
-  .vps-list{list-style:none}
-  .vps-item{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-radius:10px;cursor:pointer;transition:.15s;border:2px solid transparent;margin-bottom:8px}
-  .vps-item:hover{background:var(--blue-light)}
-  .vps-item.selected{border-color:var(--blue);background:var(--blue-light)}
-  .vps-info{display:flex;flex-direction:column;gap:3px}
-  .vps-name{font-weight:600;font-size:14px}
-  .vps-meta{font-size:12px;color:var(--muted);display:flex;gap:10px}
-  .badge{display:inline-flex;align-items:center;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600}
-  .badge-running{background:#dcfce7;color:#166534}
-  .badge-stopped{background:#fee2e2;color:#991b1b}
-  .badge-paused {background:#fef9c3;color:#854d0e}
-  .badge-unknown{background:#f1f5f9;color:#64748b}
-  .no-selection{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:48px 20px;color:var(--muted);text-align:center;gap:12px}
-  .no-selection svg{opacity:.3}
-  .action-btns{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:16px}
-  .btn{padding:10px 16px;border-radius:8px;font-size:13px;font-weight:600;border:none;cursor:pointer;transition:.15s;display:flex;align-items:center;justify-content:center;gap:6px}
-  .btn:disabled{opacity:.45;cursor:not-allowed}
-  .btn-start  {background:#dcfce7;color:#166534}.btn-start:hover:not(:disabled)  {background:#bbf7d0}
-  .btn-stop   {background:#fee2e2;color:#991b1b}.btn-stop:hover:not(:disabled)   {background:#fecaca}
-  .btn-restart{background:#fef9c3;color:#854d0e}.btn-restart:hover:not(:disabled){background:#fef08a}
-  .btn-delete {background:#fee2e2;color:#991b1b}.btn-delete:hover:not(:disabled) {background:#fecaca}
-  .btn-primary{background:var(--blue);color:#fff;grid-column:1/-1}.btn-primary:hover:not(:disabled){background:#1d4ed8}
-  .selected-name{font-size:15px;font-weight:700;padding-bottom:12px;border-bottom:1px solid var(--border);margin-bottom:12px;display:flex;align-items:center;gap:8px}
-
-  /* ── create form ── */
-  .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-  .form-field{display:flex;flex-direction:column;gap:6px}
-  .form-field.full{grid-column:1/-1}
-  label{font-size:13px;font-weight:500;color:var(--muted)}
-  input{padding:9px 12px;border:1px solid var(--border);border-radius:8px;font-size:14px;outline:none;transition:.15s;background:#fff}
-  input:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(37,99,235,.1)}
-  .hint{font-size:11px;color:var(--gray)}
-
-  /* ── toast ── */
-  #toast-wrap{position:fixed;bottom:24px;right:24px;display:flex;flex-direction:column;gap:8px;z-index:9999}
-  .toast{padding:12px 18px;border-radius:10px;font-size:13px;font-weight:500;box-shadow:0 4px 12px rgba(0,0,0,.15);animation:slide-in .25s ease;max-width:320px}
-  .toast-ok  {background:#166534;color:#fff}
-  .toast-err {background:#991b1b;color:#fff}
-  @keyframes slide-in{from{transform:translateX(100%);opacity:0}to{transform:none;opacity:1}}
-
-  /* ── modal ── */
-  .overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:100;align-items:center;justify-content:center}
-  .overlay.open{display:flex}
-  .modal{background:#fff;border-radius:16px;padding:28px;width:380px;box-shadow:0 20px 60px rgba(0,0,0,.2)}
-  .modal h3{font-size:18px;font-weight:700;margin-bottom:8px}
-  .modal p{color:var(--muted);font-size:14px;margin-bottom:20px}
-  .modal-btns{display:flex;gap:10px;justify-content:flex-end}
-  .btn-cancel{padding:9px 18px;border-radius:8px;border:1px solid var(--border);background:#fff;cursor:pointer;font-size:13px;font-weight:600}
-  .btn-confirm{padding:9px 18px;border-radius:8px;border:none;background:#dc2626;color:#fff;cursor:pointer;font-size:13px;font-weight:600}
-
-  /* ── mobile nav ── */
-  .mob-nav{display:none;position:fixed;bottom:0;left:0;right:0;background:#fff;border-top:1px solid var(--border);z-index:50;padding:6px 0 env(safe-area-inset-bottom,6px)}
-  .mob-nav-inner{display:flex;justify-content:space-around}
-  .mob-nav a{display:flex;flex-direction:column;align-items:center;gap:3px;padding:6px 12px;border-radius:8px;text-decoration:none;color:var(--muted);font-size:10px;font-weight:500;border:none;background:none;cursor:pointer;min-width:60px}
-  .mob-nav a.active{color:var(--blue)}
-  .mob-nav a svg{flex-shrink:0}
-
-  /* ── dashboard quick panel ── */
-  .dash-bottom{display:grid;grid-template-columns:1fr 320px;gap:20px;margin-top:20px}
-  .dash-vps-list{list-style:none;max-height:280px;overflow-y:auto}
-  .dash-vps-item{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-radius:8px;cursor:pointer;transition:.15s;border:2px solid transparent;margin-bottom:6px}
-  .dash-vps-item:hover{background:var(--blue-light)}
-  .dash-vps-item.selected{border-color:var(--blue);background:var(--blue-light)}
-  .qa-btns{display:flex;flex-direction:column;gap:10px;margin-top:12px}
-  .qa-btn{padding:12px 16px;border-radius:8px;font-size:14px;font-weight:600;border:none;cursor:pointer;transition:.15s;display:flex;align-items:center;gap:8px}
-  .qa-btn:disabled{opacity:.4;cursor:not-allowed}
-  .qa-start  {background:#dcfce7;color:#166534}.qa-start:hover:not(:disabled)  {background:#bbf7d0}
-  .qa-stop   {background:#fee2e2;color:#991b1b}.qa-stop:hover:not(:disabled)   {background:#fecaca}
-  .qa-restart{background:#fef9c3;color:#854d0e}.qa-restart:hover:not(:disabled){background:#fef08a}
-  .qa-none{color:var(--muted);font-size:13px;padding:24px 0;text-align:center}
-
-  .hamburger{display:none;background:none;border:none;cursor:pointer;padding:6px 8px;border-radius:6px;color:var(--text);flex-shrink:0}
-  .hamburger:hover{background:var(--blue-light)}
-  .hamburger svg{display:block}
-  .sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:40}
-  .sidebar-overlay.open{display:block}
-  /* ── tunnel banner ── */
-  .tunnel-banner{display:none;background:#0f172a;color:#60a5fa;font-size:12px;font-family:monospace;padding:7px 16px;align-items:center;gap:10px;border-bottom:1px solid #1e3a5f;flex-wrap:wrap}
-  .tunnel-banner.show{display:flex}
-  .tunnel-url{flex:1;word-break:break-all;letter-spacing:.03em}
-  .tunnel-copy{background:#1e293b;border:none;color:#94a3b8;font-size:11px;font-weight:600;padding:4px 10px;border-radius:6px;cursor:pointer;white-space:nowrap;flex-shrink:0}
-  .tunnel-copy:hover{background:#334155;color:#e2e8f0}
-  @media(max-width:900px){
-    aside{display:none;position:fixed;top:0;left:0;bottom:0;width:260px;z-index:50;box-shadow:4px 0 24px rgba(0,0,0,.18);overflow-y:auto}
-    aside.open{display:flex !important}
-    .mob-nav{display:none}
-    .main{padding-bottom:0}
-    .content{padding:16px}
-    .grid-2,.grid-3,.two-panel,.dash-bottom{grid-template-columns:1fr}
-    .form-grid{grid-template-columns:1fr}
-    h1{font-size:20px}
-    .topbar{padding:0 16px}
-    .card-body{padding:14px}
-    .hamburger{display:inline-flex !important;align-items:center;justify-content:center}
-  }
-
-  /* ── Activation overlay ── */
-  .act-overlay{position:fixed;inset:0;background:linear-gradient(135deg,#0f172a 0%,#1e293b 50%,#0f172a 100%);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px}
-  .act-overlay.hidden{display:none}
-  .act-card{background:#1e293b;border:1px solid #334155;border-radius:20px;padding:40px 36px;width:min(440px,100%);box-shadow:0 30px 80px rgba(0,0,0,.6);text-align:center}
-  .act-logo{width:72px;height:72px;border-radius:16px;margin:0 auto 20px;display:flex;align-items:center;justify-content:center}
-  .act-logo img{width:72px;height:72px;object-fit:contain;border-radius:16px}
-  .act-logo-fallback{width:72px;height:72px;background:linear-gradient(135deg,#2563eb,#3b82f6);border-radius:16px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:28px}
-  .act-title{font-size:22px;font-weight:700;color:#f1f5f9;margin-bottom:6px}
-  .act-sub{font-size:13px;color:#64748b;margin-bottom:28px;line-height:1.5}
-  .act-input{width:100%;background:#0f172a;border:1.5px solid #334155;border-radius:10px;padding:13px 16px;font-size:14px;color:#e2e8f0;font-family:'Cascadia Code','Fira Code',monospace;letter-spacing:.08em;outline:none;transition:.2s;margin-bottom:6px}
-  .act-input:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.25)}
-  .act-input.error{border-color:#dc2626;box-shadow:0 0 0 3px rgba(220,38,38,.2)}
-  .act-input.success{border-color:#16a34a;box-shadow:0 0 0 3px rgba(22,163,74,.2)}
-  .act-err{font-size:12px;color:#dc2626;margin-bottom:16px;min-height:18px;text-align:left}
-  .act-btn{width:100%;padding:13px;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;transition:.2s;margin-bottom:10px}
-  .act-btn-paid{background:linear-gradient(135deg,#2563eb,#1d4ed8);color:#fff}
-  .act-btn-paid:hover{background:linear-gradient(135deg,#1d4ed8,#1e40af);transform:translateY(-1px)}
-  .act-btn-paid:active{transform:translateY(0)}
-  .act-btn-free{background:transparent;border:1.5px solid #334155 !important;color:#94a3b8}
-  .act-btn-free:hover{border-color:#475569 !important;color:#cbd5e1;background:#334155}
-  .act-divider{display:flex;align-items:center;gap:10px;margin:4px 0 4px;color:#475569;font-size:11px}
-  .act-divider::before,.act-divider::after{content:'';flex:1;height:1px;background:#334155}
-  .act-badge{display:inline-flex;align-items:center;gap:5px;background:#0f172a;border:1px solid #1e3a5f;border-radius:20px;padding:4px 12px;font-size:11px;color:#60a5fa;margin-bottom:20px}
-  .act-mode-banner{position:fixed;top:0;left:0;right:0;z-index:100;padding:7px 16px;font-size:12px;font-weight:600;text-align:center;pointer-events:none}
-  .act-mode-banner.paid{background:#dcfce7;color:#16a34a;border-bottom:1px solid #bbf7d0}
-  .act-mode-banner.free{background:#fef9c3;color:#854d0e;border-bottom:1px solid #fef08a}
-
-  /* ── Premium system ── */
-  .plan-badge{display:inline-flex;align-items:center;gap:5px;padding:3px 11px;border-radius:20px;font-size:11px;font-weight:700}
-  .plan-badge.premium{background:#fef3c7;color:#d97706;border:1px solid #fcd34d}
-  .plan-badge.free{background:#f1f5f9;color:#64748b;border:1px solid #e2e8f0}
-  .topbar-brand{margin-left:auto;font-size:12px;font-weight:700;color:#94a3b8;display:flex;align-items:center;gap:12px;white-space:nowrap}
-  .topbar-brand .brand-powered{color:#f59e0b}
-  .topbar-brand .brand-name-txt{color:#0f172a;font-weight:800}
-
-  /* ── Owner modal ── */
-  .owner-modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:8000;display:none;align-items:center;justify-content:center;padding:16px}
-  .owner-modal-overlay.open{display:flex}
-  .owner-modal{background:#1e293b;border:1px solid #334155;border-radius:18px;width:min(420px,96vw);overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.5)}
-  .owner-modal-header{background:#0f172a;padding:16px 20px;display:flex;align-items:center;justify-content:space-between}
-  .owner-modal-title{color:#f1f5f9;font-size:15px;font-weight:700;display:flex;align-items:center;gap:8px}
-  .owner-modal-body{padding:28px}
-  .owner-input{width:100%;background:#0f172a;border:1.5px solid #334155;border-radius:8px;padding:12px 14px;font-size:14px;color:#e2e8f0;outline:none;transition:.2s;margin-bottom:8px;font-family:monospace;letter-spacing:.06em}
-  .owner-input:focus{border-color:#7c3aed;box-shadow:0 0 0 3px rgba(124,58,237,.2)}
-  .owner-input.error{border-color:#dc2626}
-  .owner-err{font-size:12px;color:#dc2626;margin-bottom:14px;min-height:16px}
-  .owner-btn{width:100%;padding:12px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:.2s;margin-bottom:8px}
-  .owner-btn-primary{background:linear-gradient(135deg,#7c3aed,#4f46e5);color:#fff}
-  .owner-btn-primary:hover{background:linear-gradient(135deg,#6d28d9,#4338ca);transform:translateY(-1px)}
-  .owner-btn-secondary{background:#334155;color:#94a3b8}
-  .owner-btn-secondary:hover{background:#475569;color:#e2e8f0}
-
-  /* ── Owner panel tabs ── */
-  .owner-tabs{display:flex;gap:4px;margin-bottom:24px;background:var(--blue-light);border-radius:10px;padding:4px;border:1px solid var(--blue-mid)}
-  .owner-tab{padding:8px 18px;border:none;border-radius:7px;font-size:13px;font-weight:600;cursor:pointer;transition:.15s;color:var(--muted);background:none}
-  .owner-tab.active{background:#fff;color:var(--blue);box-shadow:0 1px 4px rgba(0,0,0,.1)}
-  .owner-tab-panel{display:none}.owner-tab-panel.active{display:block}
-
-  /* ── Analytics cards ── */
-  .owner-analytics{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px;margin-bottom:24px}
-  .ana-card{background:#fff;border:1px solid var(--border);border-radius:12px;padding:18px 16px;text-align:center}
-  .ana-num{font-size:28px;font-weight:800;margin-bottom:4px}
-  .ana-label{font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.05em}
-
-  /* ── Key table ── */
-  .key-table{width:100%;border-collapse:collapse;font-size:13px}
-  .key-table th{text-align:left;padding:10px 12px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);border-bottom:2px solid var(--border);background:#f8fafc}
-  .key-table td{padding:10px 12px;border-bottom:1px solid #f1f5f9;vertical-align:middle}
-  .key-table tr:hover td{background:#f8fafc}
-  .key-table .overflow-x{overflow-x:auto}
-  .key-mono{font-family:'Cascadia Code','Fira Code',monospace;font-size:12px;color:#2563eb;letter-spacing:.06em;word-break:break-all}
-  .status-pill{display:inline-block;padding:2px 10px;border-radius:20px;font-size:11px;font-weight:700;text-transform:uppercase}
-  .pill-active{background:#dcfce7;color:#16a34a}
-  .pill-used{background:#e0f2fe;color:#0369a1}
-  .pill-expired{background:#fee2e2;color:#dc2626}
-  .pill-revoked{background:#f1f5f9;color:#94a3b8;text-decoration:line-through}
-  .tbl-btn{padding:4px 10px;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;transition:.15s;margin-right:4px}
-  .tbl-btn-revoke{background:#fef3c7;color:#d97706}.tbl-btn-revoke:hover{background:#fde68a}
-  .tbl-btn-delete{background:#fee2e2;color:#dc2626}.tbl-btn-delete:hover{background:#fca5a5;color:#fff}
-
-  /* ── Generate key form ── */
-  .gen-panel{background:var(--blue-light);border:1px solid var(--blue-mid);border-radius:12px;padding:20px;margin-bottom:20px}
-  .gen-row{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-bottom:12px}
-  .gen-field{display:flex;flex-direction:column;gap:5px;flex:1;min-width:140px}
-  .gen-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
-  .gen-input,.gen-select{background:#fff;border:1.5px solid var(--border);border-radius:8px;padding:9px 12px;font-size:13px;color:var(--text);outline:none;transition:.2s;width:100%}
-  .gen-input:focus,.gen-select:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(37,99,235,.12)}
-
-  /* ── Feature control ── */
-  .feat-row{display:flex;align-items:center;padding:14px 0;border-bottom:1px solid #f1f5f9;gap:12px}
-  .feat-row:last-child{border-bottom:none}
-  .feat-info{flex:1;min-width:0}
-  .feat-name{font-size:14px;font-weight:600;color:var(--text)}
-  .feat-cat{font-size:11px;color:var(--muted);margin-top:2px}
-  .tier-toggle{display:inline-flex;background:#f1f5f9;border-radius:20px;padding:2px;gap:2px;border:1px solid var(--border)}
-  .tier-btn{padding:5px 14px;border:none;border-radius:18px;font-size:12px;font-weight:700;cursor:pointer;transition:.2s;background:none;color:var(--muted)}
-  .tier-btn.active-free{background:#22c55e;color:#fff}
-  .tier-btn.active-premium{background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff}
-
-  /* ── Log rows ── */
-  .log-row{display:flex;flex-wrap:wrap;align-items:center;padding:10px 12px;border-bottom:1px solid #f1f5f9;gap:8px;font-size:13px}
-  .log-time{font-size:11px;color:var(--muted);min-width:135px;font-family:monospace}
-  .log-key{font-family:monospace;font-size:12px;color:#2563eb}
-
-  /* ── Cloud Storage ── */
-  .storage-bar-wrap{background:#f1f5f9;border-radius:8px;height:10px;overflow:hidden;margin-bottom:4px}
-  .storage-bar-fill{height:100%;background:linear-gradient(90deg,#2563eb,#60a5fa);border-radius:8px;transition:.5s}
-  .storage-crumb{display:flex;align-items:center;gap:2px;flex-wrap:wrap;font-size:13px;margin-bottom:14px}
-  .file-table{width:100%;border-collapse:collapse;font-size:13px}
-  .file-table th{text-align:left;padding:10px 14px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);border-bottom:2px solid var(--border);background:#f8fafc}
-  .file-table td{padding:11px 14px;border-bottom:1px solid #f1f5f9;vertical-align:middle}
-  .file-table tr:hover td{background:#f8fafc}
-  .file-name-btn{background:none;border:none;font-size:13px;font-weight:500;color:var(--text);cursor:pointer;padding:0;text-align:left}
-  .file-name-btn:hover{color:var(--blue);text-decoration:underline}
-  .storage-toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
-
-  /* ── Upgrade modal ── */
-  .upgrade-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:7000;display:none;align-items:center;justify-content:center;padding:16px}
-  .upgrade-overlay.open{display:flex}
-  .upgrade-card{background:#1e293b;border:1px solid #334155;border-radius:18px;width:min(400px,96vw);padding:32px 28px;text-align:center;box-shadow:0 24px 70px rgba(0,0,0,.5)}
-  .upgrade-title{font-size:20px;font-weight:800;color:#f1f5f9;margin-bottom:8px}
-  .upgrade-sub{font-size:13px;color:#64748b;margin-bottom:22px;line-height:1.6}
-  .upgrade-inp{width:100%;background:#0f172a;border:1.5px solid #334155;border-radius:8px;padding:12px 14px;font-size:14px;color:#e2e8f0;outline:none;transition:.2s;margin-bottom:8px;font-family:monospace;letter-spacing:.06em}
-  .upgrade-inp:focus{border-color:#f59e0b;box-shadow:0 0 0 3px rgba(245,158,11,.2)}
-  .upgrade-err{font-size:12px;color:#dc2626;min-height:16px;margin-bottom:12px;text-align:left}
-  .search-inp{background:#fff;border:1.5px solid var(--border);border-radius:8px;padding:8px 12px;font-size:13px;outline:none;transition:.2s;width:220px}
-  .search-inp:focus{border-color:var(--blue);box-shadow:0 0 0 2px rgba(37,99,235,.1)}
-  @media(max-width:600px){.owner-tabs{flex-wrap:wrap}.owner-tab{flex:1;min-width:80px;text-align:center;font-size:11px;padding:7px 8px}.gen-row{flex-direction:column}}
-
-  /* ── UI Customization ── */
-  .uic-section{margin-bottom:22px}
-  .uic-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-bottom:10px;display:flex;align-items:center;gap:6px}
-  .uic-presets{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:4px}
-  .uic-preset{padding:8px 16px;border-radius:20px;border:2px solid var(--border);background:var(--card);color:var(--text);font-size:13px;font-weight:600;cursor:pointer;transition:.2s}
-  .uic-preset:hover{border-color:var(--blue);color:var(--blue)}
-  .uic-preset.active{border-color:var(--blue);background:var(--blue);color:#fff}
-  .uic-color-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(175px,1fr));gap:10px}
-  .uic-color-row{display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--blue-light);border:1px solid var(--blue-mid);border-radius:10px}
-  .uic-swatch{width:36px;height:36px;border-radius:8px;border:2px solid var(--border);cursor:pointer;flex-shrink:0;padding:0;overflow:hidden;position:relative}
-  .uic-swatch input[type=color]{position:absolute;inset:-4px;width:calc(100% + 8px);height:calc(100% + 8px);border:none;cursor:pointer;padding:0}
-  .uic-color-name{font-size:12px;font-weight:600;color:var(--text);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .uic-bg-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px;margin-bottom:12px}
-  .uic-bg-card{border-radius:12px;overflow:hidden;cursor:pointer;border:3px solid transparent;transition:.2s;box-shadow:var(--shadow)}
-  .uic-bg-card:hover{border-color:var(--blue);transform:translateY(-2px)}
-  .uic-bg-card.active{border-color:var(--blue);box-shadow:0 0 0 3px rgba(37,99,235,.25)}
-  .uic-bg-thumb{height:80px;width:100%;display:block;background-size:cover;background-position:center;background-size:200% 200%;animation:cpm-thumb-idle 6s ease infinite}
-  .uic-bg-name{padding:6px 10px;font-size:12px;font-weight:600;background:var(--card);color:var(--text);text-align:center}
-  .uic-custom-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px}
-  .uic-url-inp{flex:1;min-width:200px;padding:9px 12px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;background:var(--card);color:var(--text);outline:none;transition:.2s}
-  .uic-url-inp:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(37,99,235,.1)}
-  .uic-apply-btn{padding:9px 18px;border-radius:8px;border:none;background:var(--blue);color:#fff;font-size:13px;font-weight:600;cursor:pointer;transition:.2s;white-space:nowrap}
-  .uic-apply-btn:hover{background:#1d4ed8}
-  .uic-font-row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-  .uic-select{padding:9px 12px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;background:var(--card);color:var(--text);outline:none;transition:.2s;cursor:pointer;width:100%;max-width:340px}
-  .uic-select:focus{border-color:var(--blue)}
-  .uic-range-row{display:flex;align-items:center;gap:12px}
-  .uic-range{flex:1;accent-color:var(--blue);height:5px;max-width:300px}
-  .uic-range-val{font-size:13px;font-weight:700;color:var(--blue);min-width:40px}
-  .uic-action-bar{display:flex;gap:12px;flex-wrap:wrap;padding-top:8px}
-  .uic-save-btn{padding:11px 26px;background:var(--blue);color:#fff;border:none;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;transition:.2s}
-  .uic-save-btn:hover{background:#1d4ed8;transform:translateY(-1px)}
-  .uic-reset-btn{padding:11px 26px;background:var(--card);color:var(--muted);border:1.5px solid var(--border);border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;transition:.2s}
-  .uic-reset-btn:hover{border-color:#dc2626;color:#dc2626}
-  .uic-radius-row{display:flex;gap:8px;flex-wrap:wrap}
-  .uic-radius-opt{padding:8px 16px;border-radius:8px;border:2px solid var(--border);background:var(--card);color:var(--text);font-size:13px;font-weight:600;cursor:pointer;transition:.2s}
-  .uic-radius-opt:hover{border-color:var(--blue);color:var(--blue)}
-  .uic-radius-opt.active{border-color:var(--blue);background:var(--blue);color:#fff}
-  .uic-upload-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:14px}
-  .uic-upload-drop{border:2px dashed var(--border);border-radius:12px;height:140px;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:.2s;overflow:hidden;background:var(--blue-light);margin-bottom:8px}
-  .uic-upload-drop:hover{border-color:var(--blue)}
-  .uic-clear-btn{width:100%;padding:8px;border:none;border-radius:8px;background:#fee2e2;color:#dc2626;font-size:12px;font-weight:600;cursor:pointer;transition:.15s}
-  .uic-clear-btn:hover{background:#fca5a5}
-  .uic-tip{font-size:12px;color:var(--muted);padding:8px 12px;background:var(--blue-light);border-radius:8px;margin-top:8px}
-  @keyframes cpm-grad{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
-  @keyframes cpm-thumb-idle{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
-</style>
-</head>
-<body>
-<div id="cpm-bg-layer" style="position:fixed;inset:0;z-index:-2;pointer-events:none;transition:background .6s,background-image .6s"></div>
-<div id="cpm-bg-style"></div>
-<video id="cpm-bg-video" autoplay loop muted playsinline style="display:none;position:fixed;inset:0;z-index:-3;width:100%;height:100%;object-fit:cover;pointer-events:none"></video>
-
-<!-- ── Activation overlay ────────────────────────────────────────────── -->
-<div class="act-overlay" id="act-overlay">
-  <div class="act-card">
-    <div class="act-logo">
-      <img src="/logo.png" alt="CPM Panel" onerror="this.parentElement.innerHTML='<div class=&quot;act-logo-fallback&quot;>CP</div>'"/>
-    </div>
-    <div class="act-title">CPM Panel</div>
-    <div class="act-sub">Enter your key to continue. Owner key opens the Owner Panel. Paid key activates Premium mode.</div>
-    <div class="act-badge">
-      <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-      CPM Panel &mdash; KVM VPS Manager
-    </div>
-
-    <!-- Normal key entry (shown by default) -->
-    <div id="act-main-form">
-      <input class="act-input" id="act-key-input" type="password" placeholder="Enter your key…" maxlength="64" autocomplete="off" spellcheck="false"/>
-      <div class="act-err" id="act-err"></div>
-      <button class="act-btn act-btn-paid" id="act-btn-paid" onclick="activatePanel()">
-        🔑 Access Panel
-      </button>
-      <div class="act-divider">or</div>
-      <button class="act-btn act-btn-free" onclick="useFreeVersion()" style="margin-top:8px">
-        Continue with Free Version
-      </button>
-      <div style="margin-top:14px;text-align:center">
-        <button onclick="showActSetup()" style="background:none;border:none;color:#475569;font-size:12px;cursor:pointer;text-decoration:underline">
-          First time? Set up owner key →
-        </button>
-      </div>
-    </div>
-
-    <!-- First-time owner setup (hidden by default) -->
-    <div id="act-setup-form" style="display:none">
-      <div style="font-size:13px;color:#94a3b8;margin-bottom:16px;line-height:1.6;text-align:left">
-        No owner key set yet. Create your secret owner key below.<br>
-        <strong style="color:#f59e0b">Keep it safe — it cannot be recovered.</strong>
-      </div>
-      <input class="act-input" id="act-setup-key" type="password" placeholder="Create owner key (min 6 chars)" maxlength="64" autocomplete="new-password"/>
-      <div class="act-err" id="act-setup-err"></div>
-      <button class="act-btn act-btn-paid" id="act-setup-btn" onclick="submitActOwnerSetup()">
-        🔐 Set Owner Key & Enter
-      </button>
-      <button class="act-btn act-btn-free" onclick="hideActSetup()" style="margin-top:6px">
-        ← Back
-      </button>
-    </div>
-  </div>
-</div>
-
-<!-- Mode banner (shown after choosing) -->
-<div class="act-mode-banner paid" id="act-mode-banner" style="display:none"></div>
-
-<aside>
-  <div class="brand">
-    <img src="/logo.png" class="brand-logo" alt="CPM Panel" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"/>
-    <div class="brand-icon" style="display:none">CP</div>
-    <span class="brand-name">CPM Panel</span>
-  </div>
-  <nav>
-    <a class="active" onclick="showPage('dashboard',this)">
-      <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-      Dashboard
-    </a>
-    <a onclick="showPage('vps',this)">
-      <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="8" rx="1"/><rect x="2" y="13" width="20" height="8" rx="1"/><circle cx="6" cy="7" r="1" fill="currentColor"/><circle cx="6" cy="17" r="1" fill="currentColor"/></svg>
-      VPS Manager
-    </a>
-    <a onclick="showPage('create',this)">
-      <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
-      Create VPS
-    </a>
-    <a onclick="openStorageWithCheck(this)">
-      <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4.03 3-9 3S3 13.66 3 12"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/></svg>
-      Cloud Storage
-    </a>
-    <a onclick="openUiCustomizeWithCheck(this)">
-      <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 22C6.5 22 2 17.5 2 12c0-5.5 4.5-10 10-10 4.5 0 8 3.1 8 7 0 2.8-2.2 5-5 5h-1.4c-.6 0-1 .5-1 1.1 0 .3.1.5.1.8.1.5-.2 1-.7 1.1z"/><circle cx="8.5" cy="9.5" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="7" r="1.5" fill="currentColor" stroke="none"/><circle cx="15.5" cy="9.5" r="1.5" fill="currentColor" stroke="none"/></svg>
-      UI Customize
-    </a>
-  </nav>
-  <a onclick="enterOwnerPanel()" id="nav-owner" style="display:none;margin-top:auto;background:linear-gradient(135deg,#fef3c7,#fde68a);color:#92400e;border-radius:8px;margin:0 10px 8px">
-    <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M2 4l3 12h14l3-12-6 5-4-7-4 7-6-5z"/></svg>
-    Owner Panel
-  </a>
-  <div class="sidebar-footer">
-    <div><span class="status-dot" id="dot"></span><span class="status-label" id="status-txt">Connecting…</span></div>
-    <div class="version">v1.0.0</div>
-    <button onclick="logoutPanel()" style="margin-top:8px;width:100%;background:none;border:1px solid var(--border);border-radius:6px;padding:5px 0;font-size:12px;color:var(--muted);cursor:pointer;transition:.15s" onmouseover="this.style.background='#fee2e2';this.style.color='#dc2626';this.style.borderColor='#fca5a5'" onmouseout="this.style.background='none';this.style.color='var(--muted)';this.style.borderColor='var(--border)'">
-      🔓 Logout / Switch Account
-    </button>
-  </div>
-</aside>
-
-<div class="main">
-  <!-- Tunnel banner -->
-  <div class="tunnel-banner" id="tunnel-banner">
-    <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 010 20M12 2a15.3 15.3 0 000 20"/></svg>
-    <span style="color:#94a3b8;white-space:nowrap">Public URL:</span>
-    <span class="tunnel-url" id="tunnel-url-text">—</span>
-    <button class="tunnel-copy" onclick="copyTunnelUrl()">Copy</button>
-  </div>
-
-  <div class="topbar">
-    <button class="hamburger" onclick="toggleSidebar()" aria-label="Toggle menu">
-      <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
-    </button>
-    <div class="topbar-icon">
-      <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-    </div>
-    <span class="topbar-text" id="kvm-status">Checking KVM…</span>
-    <div class="topbar-brand">
-      <span id="plan-badge" class="plan-badge free">🔓 Free</span>
-      <span>⚡ <span class="brand-powered">Powered by</span> <span class="brand-name-txt">Abdullah</span></span>
-    </div>
-  </div>
-
-  <main class="content">
-
-    <!-- DASHBOARD -->
-    <section class="page active" id="page-dashboard">
-      <h1>Dashboard</h1>
-      <p class="subtitle">System overview and resource utilisation.</p>
-
-      <!-- KVM not-supported banner -->
-      <div class="kvm-banner" id="kvm-banner">
-        <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-        <span id="kvm-banner-msg">KVM virtualisation is not supported on this host — VPS instance controls are disabled.</span>
-      </div>
-
-      <div class="grid-2" style="margin-bottom:20px">
-        <div class="card">
-          <div class="card-header">
-            <div class="card-title">
-              <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-              Memory Usage
-            </div>
-            <div class="card-desc">System RAM utilisation</div>
-          </div>
-          <div class="card-body meter-wrap"><svg id="meter-ram" viewBox="0 0 200 132" width="200" height="132"></svg></div>
-        </div>
-        <div class="card">
-          <div class="card-header">
-            <div class="card-title">
-              <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="2"/><circle cx="12" cy="12" r="3"/></svg>
-              Storage Usage
-            </div>
-            <div class="card-desc">System disk utilisation</div>
-          </div>
-          <div class="card-body meter-wrap"><svg id="meter-disk" viewBox="0 0 200 132" width="200" height="132"></svg></div>
-        </div>
-      </div>
-
-      <div class="grid-3" style="margin-bottom:20px">
-        <div class="card card-body">
-          <div class="stat-label">CPU Usage <svg width="14" height="14" fill="none" stroke="#2563eb" stroke-width="2" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="2" x2="9" y2="4"/><line x1="15" y1="2" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="22"/><line x1="15" y1="20" x2="15" y2="22"/><line x1="2" y1="9" x2="4" y2="9"/><line x1="2" y1="15" x2="4" y2="15"/><line x1="20" y1="9" x2="22" y2="9"/><line x1="20" y1="15" x2="22" y2="15"/></svg></div>
-          <div class="stat-value" id="cpu-pct">—</div>
-          <div class="stat-sub" id="cpu-model">—</div>
-        </div>
-        <div class="card card-body">
-          <div class="stat-label">Network Traffic <svg width="14" height="14" fill="none" stroke="#2563eb" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><line x1="12" y1="3" x2="12" y2="9"/><line x1="12" y1="15" x2="12" y2="21"/><line x1="3" y1="12" x2="9" y2="12"/><line x1="15" y1="12" x2="21" y2="12"/></svg></div>
-          <div style="display:flex;justify-content:space-between;margin-top:6px">
-            <div><div class="stat-value" style="font-size:18px" id="net-rx">—</div><div class="stat-sub">Received (RX)</div></div>
-            <div><div class="stat-value" style="font-size:18px;text-align:right" id="net-tx">—</div><div class="stat-sub">Sent (TX)</div></div>
-          </div>
-        </div>
-        <div class="card card-body">
-          <div class="stat-label">System Uptime <svg width="14" height="14" fill="none" stroke="#2563eb" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></div>
-          <div class="stat-value" id="uptime">—</div>
-          <div class="stat-sub">Total continuous uptime</div>
-        </div>
-      </div>
-
-      <!-- VM summary counts -->
-      <div class="card">
-        <div class="card-header"><div class="card-title">
-          <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="8" rx="1"/><rect x="2" y="13" width="20" height="8" rx="1"/></svg>
-          Virtual Machines
-        </div></div>
-        <div class="card-body">
-          <div class="vm-summary">
-            <div><div class="vm-total" id="vm-total">—</div><div class="stat-sub">Total Instances</div></div>
-            <div class="vm-counts">
-              <div class="vm-count"><div class="vm-count-num" style="color:var(--green)" id="vm-running">—</div><div class="vm-count-label">Running</div></div>
-              <div class="vm-count"><div class="vm-count-num" style="color:var(--red)" id="vm-stopped">—</div><div class="vm-count-label">Stopped</div></div>
-              <div class="vm-count"><div class="vm-count-num" style="color:var(--amber)" id="vm-paused">—</div><div class="vm-count-label">Paused</div></div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Dashboard bottom: VPS list + Quick Actions -->
-      <div class="dash-bottom">
-        <div class="card">
-          <div class="card-header">
-            <div class="card-title">
-              <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="8" rx="1"/><rect x="2" y="13" width="20" height="8" rx="1"/></svg>
-              Instances
-            </div>
-            <div class="card-desc">Select an instance to control it</div>
-          </div>
-          <div class="card-body">
-            <ul class="dash-vps-list" id="dash-vps-list">
-              <li style="color:var(--muted);font-size:13px">Loading…</li>
-            </ul>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-header">
-            <div class="card-title">
-              <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-              Quick Actions
-            </div>
-            <div class="card-desc" id="qa-selected-name">No instance selected</div>
-          </div>
-          <div class="card-body" id="qa-body">
-            <div class="qa-none">Select an instance from the list</div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- VPS MANAGER -->
-    <section class="page" id="page-vps">
-      <h1>VPS Manager</h1>
-      <p class="subtitle">Manage, monitor, and control your virtual instances.</p>
-      <div class="two-panel">
-        <div class="card">
-          <div class="card-header"><div class="card-title">Instances</div></div>
-          <div class="card-body"><ul class="vps-list" id="vps-list"><li style="color:var(--muted);font-size:14px">Loading…</li></ul></div>
-        </div>
-        <div class="card">
-          <div class="card-header"><div class="card-title">Controls</div></div>
-          <div class="card-body" id="controls-body">
-            <div class="no-selection">
-              <svg width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="8" rx="1"/><rect x="2" y="13" width="20" height="8" rx="1"/></svg>
-              <span style="font-size:14px">Select an instance to manage</span>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- CREATE VPS -->
-    <section class="page" id="page-create">
-      <h1>Create Instance</h1>
-      <p class="subtitle">Deploy a new KVM virtual machine.</p>
-      <div class="card" style="max-width:680px">
-        <div class="card-header">
-          <div class="card-title">
-            <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="8" rx="1"/><rect x="2" y="13" width="20" height="8" rx="1"/></svg>
-            Instance Details
-          </div>
-        </div>
-        <div class="card-body">
-          <form id="create-form" onsubmit="submitCreate(event)">
-            <div class="form-grid">
-              <div class="form-field">
-                <label>Instance Name *</label>
-                <input id="f-name" placeholder="e.g. web-server-01" required pattern="[a-zA-Z0-9_\-]{1,64}"/>
-                <span class="hint">Letters, numbers, dash, underscore only.</span>
-              </div>
-              <div class="form-field">
-                <label>OS Variant</label>
-                <input id="f-variant" value="ubuntu22.04" placeholder="ubuntu22.04"/>
-                <span class="hint">Used by virt-install for optimisations.</span>
-              </div>
-              <div class="form-field">
-                <label>RAM (MB) *</label>
-                <input id="f-ram" type="number" min="128" max="524288" value="1024" required/>
-                <span class="hint">Minimum 128 MB.</span>
-              </div>
-              <div class="form-field">
-                <label>vCPUs *</label>
-                <input id="f-vcpus" type="number" min="1" max="128" value="1" required/>
-              </div>
-              <div class="form-field">
-                <label>Disk (GB) *</label>
-                <input id="f-disk" type="number" min="1" max="10000" value="20" required/>
-              </div>
-              <div class="form-field">
-                <label>ISO Path (optional)</label>
-                <input id="f-iso" placeholder="/var/lib/libvirt/images/ubuntu.iso"/>
-                <span class="hint">Leave blank for network/template install.</span>
-              </div>
-              <div class="form-field full" style="margin-top:8px">
-                <button type="submit" class="btn btn-primary">
-                  <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
-                  Create Instance
-                </button>
-              </div>
-            </div>
-          </form>
-        </div>
-      </div>
-    </section>
-
-    <!-- OWNER PANEL -->
-    <section class="page" id="page-owner">
-      <h1>👑 Owner Panel</h1>
-      <p class="subtitle">Generate premium keys, manage feature access, and view analytics.</p>
-
-      <div class="owner-tabs">
-        <button class="owner-tab active" onclick="ownerTab('analytics',this)">📊 Analytics</button>
-        <button class="owner-tab" onclick="ownerTab('keys',this)">🔑 Keys</button>
-        <button class="owner-tab" onclick="ownerTab('logs',this)">📋 Logs</button>
-      </div>
-
-      <!-- Analytics -->
-      <div class="owner-tab-panel active" id="otab-analytics">
-        <div class="owner-analytics" id="ana-cards">
-          <div class="ana-card"><div class="ana-num" style="color:var(--blue)">—</div><div class="ana-label">Total Keys</div></div>
-          <div class="ana-card"><div class="ana-num" style="color:var(--green)">—</div><div class="ana-label">Active Keys</div></div>
-          <div class="ana-card"><div class="ana-num" style="color:#0369a1">—</div><div class="ana-label">Used Keys</div></div>
-          <div class="ana-card"><div class="ana-num" style="color:#7c3aed">—</div><div class="ana-label">Activations</div></div>
-        </div>
-        <div class="card">
-          <div class="card-header"><div class="card-title">Recent Activations</div></div>
-          <div class="card-body" id="ana-recent-logs"><div style="color:var(--muted);font-size:14px">Loading…</div></div>
-        </div>
-      </div>
-
-      <!-- Key Management -->
-      <div class="owner-tab-panel" id="otab-keys">
-        <div class="gen-panel card" style="padding:20px;margin-bottom:20px">
-          <div class="card-title" style="margin-bottom:16px">
-            <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
-            Generate New Key
-          </div>
-          <div class="gen-row">
-            <div class="gen-field">
-              <label class="gen-label">Custom Key (optional)</label>
-              <input class="gen-input" id="gen-custom" placeholder="CPM-XXXX-XXXX auto if blank"/>
-            </div>
-            <div class="gen-field">
-              <label class="gen-label">Expiry Value</label>
-              <input class="gen-input" id="gen-exp-val" type="number" min="1" placeholder="Leave blank = never"/>
-            </div>
-            <div class="gen-field">
-              <label class="gen-label">Expiry Unit</label>
-              <select class="gen-select" id="gen-exp-unit">
-                <option value="days">Days</option>
-                <option value="months">Months</option>
-                <option value="years">Years</option>
-              </select>
-            </div>
-            <div class="gen-field">
-              <label class="gen-label">Max Uses</label>
-              <select class="gen-select" id="gen-uses">
-                <option value="1">1 (One-time)</option>
-                <option value="5">5</option>
-                <option value="10">10</option>
-                <option value="-1">Unlimited</option>
-              </select>
-            </div>
-            <div class="gen-field">
-              <label class="gen-label">Note</label>
-              <input class="gen-input" id="gen-note" placeholder="Optional note"/>
-            </div>
-            <div class="gen-field">
-              <label class="gen-label">&nbsp;</label>
-              <button class="btn btn-primary" onclick="ownerGenerateKey()">⚡ Generate</button>
-            </div>
-          </div>
-        </div>
-        <div class="card">
-          <div class="card-header">
-            <div class="card-title">Premium Keys</div>
-            <button class="btn btn-secondary" onclick="ownerLoadKeys()" style="padding:6px 14px;font-size:12px">↻ Refresh</button>
-          </div>
-          <div class="card-body" style="overflow-x:auto;padding:0">
-            <table class="key-table">
-              <thead><tr>
-                <th>Key / ID</th><th>Status</th><th>Expires</th><th>Uses</th><th>Actions</th>
-              </tr></thead>
-              <tbody id="keys-tbody">
-                <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:24px">Loading…</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-
-      <!-- Logs -->
-      <div class="owner-tab-panel" id="otab-logs">
-        <div class="card">
-          <div class="card-header">
-            <div class="card-title">Activation Logs</div>
-            <button class="btn btn-secondary" onclick="ownerLoadLogs()" style="padding:6px 14px;font-size:12px">↻ Refresh</button>
-          </div>
-          <div class="card-body" style="padding:0" id="log-list">
-            <div style="color:var(--muted);padding:24px;font-size:14px">Loading…</div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- CLOUD STORAGE -->
-    <section class="page" id="page-storage">
-      <h1>Cloud Storage</h1>
-      <p class="subtitle">Store and manage files directly on your VPS disk.</p>
-
-      <!-- Disk usage bar -->
-      <div class="card" style="margin-bottom:20px">
-        <div class="card-body" style="padding:16px 22px">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-            <div style="font-size:13px;font-weight:600;display:flex;align-items:center;gap:6px">
-              <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4.03 3-9 3S3 13.66 3 12"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/></svg>
-              Disk Usage
-            </div>
-            <div style="font-size:12px;color:var(--muted)" id="storage-usage-text">—</div>
-          </div>
-          <div class="storage-bar-wrap">
-            <div class="storage-bar-fill" id="storage-bar" style="width:0%"></div>
-          </div>
-          <div style="font-size:11px;color:var(--muted);margin-top:4px">Storage root: /opt/cpm-storage/</div>
-        </div>
-      </div>
-
-      <!-- File browser -->
-      <div class="card">
-        <div class="card-header" style="padding-bottom:14px">
-          <div class="storage-crumb" id="storage-crumb">
-            <span onclick="storageTo('')" style="cursor:pointer;color:var(--blue);font-weight:600">📁 Storage</span>
-          </div>
-          <div class="storage-toolbar">
-            <button class="btn" onclick="requirePremium('file_upload',()=>storageUpload())" style="background:var(--blue);color:#fff;display:flex;align-items:center;gap:6px">
-              <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
-              Upload File 👑
-            </button>
-            <button class="btn" onclick="storageMkdir()" style="display:flex;align-items:center;gap:6px">
-              <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>
-              New Folder
-            </button>
-          </div>
-        </div>
-        <div class="card-body" style="padding:0">
-          <div id="storage-file-list">
-            <div style="padding:32px;color:var(--muted);text-align:center">Open the Cloud Storage page to load files.</div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Hidden file input -->
-      <input type="file" id="storage-file-input" style="display:none" multiple onchange="storageDoUpload(this)"/>
-    </section>
-
-    <!-- UI CUSTOMIZATION -->
-    <section class="page" id="page-uicustom">
-      <h1>🎨 UI Customization</h1>
-      <p class="subtitle">Personalize every aspect of your panel's appearance — changes apply live instantly.</p>
-
-      <!-- Color Themes -->
-      <div class="card" style="margin-bottom:20px">
-        <div class="card-header">
-          <div class="card-title">
-            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 22C6.5 22 2 17.5 2 12c0-5.5 4.5-10 10-10 4.5 0 8 3.1 8 7 0 2.8-2.2 5-5 5h-1.4c-.6 0-1 .5-1 1.1 0 .3.1.5.1.8.1.5-.2 1-.7 1.1z"/><circle cx="8.5" cy="9.5" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="7" r="1.5" fill="currentColor" stroke="none"/><circle cx="15.5" cy="9.5" r="1.5" fill="currentColor" stroke="none"/></svg>
-            Color Themes
-          </div>
-          <p class="card-desc">One-click presets that style the whole panel instantly</p>
-        </div>
-        <div class="card-body">
-          <div class="uic-section">
-            <div class="uic-label">Theme Presets</div>
-            <div class="uic-presets" id="uic-preset-btns"></div>
-          </div>
-          <div class="uic-section" style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
-            <div class="uic-label">Quick Color Adjustments</div>
-            <div style="display:flex;gap:20px;flex-wrap:wrap;margin-top:10px">
-              <div class="uic-color-row">
-                <div class="uic-swatch" id="sw-text"><input type="color" id="uic-clr-text" oninput="uicPickColor('text',this)" onchange="uicPickColor('text',this)"/></div>
-                <span class="uic-color-name">Text Color</span>
-              </div>
-              <div class="uic-color-row">
-                <div class="uic-swatch" id="sw-blue"><input type="color" id="uic-clr-blue" oninput="uicPickColor('blue',this)" onchange="uicPickColor('blue',this)"/></div>
-                <span class="uic-color-name">Button Color</span>
-              </div>
-            </div>
-            <div class="uic-tip" style="margin-top:10px">💡 These adjustments override the current theme. Select any preset to reset them.</div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Background -->
-      <div class="card" style="margin-bottom:20px">
-        <div class="card-header">
-          <div class="card-title">
-            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
-            Background
-          </div>
-          <p class="card-desc">Upload your own image or video as a full-screen panel background</p>
-        </div>
-        <div class="card-body">
-          <div class="uic-upload-grid">
-            <div>
-              <div class="uic-label">📷 Background Image</div>
-              <div class="uic-upload-drop" id="uic-img-drop" onclick="document.getElementById('uic-img-file').click()" ondragover="event.preventDefault()" ondrop="uicDropImage(event)">
-                <div id="uic-img-preview-wrap" style="display:flex;flex-direction:column;align-items:center;gap:8px;color:var(--muted)">
-                  <svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
-                  <span style="font-size:13px;font-weight:600">Click or drag an image here</span>
-                  <span style="font-size:11px">JPG, PNG, GIF, WebP — max 8 MB</span>
-                </div>
-              </div>
-              <input type="file" id="uic-img-file" accept="image/*" style="display:none" onchange="uicUploadImage(this)"/>
-              <button id="uic-img-clear-btn" class="uic-clear-btn" onclick="uicClearImage()" style="display:none">✕ Remove Image</button>
-            </div>
-            <div>
-              <div class="uic-label">🎬 Background Video</div>
-              <div class="uic-upload-drop" id="uic-vid-drop" onclick="document.getElementById('uic-vid-file').click()" ondragover="event.preventDefault()" ondrop="uicDropVideo(event)">
-                <div id="uic-vid-preview-wrap" style="display:flex;flex-direction:column;align-items:center;gap:8px;color:var(--muted)">
-                  <svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
-                  <span style="font-size:13px;font-weight:600">Click or drag a video here</span>
-                  <span style="font-size:11px">MP4, WebM — max 20 MB</span>
-                </div>
-              </div>
-              <input type="file" id="uic-vid-file" accept="video/*" style="display:none" onchange="uicUploadVideo(this)"/>
-              <button id="uic-vid-clear-btn" class="uic-clear-btn" onclick="uicClearVideo()" style="display:none">✕ Remove Video</button>
-            </div>
-          </div>
-          <div class="uic-tip">💡 Tip: After setting a background, pick a dark theme (Dark, Ocean, Midnight) so text stays readable on top.</div>
-        </div>
-      </div>
-
-      <!-- Typography -->
-      <div class="card" style="margin-bottom:20px">
-        <div class="card-header">
-          <div class="card-title">
-            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg>
-            Typography
-          </div>
-          <p class="card-desc">Font family and base size</p>
-        </div>
-        <div class="card-body">
-          <div class="uic-section">
-            <div class="uic-label">Font Family</div>
-            <div class="uic-font-row">
-              <select class="uic-select" id="uic-font-select" onchange="uicApplyFont()">
-                <option value="">System Default (Segoe UI)</option>
-                <option value="Inter">Inter</option>
-                <option value="Roboto">Roboto</option>
-                <option value="Poppins">Poppins</option>
-                <option value="Nunito">Nunito</option>
-                <option value="Raleway">Raleway</option>
-                <option value="'JetBrains Mono','Fira Code',monospace">JetBrains Mono (Code)</option>
-                <option value="'Courier New',monospace">Courier New (Monospace)</option>
-                <option value="Georgia,serif">Georgia (Serif)</option>
-              </select>
-            </div>
-          </div>
-          <div class="uic-section">
-            <div class="uic-label">Font Size — <span id="uic-size-val" style="color:var(--blue);font-size:13px">14px</span></div>
-            <div class="uic-range-row">
-              <input type="range" class="uic-range" id="uic-font-size" min="11" max="20" value="14" oninput="uicApplyFont()"/>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Corner Style -->
-      <div class="card" style="margin-bottom:20px">
-        <div class="card-header">
-          <div class="card-title">
-            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="5"/></svg>
-            Corner Style
-          </div>
-          <p class="card-desc">Controls roundness of cards and buttons across the whole panel</p>
-        </div>
-        <div class="card-body">
-          <div class="uic-radius-row">
-            <button class="uic-radius-opt" data-r="0px" onclick="uicApplyRadius('0px')">⬜ Sharp</button>
-            <button class="uic-radius-opt" data-r="6px" onclick="uicApplyRadius('6px')">▫️ Slight</button>
-            <button class="uic-radius-opt active" data-r="12px" onclick="uicApplyRadius('12px')">🔲 Rounded (Default)</button>
-            <button class="uic-radius-opt" data-r="20px" onclick="uicApplyRadius('20px')">⭕ Extra Round</button>
-          </div>
-        </div>
-      </div>
-
-      <!-- Save / Reset -->
-      <div class="uic-action-bar">
-        <button class="uic-save-btn" onclick="saveUiCustomize()">💾 Save Settings</button>
-        <button class="uic-reset-btn" onclick="resetUiCustomize()">↩ Reset to Default</button>
-      </div>
-    </section>
-
-  </main>
-</div>
-
-<!-- Owner auth modal -->
-<div class="owner-modal-overlay" id="owner-modal-overlay">
-  <div class="owner-modal">
-    <div class="owner-modal-header">
-      <div class="owner-modal-title">
-        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M2 4l3 12h14l3-12-6 5-4-7-4 7-6-5z"/></svg>
-        Owner Access
-      </div>
-      <button onclick="closeOwnerModal()" style="background:none;border:none;color:#64748b;cursor:pointer;font-size:18px;padding:0 4px">✕</button>
-    </div>
-    <div class="owner-modal-body" id="owner-modal-body"></div>
-  </div>
-</div>
-
-<!-- Premium upgrade modal -->
-<div class="upgrade-overlay" id="upgrade-overlay">
-  <div class="upgrade-card">
-    <div style="font-size:36px;margin-bottom:8px">👑</div>
-    <div class="upgrade-title">Premium Feature</div>
-    <div class="upgrade-sub">This feature requires a Premium activation key. Enter your key below to unlock all premium features instantly.</div>
-    <input class="upgrade-inp" id="upgrade-key-input" placeholder="CPM-XXXX-XXXX-XXXX" maxlength="25" autocomplete="off" spellcheck="false"/>
-    <div class="upgrade-err" id="upgrade-err"></div>
-    <button class="act-btn act-btn-paid" onclick="submitUpgradeKey()">🔑 Activate Premium</button>
-    <button class="act-btn act-btn-free" onclick="closeUpgrade()" style="margin-top:4px">Cancel</button>
-  </div>
-</div>
-
-<!-- SSH / tmate Modal -->
-<div class="ssh-overlay" id="ssh-overlay">
-  <div class="ssh-window">
-    <div class="ssh-header">
-      <div class="ssh-title">
-        <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-        <span id="ssh-title-text">SSH Access</span>
-      </div>
-      <button class="ssh-close" onclick="closeSsh()">✕</button>
-    </div>
-    <div class="ssh-body" id="ssh-body">
-      <div class="ssh-loading">Starting tmate session…</div>
-    </div>
-  </div>
-</div>
-
-<!-- Delete confirm modal -->
-<div class="overlay" id="del-modal">
-  <div class="modal">
-    <h3>Delete instance?</h3>
-    <p id="del-msg">This will permanently destroy the VM and cannot be undone.</p>
-    <div class="modal-btns">
-      <button class="btn-cancel" onclick="closeModal()">Cancel</button>
-      <button class="btn-confirm" id="del-confirm">Delete</button>
-    </div>
-  </div>
-</div>
-
-<!-- Sidebar overlay (mobile) -->
-<div class="sidebar-overlay" id="sidebar-overlay" onclick="closeSidebar()"></div>
-
-<!-- Mobile bottom nav -->
-<nav class="mob-nav">
-  <div class="mob-nav-inner">
-    <a class="active" onclick="showPage('dashboard',this)" id="mob-dash">
-      <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-      Dashboard
-    </a>
-    <a onclick="showPage('vps',this)" id="mob-vps">
-      <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="8" rx="1"/><rect x="2" y="13" width="20" height="8" rx="1"/><circle cx="6" cy="7" r="1" fill="currentColor"/><circle cx="6" cy="17" r="1" fill="currentColor"/></svg>
-      Instances
-    </a>
-    <a onclick="showPage('create',this)" id="mob-create">
-      <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
-      Create
-    </a>
-  </div>
-</nav>
-
-<div id="toast-wrap"></div>
-
-<script>
-// ── state ──────────────────────────────────────────────────────────────────
-let selectedVps = null;
-let vpsData = [];
-let deleteTarget = null;
-
-// ── sidebar drawer (mobile) ─────────────────────────────────────────────────
-function toggleSidebar() {
-  const aside = document.querySelector('aside');
-  const overlay = document.getElementById('sidebar-overlay');
-  const isOpen = aside.classList.contains('open');
-  aside.classList.toggle('open', !isOpen);
-  overlay.classList.toggle('open', !isOpen);
-}
-function closeSidebar() {
-  document.querySelector('aside').classList.remove('open');
-  document.getElementById('sidebar-overlay').classList.remove('open');
-}
-
-// ── navigation ─────────────────────────────────────────────────────────────
-const MOB_IDS = {dashboard:'mob-dash', vps:'mob-vps', create:'mob-create'};
-function showPage(id, el) {
-  closeSidebar();
-  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('nav a, .mob-nav a').forEach(a => a.classList.remove('active'));
-  document.getElementById('page-' + id).classList.add('active');
-  if (el) el.classList.add('active');
-  const mobEl = document.getElementById(MOB_IDS[id]);
-  if (mobEl) mobEl.classList.add('active');
-  window.scrollTo(0,0);
-}
-
-// ── formatting ─────────────────────────────────────────────────────────────
-function fmtBytes(b) {
-  if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB';
-  if (b >= 1e6) return (b / 1e6).toFixed(2) + ' MB';
-  if (b >= 1e3) return (b / 1e3).toFixed(1) + ' KB';
-  return b + ' B';
-}
-function fmtUptime(s) {
-  const d = Math.floor(s/86400), h = Math.floor((s%86400)/3600),
-        m = Math.floor((s%3600)/60);
-  if (d > 0) return `${d}d ${h}h ${m}m`;
-  if (h > 0) return `${h}h ${m}m`;
-  return `${m} mins`;
-}
-
-// ── arc meter ──────────────────────────────────────────────────────────────
-function drawMeter(svgId, pct, label, sub) {
-  const svg = document.getElementById(svgId);
-  if (!svg) return;
-  const cx=100,cy=100,r=72,sw=14;
-  const arc = `M ${cx-r} ${cy} A ${r} ${r} 0 0 1 ${cx+r} ${cy}`;
-  const total = Math.PI * r;
-  const fill  = Math.min(Math.max(pct,0),100) / 100 * total;
-  const color = pct > 85 ? '#dc2626' : pct > 60 ? '#d97706' : '#2563eb';
-  svg.innerHTML = `
-    <path d="${arc}" fill="none" stroke="#e2e8f0" stroke-width="${sw}" stroke-linecap="round"/>
-    ${pct > 0 ? `<path d="${arc}" fill="none" stroke="${color}" stroke-width="${sw}" stroke-linecap="round"
-      stroke-dasharray="${fill} ${total}" style="transition:stroke-dasharray 1s ease"/>` : ''}
-    <text x="${cx}" y="${cy-8}" text-anchor="middle" font-size="28" font-weight="700" fill="#0f172a">${Math.round(pct)}%</text>
-    <text x="${cx}" y="${cy+14}" text-anchor="middle" font-size="12" font-weight="500" fill="#64748b">${label}</text>
-    <text x="${cx}" y="${cy+32}" text-anchor="middle" font-size="11" fill="#94a3b8">${sub}</text>`;
-}
-
-// ── client token (only a lookup key — actual data lives on server) ──────────
-function getClientToken() {
-  let t = localStorage.getItem('cpm_client_token');
-  if (!t || t.length < 16) {
-    const arr = new Uint8Array(24);
-    crypto.getRandomValues(arr);
-    t = Array.from(arr, b => b.toString(16).padStart(2,'0')).join('');
-    localStorage.setItem('cpm_client_token', t);
-  }
-  return t;
-}
-
-// ── fetch helpers ──────────────────────────────────────────────────────────
-async function api(path, opts={}) {
-  const hdrs = {'Content-Type':'application/json','X-Client-Token':getClientToken(),...(opts.headers||{})};
-  const r = await fetch(path, {...opts, headers:hdrs});
-  return r.json();
-}
-
-// ── toast ──────────────────────────────────────────────────────────────────
-function toast(msg, ok=true) {
-  const w = document.getElementById('toast-wrap');
-  const el = document.createElement('div');
-  el.className = 'toast ' + (ok ? 'toast-ok' : 'toast-err');
-  el.textContent = msg;
-  w.appendChild(el);
-  setTimeout(() => el.remove(), 3500);
-}
-
-// ── load system stats ──────────────────────────────────────────────────────
-async function loadStats() {
-  try {
-    const d = await api('/api/system');
-    drawMeter('meter-ram',  d.ram.percent,  'RAM Used',  `${fmtBytes(d.ram.used)} / ${fmtBytes(d.ram.total)}`);
-    drawMeter('meter-disk', d.disk.percent, 'Disk Used', `${fmtBytes(d.disk.used)} / ${fmtBytes(d.disk.total)}`);
-    document.getElementById('cpu-pct').textContent   = d.cpu.percent.toFixed(1) + '%';
-    document.getElementById('cpu-model').textContent = `${d.cpu.cores} Cores · ${d.cpu.model}`;
-    document.getElementById('net-rx').textContent    = fmtBytes(d.network.bytesRecv);
-    document.getElementById('net-tx').textContent    = fmtBytes(d.network.bytesSent);
-    document.getElementById('uptime').textContent    = fmtUptime(d.uptime);
-    document.getElementById('status-txt').textContent = 'System OK';
-    document.getElementById('dot').style.background  = '#16a34a';
-  } catch (e) {
-    document.getElementById('status-txt').textContent = 'Offline';
-    document.getElementById('dot').style.background  = '#dc2626';
-  }
-}
-
-// ── load VPS list ──────────────────────────────────────────────────────────
-let dashSelected = null;
-async function loadVps() {
-  try {
-    const d = await api('/api/vps/list');
-    vpsData = d.vps || [];
-    const running = vpsData.filter(v=>v.state==='running').length;
-    const stopped = vpsData.filter(v=>['stopped','crashed'].includes(v.state)).length;
-    const paused  = vpsData.filter(v=>v.state==='paused').length;
-    document.getElementById('vm-total').textContent   = vpsData.length;
-    document.getElementById('vm-running').textContent = running;
-    document.getElementById('vm-stopped').textContent = stopped;
-    document.getElementById('vm-paused').textContent  = paused;
-    renderVpsList();
-    renderDashList();
-    if (dashSelected) renderQuickActions(dashSelected);
-  } catch (e) {}
-}
-
-function renderDashList() {
-  const ul = document.getElementById('dash-vps-list');
-  if (!ul) return;
-  if (!vpsData.length) { ul.innerHTML = '<li style="color:var(--muted);font-size:13px;padding:8px">No instances found.</li>'; return; }
-  ul.innerHTML = vpsData.map(v => `
-    <li class="dash-vps-item${dashSelected===v.name?' selected':''}" onclick="dashSelectVps('${v.name}')">
-      <span style="font-weight:600;font-size:13px">${v.name}</span>
-      <span class="badge ${badgeClass(v.state)}">${v.state.charAt(0).toUpperCase()+v.state.slice(1)}</span>
-    </li>`).join('');
-}
-
-function dashSelectVps(name) {
-  dashSelected = name;
-  renderDashList();
-  renderQuickActions(name);
-}
-
-function renderQuickActions(name) {
-  const vm = vpsData.find(v=>v.name===name);
-  const nameEl = document.getElementById('qa-selected-name');
-  const body   = document.getElementById('qa-body');
-  if (!vm || !nameEl || !body) return;
-  nameEl.textContent = name;
-  const isRunning = vm.state==='running';
-  const isStopped = vm.state==='stopped';
-  body.innerHTML = `
-    <div class="qa-btns">
-      <button class="qa-btn qa-start"   ${isRunning?'disabled':''} onclick="requirePremium('vps_start',()=>dashAction('start'))">
-        <svg width="15" height="15" fill="currentColor" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg> Start Instance 👑
-      </button>
-      <button class="qa-btn qa-stop"    ${isStopped?'disabled':''} onclick="dashAction('stop')">
-        <svg width="15" height="15" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg> Stop Instance
-      </button>
-      <button class="qa-btn qa-restart" ${isStopped?'disabled':''} onclick="requirePremium('vps_restart',()=>dashAction('restart'))">
-        <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Restart Instance 👑
-      </button>
-      <button class="qa-btn qa-ssh" onclick="openSsh('${name}')">
-        <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg> Get SSH Access
-      </button>
-    </div>`;
-}
-
-async function dashAction(action) {
-  if (!dashSelected) return;
-  try {
-    const d = await api(`/api/vps/${action}`, {method:'POST', body:JSON.stringify({name:dashSelected})});
-    if (d.success) { toast(d.message); await loadVps(); }
-    else toast(d.error || 'Action failed', false);
-  } catch(e) { toast('Request failed', false); }
-}
-
-function badgeClass(state) {
-  return {running:'badge-running',stopped:'badge-stopped',paused:'badge-paused'}[state] || 'badge-unknown';
-}
-
-function renderVpsList() {
-  const ul = document.getElementById('vps-list');
-  if (!vpsData.length) { ul.innerHTML = '<li style="color:var(--muted);font-size:14px;padding:8px">No instances found.</li>'; return; }
-  ul.innerHTML = vpsData.map(v => `
-    <li class="vps-item${selectedVps===v.name?' selected':''}" onclick="selectVps('${v.name}')">
-      <div class="vps-info">
-        <span class="vps-name">${v.name}</span>
-        <span class="vps-meta">
-          ${v.vcpus ? `<span>${v.vcpus} vCPU</span>` : ''}
-          ${v.memory ? `<span>${v.memory} MB</span>` : ''}
-        </span>
-      </div>
-      <span class="badge ${badgeClass(v.state)}">${v.state.charAt(0).toUpperCase()+v.state.slice(1)}</span>
-    </li>`).join('');
-}
-
-function selectVps(name) {
-  selectedVps = name;
-  renderVpsList();
-  const vm = vpsData.find(v=>v.name===name);
-  const isRunning = vm?.state === 'running';
-  const isStopped = vm?.state === 'stopped';
-  document.getElementById('controls-body').innerHTML = `
-    <div class="selected-name">
-      <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="8" rx="1"/><rect x="2" y="13" width="20" height="8" rx="1"/></svg>
-      ${name}
-      <span class="badge ${badgeClass(vm?.state||'unknown')}" style="margin-left:auto">${vm?.state||'unknown'}</span>
-    </div>
-    <div class="action-btns">
-      <button class="btn btn-start"   onclick="requirePremium('vps_start',()=>doAction('start'))"   ${isRunning?'disabled':''}>
-        <svg width="13" height="13" fill="currentColor" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>Start</button>
-      <button class="btn btn-stop"    onclick="doAction('stop')"    ${isStopped?'disabled':''}>
-        <svg width="13" height="13" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>Stop</button>
-      <button class="btn btn-restart" onclick="requirePremium('vps_restart',()=>doAction('restart'))" ${isStopped?'disabled':''}>
-        <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>Restart</button>
-      <button class="btn btn-delete"  onclick="confirmDelete('${name}')">
-        <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>Delete</button>
-      <button class="btn btn-ssh" onclick="openSsh('${name}')" style="grid-column:1/-1">
-        <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>Get SSH Access 👑</button>
-    </div>`;
-}
-
-async function doAction(action) {
-  if (!selectedVps) return;
-  try {
-    const d = await api(`/api/vps/${action}`, {method:'POST', body:JSON.stringify({name:selectedVps})});
-    if (d.success) { toast(d.message); await loadVps(); selectVps(selectedVps); }
-    else toast(d.error || 'Action failed', false);
-  } catch(e) { toast('Request failed', false); }
-}
-
-// ── delete modal ──────────────────────────────────────────────────────────
-function confirmDelete(name) {
-  if (!canUse('vps_delete')) { openUpgrade(); return; }
-  deleteTarget = name;
-  document.getElementById('del-msg').textContent = `This will permanently destroy "${name}" and cannot be undone.`;
-  document.getElementById('del-modal').classList.add('open');
-  document.getElementById('del-confirm').onclick = async () => {
-    closeModal();
-    try {
-      const d = await api('/api/vps/delete', {method:'POST', body:JSON.stringify({name:deleteTarget})});
-      if (d.success) { toast(d.message); selectedVps=null; await loadVps(); document.getElementById('controls-body').innerHTML='<div class="no-selection"><span style="font-size:14px">Select an instance to manage</span></div>'; }
-      else toast(d.error||'Delete failed', false);
-    } catch(e) { toast('Request failed', false); }
-  };
-}
-function closeModal() { document.getElementById('del-modal').classList.remove('open'); }
-
-// ── create form ───────────────────────────────────────────────────────────
-async function submitCreate(e) {
-  e.preventDefault();
-  if (!canUse('vps_create')) { openUpgrade(); return; }
-  const btn = e.target.querySelector('button[type=submit]');
-  btn.disabled = true; btn.textContent = 'Creating…';
-  try {
-    const iso = document.getElementById('f-iso').value.trim();
-    const d = await api('/api/vps/create', {method:'POST', body:JSON.stringify({
-      name:    document.getElementById('f-name').value.trim(),
-      ram:     parseInt(document.getElementById('f-ram').value),
-      vcpus:   parseInt(document.getElementById('f-vcpus').value),
-      disk:    parseInt(document.getElementById('f-disk').value),
-      osVariant: document.getElementById('f-variant').value.trim() || 'generic',
-      ...(iso ? {isoPath: iso} : {})
-    })});
-    if (d.success) {
-      document.getElementById('create-form').reset();
-      await loadVps();
-      // Show success toast with Start Now option
-      const w = document.getElementById('toast-wrap');
-      const el = document.createElement('div');
-      el.className = 'toast toast-ok';
-      el.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:280px';
-      const vmName = document.getElementById('f-name') ? document.getElementById('f-name').value || '' : '';
-      el.innerHTML = `<span>${d.message}</span><button onclick="startNewVm('${vmName || d.message}')" style="background:rgba(255,255,255,.25);border:none;color:#fff;font-weight:700;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:12px;flex-shrink:0">Start Now</button>`;
-      w.appendChild(el);
-      setTimeout(() => el.remove(), 6000);
-    }
-    else toast(d.error || 'Create failed', false);
-  } catch(e) { toast('Request failed', false); }
-  btn.disabled = false; btn.innerHTML = '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg> Create Instance';
-}
-
-// ── KVM status check ──────────────────────────────────────────────────────
-let kvmFunctional = true;
-
-async function checkKvmStatus() {
-  try {
-    const d = await api('/api/kvm/status');
-    kvmFunctional = d.functional;
-    const banner  = document.getElementById('kvm-banner');
-    const topText = document.getElementById('kvm-status');
-    if (!d.functional) {
-      document.getElementById('kvm-banner-msg').textContent = d.message;
-      banner.classList.add('show');
-      topText.textContent = '⚠ KVM not available';
-      // Disable all VPS action buttons
-      document.querySelectorAll('.btn-start,.btn-stop,.btn-restart,.btn-delete,.btn-ssh,.qa-start,.qa-stop,.qa-restart,.qa-ssh').forEach(b => {
-        b.disabled = true; b.title = d.message;
-      });
-      // Overlay VPS list with clear message
-      const vl = document.getElementById('vps-list');
-      if (vl) vl.innerHTML = `<li style="padding:24px 12px;text-align:center">
-        <div style="font-size:28px;margin-bottom:10px">⚠️</div>
-        <div style="font-weight:700;font-size:15px;color:var(--red);margin-bottom:6px">KVM Not Available on This Host</div>
-        <div style="font-size:13px;color:var(--muted);line-height:1.6">${d.message}<br><br>
-        To create real VPS instances, your server must support KVM hardware virtualisation.<br>
-        Most shared VPS providers do not allow nested KVM.<br>
-        You need a <strong>dedicated server or bare-metal host</strong> with KVM enabled.</div>
-      </li>`;
-      // Disable create form
-      const cf = document.getElementById('create-form');
-      if (cf) {
-        const sub = cf.querySelector('button[type=submit]');
-        if (sub) { sub.disabled = true; sub.textContent = '⚠ KVM Not Available'; }
-        if (!document.getElementById('kvm-create-notice')) {
-          const notice = document.createElement('div');
-          notice.id = 'kvm-create-notice';
-          notice.style.cssText = 'background:#fef3c7;border:1px solid #f59e0b;border-radius:10px;padding:14px 18px;margin-bottom:18px;font-size:13px;color:#92400e;line-height:1.6';
-          notice.innerHTML = `<strong>⚠ KVM virtualisation is not available on this host.</strong><br>Creating VPS instances requires a dedicated/bare-metal server with KVM enabled. Your current host does not support it.`;
-          cf.insertBefore(notice, cf.firstChild);
-        }
-      }
-    } else {
-      banner.classList.remove('show');
-      topText.textContent = 'KVM Virtualisation Active';
-      const notice = document.getElementById('kvm-create-notice');
-      if (notice) notice.remove();
-    }
-  } catch(e) {}
-}
-
-// ── SSH / tmate ───────────────────────────────────────────────────────────
-function closeSsh() {
-  document.getElementById('ssh-overlay').classList.remove('open');
-}
-
-function copyText(txt, btn) {
-  navigator.clipboard.writeText(txt).then(() => {
-    btn.textContent = 'Copied!';
-    setTimeout(() => btn.textContent = 'Copy', 1800);
-  }).catch(() => {
-    btn.textContent = 'Error';
-    setTimeout(() => btn.textContent = 'Copy', 1800);
-  });
-}
-
-async function openSsh(name) {
-  if (!canUse('ssh_access')) { openUpgrade(); return; }
-  document.getElementById('ssh-title-text').textContent = 'SSH Access — ' + name;
-  document.getElementById('ssh-body').innerHTML =
-    '<div class="ssh-loading">⏳ Preparing SSH session for <strong>' + name + '</strong>…' +
-    '<br><small style="opacity:.6">Installing tmate if needed, then starting session…</small></div>';
-  document.getElementById('ssh-overlay').classList.add('open');
-  try {
-    const d = await api('/api/vps/tmate', {method:'POST', body:JSON.stringify({name})});
-    if (d.success) {
-      // Build the "commands that were run" block
-      const cmds = (d.cmds_run || []);
-      const cmdHtml = cmds.length ? `
-        <div class="ssh-label" style="margin-bottom:6px">Commands run on server</div>
-        <div class="ssh-box" style="color:#94a3b8;font-size:12px;margin-bottom:16px">${
-          cmds.map(c => `<div style="margin-bottom:4px"><span style="color:#4ade80">$</span> ${c}</div>`).join('')
-        }</div>` : '';
-      const sshSafe  = d.ssh.replace(/'/g, "\\'");
-      const webSafe  = (d.web||'').replace(/'/g, "\\'");
-      document.getElementById('ssh-body').innerHTML = `
-        ${cmdHtml}
-        <div class="ssh-label">SSH Connection Key</div>
-        <div class="ssh-box">${d.ssh}<button class="copy-btn" onclick="copyText('${sshSafe}',this)">Copy</button></div>
-        ${d.web ? `
-        <div class="ssh-label">Web Browser Link</div>
-        <div class="ssh-box" style="margin-bottom:0">
-          <a href="${d.web}" target="_blank" style="color:#60a5fa;text-decoration:none;word-break:break-all">${d.web}</a>
-          <button class="copy-btn" onclick="copyText('${webSafe}',this)">Copy</button>
-        </div>` : ''}
-        <div class="ssh-note" style="margin-top:16px">
-          Paste the SSH command into your terminal to connect to this server.<br>
-          The session stays active until you close tmate or restart the panel.
-        </div>`;
-    } else {
-      document.getElementById('ssh-body').innerHTML =
-        `<div class="ssh-loading" style="color:#dc2626">❌ ${d.error}</div>`;
-    }
-  } catch(e) {
-    document.getElementById('ssh-body').innerHTML =
-      '<div class="ssh-loading" style="color:#dc2626">❌ Request failed — is the panel running?</div>';
-  }
-}
-
-// close SSH modal on Escape key
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSsh(); });
-
-// ── start newly created VM ────────────────────────────────────────────────
-async function startNewVm(name) {
-  try {
-    const d = await api('/api/vps/start', {method:'POST', body:JSON.stringify({name})});
-    if (d.success) { toast(`${name} started!`); await loadVps(); dashSelectVps(name); showPage('dashboard', document.getElementById('mob-dash')); }
-    else toast(d.error || 'Could not start', false);
-  } catch(e) { toast('Request failed', false); }
-}
-
-// ── Feature gating ────────────────────────────────────────────────────────
-let featureMap = {};
-
-function getUserPlan() {
-  return localStorage.getItem('cpm_activation') || 'none';
-}
-
-function canUse(featureId) {
-  const feat = featureMap[featureId];
-  if (!feat || feat.tier === 'free') return true;
-  const plan = getUserPlan();
-  return plan === 'premium' || plan === 'paid' || plan === 'owner';
-}
-
-function requirePremium(featureId, callback) {
-  if (canUse(featureId)) { callback(); } else { openUpgrade(); }
-}
-
-function updatePlanBadge() {
-  const plan = getUserPlan();
-  const badge = document.getElementById('plan-badge');
-  if (!badge) return;
-  if (plan === 'premium' || plan === 'paid') {
-    badge.className = 'plan-badge premium'; badge.textContent = '👑 Premium';
-  } else {
-    badge.className = 'plan-badge free'; badge.textContent = '🔓 Free';
-  }
-}
-
-async function loadFeatureMap() {
-  try {
-    const d = await api('/api/features/status');
-    featureMap = d.features || {};
-    updatePlanBadge();
-  } catch(e) {}
-}
-
-// ── Upgrade modal ─────────────────────────────────────────────────────────
-function openUpgrade() {
-  document.getElementById('upgrade-overlay').classList.add('open');
-  const inp = document.getElementById('upgrade-key-input');
-  inp.value = ''; document.getElementById('upgrade-err').textContent = '';
-  setTimeout(() => inp.focus(), 50);
-  inp.onkeydown = e => { if (e.key === 'Enter') submitUpgradeKey(); };
-}
-
-function closeUpgrade() {
-  document.getElementById('upgrade-overlay').classList.remove('open');
-}
-
-async function submitUpgradeKey() {
-  const inp = document.getElementById('upgrade-key-input');
-  const err = document.getElementById('upgrade-err');
-  const key = inp.value.trim().toUpperCase();
-  if (!key) { err.textContent = 'Please enter a key.'; return; }
-  err.textContent = '⏳ Validating…';
-  try {
-    const uid = 'u-' + Math.random().toString(36).slice(2, 9);
-    const d = await api('/api/user/activate', {method:'POST', body:JSON.stringify({key, user_id: uid})});
-    if (d.success) {
-      localStorage.setItem('cpm_activation', 'premium');
-      localStorage.setItem('cpm_premium_key', key);
-      if (d.expires_at) localStorage.setItem('cpm_premium_expires', d.expires_at);
-      closeUpgrade(); updatePlanBadge(); loadFeatureMap();
-      toast('👑 Premium activated! All features unlocked.', true);
-    } else {
-      err.textContent = '❌ ' + (d.error || 'Invalid key');
-    }
-  } catch(e) { err.textContent = '❌ Server error — try again'; }
-}
-
-// ── Activation overlay (server-side keys) ────────────────────────────────
-const ACT_STORE_KEY = 'cpm_activation';
-
-function activationInit() {
-  const saved = localStorage.getItem(ACT_STORE_KEY);
-  if (saved === 'owner') {
-    ownerKeySession = localStorage.getItem('cpm_owner_key') || '';
-    hideActOverlay('owner');
-  } else if (saved === 'premium' || saved === 'paid' || saved === 'free') {
-    hideActOverlay(saved);
-  } else {
-    document.getElementById('act-overlay').classList.remove('hidden');
-    const inp = document.getElementById('act-key-input');
-    inp.addEventListener('input', function() {
-      this.classList.remove('error');
-      document.getElementById('act-err').textContent = '';
-    });
-    inp.addEventListener('keydown', e => { if (e.key === 'Enter') activatePanel(); });
-  }
-}
-
-async function activatePanel() {
-  const inp  = document.getElementById('act-key-input');
-  const err  = document.getElementById('act-err');
-  const btn  = document.getElementById('act-btn-paid');
-  const key  = inp.value.trim();
-  if (!key) { inp.classList.add('error'); err.textContent = 'Please enter your key.'; return; }
-  btn.textContent = '⏳ Validating…'; btn.disabled = true;
-  err.textContent = '';
-
-  // 1 — try owner auth first
-  try {
-    const st = await api('/api/owner/status');
-    if (st.initialized) {
-      const od = await api('/api/owner/auth', {method:'POST', body:JSON.stringify({owner_key: key})});
-      if (od.success) {
-        ownerKeySession = key;
-        inp.classList.add('success');
-        localStorage.setItem(ACT_STORE_KEY, 'owner');
-        localStorage.setItem('cpm_owner_key', key);
-        btn.textContent = '✅ Owner Access!';
-        btn.style.background = 'linear-gradient(135deg,#d97706,#b45309)';
-        setTimeout(() => hideActOverlay('owner'), 700);
-        return;
-      }
-    }
-  } catch(_) {}
-
-  // 2 — try paid user activation
-  try {
-    const uid = 'u-' + Math.random().toString(36).slice(2, 9);
-    const d = await api('/api/user/activate', {method:'POST', body:JSON.stringify({key: key.toUpperCase(), user_id: uid})});
-    if (d.success) {
-      inp.classList.add('success');
-      localStorage.setItem(ACT_STORE_KEY, 'premium');
-      localStorage.setItem('cpm_premium_key', key.toUpperCase());
-      if (d.expires_at) localStorage.setItem('cpm_premium_expires', d.expires_at);
-      btn.textContent = '✅ Premium Activated!';
-      btn.style.background = 'linear-gradient(135deg,#16a34a,#15803d)';
-      setTimeout(() => hideActOverlay('premium'), 700);
-      return;
-    }
-  } catch(_) {}
-
-  inp.classList.add('error');
-  err.textContent = '❌ Invalid key — check it and try again.';
-  btn.textContent = '🔑 Access Panel'; btn.disabled = false;
-}
-
-function useFreeVersion() {
-  localStorage.setItem(ACT_STORE_KEY, 'free');
-  hideActOverlay('free');
-}
-
-function hideActOverlay(mode) {
-  document.getElementById('act-overlay').classList.add('hidden');
-  const nav = document.getElementById('nav-owner');
-  if (mode === 'owner') {
-    nav.style.display = 'flex';
-    updatePlanBadge(); loadFeatureMap();
-    enterOwnerPanel();
-    return;
-  }
-  nav.style.display = 'none';
-  updatePlanBadge(); loadFeatureMap();
-  const banner = document.getElementById('act-mode-banner');
-  if (mode === 'premium' || mode === 'paid') {
-    banner.className = 'act-mode-banner paid';
-    banner.textContent = '👑 Premium — All features unlocked';
-  } else {
-    banner.className = 'act-mode-banner free';
-    banner.textContent = '🔓 Free Version — Enter a key to unlock features';
-  }
-  banner.style.display = 'block';
-  setTimeout(() => { banner.style.display = 'none'; }, 5000);
-}
-
-// ── First-time owner setup inside startup dialog ──────────────────────────
-async function showActSetup() {
-  try {
-    const st = await api('/api/owner/status');
-    if (st.initialized) {
-      document.getElementById('act-err').textContent = 'Owner key already set. Enter it above.';
-      return;
-    }
-  } catch(_) {}
-  document.getElementById('act-main-form').style.display = 'none';
-  document.getElementById('act-setup-form').style.display = 'block';
-  setTimeout(() => { const i = document.getElementById('act-setup-key'); if (i) { i.focus(); i.addEventListener('keydown', e => { if (e.key === 'Enter') submitActOwnerSetup(); }); } }, 50);
-}
-
-function hideActSetup() {
-  document.getElementById('act-setup-form').style.display = 'none';
-  document.getElementById('act-main-form').style.display = 'block';
-  document.getElementById('act-setup-err').textContent = '';
-}
-
-async function submitActOwnerSetup() {
-  const inp = document.getElementById('act-setup-key');
-  const err = document.getElementById('act-setup-err');
-  const btn = document.getElementById('act-setup-btn');
-  const key = inp.value.trim();
-  if (key.length < 6) { err.textContent = 'Key must be at least 6 characters.'; return; }
-  btn.textContent = '⏳ Setting up…'; btn.disabled = true;
-  try {
-    const d = await api('/api/owner/setup', {method:'POST', body:JSON.stringify({owner_key: key})});
-    if (d.success) {
-      ownerKeySession = key;
-      localStorage.setItem(ACT_STORE_KEY, 'owner');
-      localStorage.setItem('cpm_owner_key', key);
-      btn.textContent = '✅ Done!';
-      btn.style.background = 'linear-gradient(135deg,#d97706,#b45309)';
-      setTimeout(() => hideActOverlay('owner'), 700);
-    } else {
-      err.textContent = '❌ ' + (d.error || 'Setup failed');
-      btn.textContent = '🔐 Set Owner Key & Enter'; btn.disabled = false;
-    }
-  } catch(_) {
-    err.textContent = '❌ Server error — try again';
-    btn.textContent = '🔐 Set Owner Key & Enter'; btn.disabled = false;
-  }
-}
-
-// ── Owner panel ───────────────────────────────────────────────────────────
-let ownerKeySession = '';
-
-function openOwnerPanel() {
-  enterOwnerPanel();
-}
-
-function closeOwnerModal() {
-  document.getElementById('owner-modal-overlay').classList.remove('open');
-}
-
-function showOwnerSetup() {
-  document.getElementById('owner-modal-body').innerHTML = `
-    <p style="color:#94a3b8;font-size:13px;margin-bottom:20px;line-height:1.6">
-      First-time setup. Create a secret Owner Key to protect this management panel. <strong style="color:#f59e0b">Keep it safe — it cannot be recovered.</strong>
-    </p>
-    <div class="gen-label" style="color:#94a3b8;margin-bottom:6px">Create Owner Secret Key</div>
-    <input class="owner-input" id="owner-setup-key" type="password" placeholder="Min 6 characters" autocomplete="new-password"/>
-    <div class="owner-err" id="owner-setup-err"></div>
-    <button class="owner-btn owner-btn-primary" onclick="submitOwnerSetup()">🔐 Set Owner Key</button>
-    <button class="owner-btn owner-btn-secondary" onclick="closeOwnerModal()">Cancel</button>`;
-  setTimeout(() => {
-    const i = document.getElementById('owner-setup-key');
-    if (i) { i.focus(); i.addEventListener('keydown', e => { if (e.key==='Enter') submitOwnerSetup(); }); }
-  }, 50);
-}
-
-function showOwnerAuth() {
-  document.getElementById('owner-modal-body').innerHTML = `
-    <p style="color:#94a3b8;font-size:13px;margin-bottom:20px">Enter your Owner Secret Key to access the management panel.</p>
-    <div class="gen-label" style="color:#94a3b8;margin-bottom:6px">Owner Secret Key</div>
-    <input class="owner-input" id="owner-auth-key" type="password" placeholder="Your owner secret key" autocomplete="current-password"/>
-    <div class="owner-err" id="owner-auth-err"></div>
-    <button class="owner-btn owner-btn-primary" onclick="submitOwnerAuth()">👑 Access Owner Panel</button>
-    <button class="owner-btn owner-btn-secondary" onclick="closeOwnerModal()">Cancel</button>`;
-  setTimeout(() => {
-    const i = document.getElementById('owner-auth-key');
-    if (i) { i.focus(); i.addEventListener('keydown', e => { if (e.key==='Enter') submitOwnerAuth(); }); }
-  }, 50);
-}
-
-async function submitOwnerSetup() {
-  const inp = document.getElementById('owner-setup-key');
-  const err = document.getElementById('owner-setup-err');
-  const key = inp.value.trim();
-  if (key.length < 6) { err.textContent = 'Key must be at least 6 characters'; return; }
-  try {
-    const d = await api('/api/owner/setup', {method:'POST', body:JSON.stringify({owner_key: key})});
-    if (d.success) {
-      ownerKeySession = key; closeOwnerModal(); enterOwnerPanel();
-      toast('🔐 Owner key set! Keep it safe.', true);
-    } else { err.textContent = d.error || 'Failed'; }
-  } catch(e) { err.textContent = 'Server error'; }
-}
-
-async function submitOwnerAuth() {
-  const inp = document.getElementById('owner-auth-key');
-  const err = document.getElementById('owner-auth-err');
-  const key = inp.value.trim();
-  if (!key) { err.textContent = 'Enter your owner key'; return; }
-  try {
-    const d = await api('/api/owner/auth', {method:'POST', body:JSON.stringify({owner_key: key})});
-    if (d.success) {
-      ownerKeySession = key; closeOwnerModal(); enterOwnerPanel();
-    } else {
-      inp.classList.add('error'); err.textContent = '❌ ' + (d.error || 'Invalid owner key');
-    }
-  } catch(e) { err.textContent = 'Server error'; }
-}
-
-function enterOwnerPanel() {
-  showPage('owner', document.getElementById('nav-owner'));
-  ownerLoadAnalytics();
-}
-
-function ownerTab(tab, btn) {
-  document.querySelectorAll('.owner-tab').forEach(b => b.classList.remove('active'));
-  document.querySelectorAll('.owner-tab-panel').forEach(p => p.classList.remove('active'));
-  btn.classList.add('active');
-  document.getElementById('otab-' + tab).classList.add('active');
-  if (tab === 'analytics') ownerLoadAnalytics();
-  else if (tab === 'keys') ownerLoadKeys();
-  else if (tab === 'logs') ownerLoadLogs();
-}
-
-async function ownerPost(endpoint, extra = {}) {
-  return api(endpoint, {method:'POST', body: JSON.stringify({owner_key: ownerKeySession, ...extra})});
-}
-
-async function ownerLoadAnalytics() {
-  const el = document.getElementById('ana-cards');
-  const recentEl = document.getElementById('ana-recent-logs');
-  if (!el) return;
-  try {
-    const d = await ownerPost('/api/owner/analytics');
-    const stats = [
-      ['Total Keys', d.total_keys, '#2563eb'],
-      ['Active Keys', d.active_keys, '#16a34a'],
-      ['Used Keys', d.used_keys, '#0369a1'],
-      ['Activations', d.total_activations, '#7c3aed'],
-    ];
-    el.innerHTML = stats.map(([label, num, color]) =>
-      `<div class="ana-card"><div class="ana-num" style="color:${color}">${num ?? 0}</div><div class="ana-label">${label}</div></div>`
-    ).join('');
-    const logs = d.recent_logs || [];
-    recentEl.innerHTML = logs.length
-      ? logs.map(l => `<div class="log-row">
-          <span class="log-time">${(l.activated_at||'').slice(0,19).replace('T',' ')}</span>
-          <span class="log-key">${l.key}</span>
-          <span style="margin-left:auto;font-size:11px;color:var(--muted)">${l.expires_at ? 'Exp: '+l.expires_at.slice(0,10) : '∞ No expiry'}</span>
-        </div>`).join('')
-      : '<div style="color:var(--muted);font-size:14px;padding:8px">No activations yet</div>';
-  } catch(e) { if (el) el.innerHTML = '<div style="color:#dc2626">Failed to load — is owner key correct?</div>'; }
-}
-
-async function ownerLoadKeys() {
-  const tbody = document.getElementById('keys-tbody');
-  if (!tbody) return;
-  try {
-    const d = await ownerPost('/api/owner/keys');
-    const keys = d.keys || [];
-    tbody.innerHTML = keys.length
-      ? keys.map(k => `<tr>
-          <td><span class="key-mono">${k.key}</span><br><span style="font-size:10px;color:var(--muted)">${k.id}${k.note?' · '+k.note:''}</span></td>
-          <td><span class="status-pill pill-${k.status}">${k.status}</span></td>
-          <td style="font-size:12px">${k.expires_at ? k.expires_at.slice(0,10) : '∞ Never'}</td>
-          <td style="font-size:12px">${k.uses_max===-1?'∞':k.uses_max} / used: ${k.uses_count}</td>
-          <td>
-            ${k.status!=='revoked'?`<button class="tbl-btn tbl-btn-revoke" onclick="ownerRevoke('${k.id}')">Revoke</button>`:''}
-            <button class="tbl-btn tbl-btn-delete" onclick="ownerDeleteKey('${k.id}')">Delete</button>
-          </td>
-        </tr>`).join('')
-      : '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:24px">No keys yet — generate one above</td></tr>';
-  } catch(e) { tbody.innerHTML = '<tr><td colspan="5" style="color:#dc2626">Failed to load keys</td></tr>'; }
-}
-
-async function ownerGenerateKey() {
-  try {
-    const d = await ownerPost('/api/owner/keys/generate', {
-      custom_key: document.getElementById('gen-custom').value.trim(),
-      exp_value:  document.getElementById('gen-exp-val').value.trim() || null,
-      exp_unit:   document.getElementById('gen-exp-unit').value,
-      uses_max:   parseInt(document.getElementById('gen-uses').value),
-      note:       document.getElementById('gen-note').value.trim(),
-    });
-    if (d.success) {
-      toast('✅ Key: ' + d.key.key, true);
-      ['gen-custom','gen-exp-val','gen-note'].forEach(id => { document.getElementById(id).value = ''; });
-      ownerLoadKeys();
-    } else { toast(d.error || 'Failed', false); }
-  } catch(e) { toast('Server error', false); }
-}
-
-async function ownerRevoke(id) {
-  if (!confirm('Revoke this key? Users with this key will lose premium access.')) return;
-  try { const d = await ownerPost('/api/owner/keys/revoke', {id}); if (d.success) { ownerLoadKeys(); toast('Key revoked', true); } else toast(d.error, false); }
-  catch(e) { toast('Failed', false); }
-}
-
-async function ownerDeleteKey(id) {
-  if (!confirm('Permanently delete this key?')) return;
-  try { const d = await ownerPost('/api/owner/keys/delete', {id}); if (d.success) { ownerLoadKeys(); toast('Key deleted', true); } else toast(d.error, false); }
-  catch(e) { toast('Failed', false); }
-}
-
-async function ownerLoadLogs() {
-  const el = document.getElementById('log-list');
-  if (!el) return;
-  try {
-    const d = await ownerPost('/api/owner/logs');
-    const logs = d.logs || [];
-    el.innerHTML = logs.length
-      ? logs.map(l => `<div class="log-row">
-          <span class="log-time">${(l.activated_at||'').slice(0,19).replace('T',' ')}</span>
-          <span class="log-key">${l.key}</span>
-          <span style="font-size:11px;color:var(--muted);margin-left:4px">${l.key_id}</span>
-          <span style="margin-left:auto;font-size:11px;color:var(--muted)">${l.expires_at?'Exp: '+l.expires_at.slice(0,10):'∞'}</span>
-        </div>`).join('')
-      : '<div style="color:var(--muted);font-size:14px;padding:24px">No activation logs yet</div>';
-  } catch(e) { el.innerHTML = '<div style="color:#dc2626">Failed to load logs</div>'; }
-}
-
-// ── Cloud Storage ─────────────────────────────────────────────────────────
-let storagePath = '';
-
-function openStorageWithCheck(el) {
-  requirePremium('file_manager', () => { showPage('storage', el); storageOpen(); });
-}
-
-function storageOpen() { loadStorage(''); }
-
-function storageTo(path) { loadStorage(path); }
-
-async function loadStorage(path) {
-  storagePath = path;
-  renderStorageCrumb();
-  const el = document.getElementById('storage-file-list');
-  el.innerHTML = '<div style="padding:32px;color:var(--muted);text-align:center">⏳ Loading…</div>';
-  try {
-    const d = await api('/api/storage/list?path=' + encodeURIComponent(path));
-    const items = d.items || [];
-    if (!items.length) {
-      el.innerHTML = '<div style="padding:36px;color:var(--muted);text-align:center">📂 This folder is empty.<br><small>Upload files or create a folder to get started.</small></div>';
-    } else {
-      el.innerHTML = `<div style="overflow-x:auto"><table class="file-table">
-        <thead><tr>
-          <th>Name</th><th>Size</th><th>Modified</th><th style="text-align:right">Actions</th>
-        </tr></thead>
-        <tbody>${items.map(f => {
-          const fullRel = (path ? path + '/' : '') + f.name;
-          const esc = fullRel.replace(/'/g, "\\'");
-          return `<tr>
-            <td>
-              ${f.type === 'folder'
-                ? `<button class="file-name-btn" onclick="storageTo('${esc}')">📁 ${f.name}</button>`
-                : `<span>${storageFileIcon(f.name)} ${f.name}</span>`}
-            </td>
-            <td style="color:var(--muted);font-size:12px">${f.type === 'folder' ? '—' : fmtBytes(f.size)}</td>
-            <td style="color:var(--muted);font-size:12px;white-space:nowrap">${f.modified}</td>
-            <td style="text-align:right;white-space:nowrap">
-              ${f.type === 'file' ? `<button class="tbl-btn" onclick="requirePremium('file_download',()=>{ window.location='/api/storage/download?path=${encodeURIComponent(fullRel)}'; })" style="display:inline-block">⬇ Download 👑</button>` : ''}
-              <button class="tbl-btn tbl-btn-delete" onclick="storageDelete('${esc}','${f.type}')">🗑 Delete</button>
-            </td>
-          </tr>`;
-        }).join('')}</tbody>
-      </table></div>`;
-    }
-  } catch(e) {
-    el.innerHTML = '<div style="padding:24px;color:#dc2626;text-align:center">❌ Failed to load — is the panel running?</div>';
-  }
-  loadStorageStats();
-}
-
-function renderStorageCrumb() {
-  const el = document.getElementById('storage-crumb');
-  if (!el) return;
-  const parts = storagePath ? storagePath.split('/').filter(Boolean) : [];
-  let html = `<span onclick="storageTo('')" style="cursor:pointer;color:var(--blue);font-weight:600">📁 Storage</span>`;
-  let built = '';
-  parts.forEach((p, i) => {
-    built = built ? built + '/' + p : p;
-    const snap = built;
-    html += `<span style="color:var(--muted);padding:0 5px">/</span>`;
-    if (i === parts.length - 1) {
-      html += `<span style="color:var(--text);font-weight:600">${p}</span>`;
-    } else {
-      html += `<span onclick="storageTo('${snap}')" style="cursor:pointer;color:var(--blue)">${p}</span>`;
-    }
-  });
-  el.innerHTML = html;
-}
-
-async function loadStorageStats() {
-  try {
-    const d = await api('/api/storage/stats');
-    const used = d.used || 0, total = d.total || 0;
-    const pct = total ? Math.min(100, (used / total) * 100).toFixed(1) : 0;
-    const el = document.getElementById('storage-usage-text');
-    const bar = document.getElementById('storage-bar');
-    if (el) el.textContent = fmtBytes(used) + ' used of ' + fmtBytes(total);
-    if (bar) bar.style.width = pct + '%';
-  } catch(_) {}
-}
-
-function storageFileIcon(name) {
-  const ext = (name.split('.').pop() || '').toLowerCase();
-  const map = {jpg:'🖼',jpeg:'🖼',png:'🖼',gif:'🖼',webp:'🖼',svg:'🖼',ico:'🖼',
-    mp4:'🎬',mkv:'🎬',avi:'🎬',mov:'🎬',mp3:'🎵',wav:'🎵',ogg:'🎵',
-    pdf:'📄',doc:'📝',docx:'📝',txt:'📝',log:'📝',
-    zip:'📦',tar:'📦',gz:'📦','7z':'📦',rar:'📦',
-    sh:'⚙',py:'🐍',js:'📜',ts:'📜',json:'📋',yml:'📋',yaml:'📋',
-    html:'🌐',css:'🎨',php:'🐘',sql:'🗃'};
-  return map[ext] || '📄';
-}
-
-function fmtBytes(b) {
-  if (!b) return '0 B';
-  if (b < 1024) return b + ' B';
-  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
-  if (b < 1073741824) return (b/1048576).toFixed(1) + ' MB';
-  return (b/1073741824).toFixed(2) + ' GB';
-}
-
-function storageUpload() {
-  document.getElementById('storage-file-input').click();
-}
-
-async function storageDoUpload(input) {
-  const files = Array.from(input.files);
-  if (!files.length) return;
-  toast(`⏳ Uploading ${files.length} file(s)…`);
-  let ok = 0, fail = 0;
-  for (const file of files) {
-    const fd = new FormData();
-    fd.append('file', file);
-    fd.append('path', storagePath);
-    try {
-      const r = await fetch('/api/storage/upload', {method:'POST', body: fd});
-      const d = await r.json();
-      if (d.success) ok++; else { fail++; toast('❌ ' + file.name + ': ' + (d.error||'failed'), false); }
-    } catch(_) { fail++; toast('❌ Upload failed for ' + file.name, false); }
-  }
-  input.value = '';
-  if (ok) toast('✅ ' + ok + ' file(s) uploaded', true);
-  loadStorage(storagePath);
-}
-
-async function storageMkdir() {
-  const name = prompt('New folder name:');
-  if (!name || !name.trim()) return;
-  const safe = name.trim().replace(/[^a-zA-Z0-9_\-. ]/g, '_');
-  if (!safe) { toast('Invalid folder name', false); return; }
-  try {
-    const d = await api('/api/storage/mkdir', {method:'POST', body: JSON.stringify({path: (storagePath ? storagePath + '/' : '') + safe})});
-    if (d.success) { toast('📁 Folder created', true); loadStorage(storagePath); }
-    else toast(d.error || 'Failed to create folder', false);
-  } catch(_) { toast('Server error', false); }
-}
-
-async function storageDelete(path, type) {
-  const msg = type === 'folder'
-    ? 'Delete this folder and ALL its contents? This cannot be undone.'
-    : 'Delete this file? This cannot be undone.';
-  if (!confirm(msg)) return;
-  try {
-    const d = await api('/api/storage/delete', {method:'POST', body: JSON.stringify({path})});
-    if (d.success) { toast('🗑 Deleted', true); loadStorage(storagePath); }
-    else toast(d.error || 'Delete failed', false);
-  } catch(_) { toast('Server error', false); }
-}
-
-// ── Tunnel URL ────────────────────────────────────────────────────────────
-let _tunnelUrl = null;
-
-async function loadTunnelUrl() {
-  try {
-    const d = await api('/api/tunnel/status');
-    if (d.ready && d.url) {
-      _tunnelUrl = d.url;
-      const banner = document.getElementById('tunnel-banner');
-      const urlEl  = document.getElementById('tunnel-url-text');
-      if (banner && urlEl) {
-        urlEl.textContent = d.url;
-        banner.classList.add('show');
-      }
-    }
-  } catch(e) {}
-}
-
-function copyTunnelUrl() {
-  if (!_tunnelUrl) return;
-  navigator.clipboard.writeText(_tunnelUrl).then(() => {
-    const btn = document.querySelector('.tunnel-copy');
-    if (btn) { btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = 'Copy', 2000); }
-  });
-}
-
-// Poll tunnel every 5s until ready (lt can take a few seconds to connect)
-function pollTunnel(tries=0) {
-  loadTunnelUrl().then(() => {
-    if (!_tunnelUrl && tries < 24) setTimeout(() => pollTunnel(tries+1), 5000);
-  });
-}
-
-// ── UI Customization ──────────────────────────────────────────────────────
-const UIC_PRESETS = {
-  default:  { label:'☀️ Default',    bg:'#f0f4f8', sidebar:'#ffffff', card:'#ffffff', blue:'#2563eb', text:'#0f172a', muted:'#64748b', border:'#e2e8f0', green:'#16a34a', red:'#dc2626', amber:'#d97706' },
-  dark:     { label:'🌙 Dark',       bg:'#0f172a', sidebar:'#1e293b', card:'#1e293b', blue:'#3b82f6', text:'#f1f5f9', muted:'#94a3b8', border:'#334155', green:'#22c55e', red:'#ef4444', amber:'#f59e0b' },
-  ocean:    { label:'🌊 Ocean',      bg:'#0c1a2e', sidebar:'#0f2744', card:'#122f50', blue:'#38bdf8', text:'#e0f2fe', muted:'#7dd3fc', border:'#1e4976', green:'#34d399', red:'#f87171', amber:'#fbbf24' },
-  sakura:   { label:'🌸 Sakura',     bg:'#fff0f5', sidebar:'#ffe4ef', card:'#fff8fb', blue:'#e879a0', text:'#4a1942', muted:'#be8aac', border:'#f9c6db', green:'#22c55e', red:'#ef4444', amber:'#f59e0b' },
-  forest:   { label:'🌿 Forest',     bg:'#0a1f0f', sidebar:'#0f2b15', card:'#122b18', blue:'#4ade80', text:'#dcfce7', muted:'#86efac', border:'#1a4225', green:'#86efac', red:'#f87171', amber:'#fbbf24' },
-  sunset:   { label:'🌅 Sunset',     bg:'#1c0a00', sidebar:'#2d1a00', card:'#2d1a00', blue:'#f97316', text:'#fff7ed', muted:'#fdba74', border:'#431a00', green:'#86efac', red:'#f87171', amber:'#fbbf24' },
-  midnight: { label:'🌃 Midnight',   bg:'#0a0a1a', sidebar:'#0d0d2b', card:'#12122e', blue:'#818cf8', text:'#e0e7ff', muted:'#a5b4fc', border:'#1e1e4a', green:'#4ade80', red:'#f87171', amber:'#fbbf24' },
-  cyber:    { label:'⚡ Cyber',      bg:'#000d0d', sidebar:'#001a1a', card:'#001a1a', blue:'#00ffcc', text:'#ccffee', muted:'#00aa88', border:'#004433', green:'#00ffaa', red:'#ff4466', amber:'#ffcc00' },
-  candy:    { label:'🍬 Candy',      bg:'#fff0ff', sidebar:'#ffe0ff', card:'#fff0ff', blue:'#a855f7', text:'#2e1065', muted:'#c084fc', border:'#f5d0fe', green:'#22c55e', red:'#ef4444', amber:'#f59e0b' },
-  steel:    { label:'🔩 Steel',      bg:'#1c1f26', sidebar:'#22262f', card:'#22262f', blue:'#60a5fa', text:'#e2e8f0', muted:'#94a3b8', border:'#2d333b', green:'#4ade80', red:'#f87171', amber:'#fbbf24' },
-  glass:    { label:'💎 Light Transparent', bg:'transparent', sidebar:'rgba(255,255,255,0.15)', card:'rgba(255,255,255,0.12)', blue:'#60a5fa', text:'#f8fafc', muted:'#e2e8f0', border:'rgba(255,255,255,0.25)', green:'#4ade80', red:'#f87171', amber:'#fbbf24' },
-};
-
-// Background handled via file uploads — no preset gallery
-
-let uicCurrentPreset = 'default';
-let uicCurrentBg = 'none';
-let uicSettings = {};
-
-function openUiCustomizeWithCheck(el) {
-  requirePremium('ui_customize', () => { showPage('uicustom', el); uicRenderPage(); });
-}
-
-function uicRenderPage() {
-  const presetEl = document.getElementById('uic-preset-btns');
-  if (presetEl) {
-    presetEl.innerHTML = Object.entries(UIC_PRESETS).map(([key, p]) =>
-      `<button class="uic-preset ${uicCurrentPreset===key?'active':''}" onclick="uicApplyPreset('${key}')">${p.label}</button>`
-    ).join('');
-  }
-  const savedFont = uicSettings.fontFamily || '';
-  const savedSize = uicSettings.fontSize || '14';
-  const fontEl = document.getElementById('uic-font-select');
-  if (fontEl) fontEl.value = savedFont;
-  const sizeEl = document.getElementById('uic-font-size');
-  if (sizeEl) { sizeEl.value = savedSize; const v=document.getElementById('uic-size-val'); if(v)v.textContent=savedSize+'px'; }
-  const savedRadius = uicSettings.radius || '12px';
-  document.querySelectorAll('.uic-radius-opt').forEach(b => b.classList.toggle('active', b.dataset.r===savedRadius));
-  uicSyncPickers();
-  // Restore image preview from server settings
-  if (uicSettings.bg_type === 'image' && uicSettings.bg_url) {
-    const wrap = document.getElementById('uic-img-preview-wrap');
-    if (wrap) wrap.innerHTML = `<img src="${uicSettings.bg_url}" style="width:100%;height:100%;object-fit:cover;border-radius:10px"/>`;
-    const btn = document.getElementById('uic-img-clear-btn');
-    if (btn) btn.style.display = 'block';
-  }
-  // Restore video preview from server settings
-  if (uicSettings.bg_type === 'video' && uicSettings.bg_url) {
-    const wrap = document.getElementById('uic-vid-preview-wrap');
-    if (wrap) wrap.innerHTML = `<video src="${uicSettings.bg_url}" autoplay loop muted playsinline style="width:100%;height:100%;object-fit:cover;border-radius:10px"></video>`;
-    const btn = document.getElementById('uic-vid-clear-btn');
-    if (btn) btn.style.display = 'block';
-  }
-}
-
-function uicSyncPickers() {
-  const pairs = [['bg','sw-bg'],['sidebar','sw-sidebar'],['card','sw-card'],['blue','sw-blue'],['text','sw-text'],['muted','sw-muted'],['border','sw-bord'],['green','sw-green'],['red','sw-red'],['amber','sw-amber']];
-  pairs.forEach(([varN, swId]) => {
-    const inp = document.getElementById('uic-clr-' + varN);
-    const sw  = document.getElementById(swId);
-    if (!inp) return;
-    const val = getComputedStyle(document.documentElement).getPropertyValue('--' + varN).trim();
-    const hex = uicToHex(val);
-    inp.value = hex;
-    if (sw) sw.style.background = hex;
-  });
-}
-
-function uicToHex(color) {
-  if (!color) return '#000000';
-  const m = color.trim().match(/^#([0-9a-fA-F]{6})/);
-  if (m) return '#' + m[1];
-  const m3 = color.trim().match(/^#([0-9a-fA-F]{3})$/);
-  if (m3) { const [r,g,b]=m3[1].split('').map(c=>c+c); return '#'+r+g+b; }
-  const tmp = document.createElement('canvas').getContext('2d');
-  tmp.fillStyle = color;
-  const c = tmp.fillStyle;
-  if (c.startsWith('#')) return c.slice(0,7);
-  const rgb = c.match(/\d+/g);
-  if (rgb) return '#'+rgb.slice(0,3).map(x=>parseInt(x).toString(16).padStart(2,'0')).join('');
-  return '#000000';
-}
-
-function uicPickColor(varName, el) {
-  const val = el.value;
-  document.documentElement.style.setProperty('--' + varName, val);
-  const sw = el.parentElement;
-  if (sw) sw.style.background = val;
-  uicCurrentPreset = 'custom';
-  document.querySelectorAll('.uic-preset').forEach(b => b.classList.remove('active'));
-  uicSettings.colors = uicSettings.colors || {};
-  uicSettings.colors['--' + varName] = val;
-}
-
-function uicHexAlpha(hex, a) {
-  if (!hex || !hex.startsWith('#')) return `rgba(0,0,0,${a})`;
-  const r=parseInt(hex.slice(1,3),16), g=parseInt(hex.slice(3,5),16), b=parseInt(hex.slice(5,7),16);
-  return `rgba(${r},${g},${b},${a})`;
-}
-
-function uicApplyPreset(key) {
-  const p = UIC_PRESETS[key];
-  if (!p) return;
-  const root = document.documentElement;
-  root.style.setProperty('--bg',     p.bg);
-  root.style.setProperty('--sidebar',p.sidebar);
-  root.style.setProperty('--card',   p.card);
-  root.style.setProperty('--blue',   p.blue);
-  root.style.setProperty('--blue-light', uicHexAlpha(p.blue, 0.12));
-  root.style.setProperty('--blue-mid',   uicHexAlpha(p.blue, 0.30));
-  root.style.setProperty('--text',   p.text);
-  root.style.setProperty('--muted',  p.muted);
-  root.style.setProperty('--border', p.border);
-  root.style.setProperty('--green',  p.green);
-  root.style.setProperty('--red',    p.red);
-  root.style.setProperty('--amber',  p.amber);
-  uicCurrentPreset = key;
-  uicSettings.preset = key;
-  uicSettings.colors = null;
-  document.querySelectorAll('.uic-preset').forEach((b,i) => {
-    b.classList.toggle('active', Object.keys(UIC_PRESETS)[i] === key);
-  });
-  uicSyncPickers();
-  toast(`Theme applied: ${p.label}`, true);
-}
-
-function uicUploadImage(input) {
-  const file = input.files[0];
-  if (!file) return;
-  if (file.size > 20 * 1024 * 1024) { toast('Image too large — max 20 MB', false); return; }
-  toast('⏳ Uploading image…', true);
-  const form = new FormData();
-  form.append('file', file);
-  fetch('/api/ui/background', {
-    method: 'POST',
-    headers: {'X-Client-Token': getClientToken()},
-    body: form
-  }).then(r => r.json()).then(d => {
-    if (!d.ok) { toast('❌ Upload failed: ' + (d.error||''), false); return; }
-    const bgLayer = document.getElementById('cpm-bg-layer');
-    if (bgLayer) bgLayer.style.cssText = `position:fixed;inset:0;z-index:-2;pointer-events:none;background-image:url('${d.url}');background-size:cover;background-position:center`;
-    document.getElementById('cpm-bg-style').innerHTML = '';
-    document.documentElement.style.setProperty('--bg', 'transparent');
-    const wrap = document.getElementById('uic-img-preview-wrap');
-    if (wrap) wrap.innerHTML = `<img src="${d.url}" style="width:100%;height:100%;object-fit:cover;border-radius:10px"/>`;
-    const btn = document.getElementById('uic-img-clear-btn');
-    if (btn) btn.style.display = 'block';
-    uicClearVideoSilent();
-    uicSettings.bg_url = d.url; uicSettings.bg_type = 'image'; uicSettings.background = 'upload-img';
-    uicCurrentBg = 'upload-img';
-    toast('🖼️ Image background saved on server!', true);
-  }).catch(() => toast('❌ Upload failed', false));
-}
-
-function uicDropImage(ev) {
-  ev.preventDefault();
-  const file = ev.dataTransfer.files[0];
-  if (!file || !file.type.startsWith('image/')) { toast('Please drop an image file', false); return; }
-  const fakeInput = { files:[file] };
-  uicUploadImage(fakeInput);
-}
-
-function uicUploadVideo(input) {
-  const file = input.files[0];
-  if (!file) return;
-  if (file.size > 100 * 1024 * 1024) { toast('Video too large — max 100 MB', false); return; }
-  toast('⏳ Uploading video… please wait', true);
-  const form = new FormData();
-  form.append('file', file);
-  fetch('/api/ui/background', {
-    method: 'POST',
-    headers: {'X-Client-Token': getClientToken()},
-    body: form
-  }).then(r => r.json()).then(d => {
-    if (!d.ok) { toast('❌ Upload failed: ' + (d.error||''), false); return; }
-    const vid = document.getElementById('cpm-bg-video');
-    if (vid) { vid.src = d.url; vid.style.display = 'block'; vid.load(); vid.play().catch(()=>{}); }
-    const bgLayer = document.getElementById('cpm-bg-layer');
-    if (bgLayer) bgLayer.style.cssText = 'position:fixed;inset:0;z-index:-2;pointer-events:none';
-    document.getElementById('cpm-bg-style').innerHTML = '';
-    document.documentElement.style.setProperty('--bg', 'transparent');
-    const wrap = document.getElementById('uic-vid-preview-wrap');
-    if (wrap) wrap.innerHTML = `<video src="${d.url}" autoplay loop muted playsinline style="width:100%;height:100%;object-fit:cover;border-radius:10px"></video>`;
-    const btn = document.getElementById('uic-vid-clear-btn');
-    if (btn) btn.style.display = 'block';
-    uicClearImageSilent();
-    uicSettings.bg_url = d.url; uicSettings.bg_type = 'video'; uicSettings.background = 'upload-vid';
-    uicCurrentBg = 'upload-vid';
-    toast('🎬 Video background saved on server!', true);
-  }).catch(() => toast('❌ Upload failed', false));
-}
-
-function uicDropVideo(ev) {
-  ev.preventDefault();
-  const file = ev.dataTransfer.files[0];
-  if (!file || !file.type.startsWith('video/')) { toast('Please drop a video file', false); return; }
-  const fakeInput = { files:[file] };
-  uicUploadVideo(fakeInput);
-}
-
-function uicClearImageSilent() {
-  if (uicSettings.bg_type === 'image') {
-    fetch('/api/ui/background', {method:'DELETE', headers:{'X-Client-Token':getClientToken()}}).catch(()=>{});
-    uicSettings.bg_url = null; uicSettings.bg_type = null;
-  }
-  uicSettings.background = 'none'; uicCurrentBg = 'none';
-  const bgLayer = document.getElementById('cpm-bg-layer');
-  if (bgLayer) bgLayer.style.cssText = 'position:fixed;inset:0;z-index:-2;pointer-events:none';
-  document.documentElement.style.removeProperty('--bg');
-  if (uicSettings.preset && UIC_PRESETS[uicSettings.preset]) {
-    document.documentElement.style.setProperty('--bg', UIC_PRESETS[uicSettings.preset].bg);
-  }
-  const wrap = document.getElementById('uic-img-preview-wrap');
-  if (wrap) wrap.innerHTML = `<svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg><span style="font-size:13px;font-weight:600">Click or drag an image here</span><span style="font-size:11px">JPG, PNG, GIF, WebP — max 20 MB</span>`;
-  const btn = document.getElementById('uic-img-clear-btn');
-  if (btn) btn.style.display = 'none';
-}
-
-function uicClearImage() { uicClearImageSilent(); toast('Image background removed', true); }
-
-function uicClearVideoSilent() {
-  if (uicSettings.bg_type === 'video') {
-    fetch('/api/ui/background', {method:'DELETE', headers:{'X-Client-Token':getClientToken()}}).catch(()=>{});
-    uicSettings.bg_url = null; uicSettings.bg_type = null;
-  }
-  uicSettings.background = 'none'; uicCurrentBg = 'none';
-  const vid = document.getElementById('cpm-bg-video');
-  if (vid) { vid.style.display='none'; vid.src=''; }
-  const wrap = document.getElementById('uic-vid-preview-wrap');
-  if (wrap) wrap.innerHTML = `<svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg><span style="font-size:13px;font-weight:600">Click or drag a video here</span><span style="font-size:11px">MP4, WebM, OGG — max 100 MB</span>`;
-  const btn = document.getElementById('uic-vid-clear-btn');
-  if (btn) btn.style.display = 'none';
-}
-
-function uicClearVideo() { uicClearVideoSilent(); toast('Video background removed', true); }
-
-function uicApplyFont() {
-  const family = document.getElementById('uic-font-select').value;
-  const size   = document.getElementById('uic-font-size').value;
-  const valEl  = document.getElementById('uic-size-val');
-  if (valEl) valEl.textContent = size + 'px';
-  document.body.style.fontFamily = family ? (family + ',Segoe UI,system-ui,sans-serif') : '';
-  document.body.style.fontSize   = size ? size + 'px' : '';
-  uicSettings.fontFamily = family;
-  uicSettings.fontSize   = size;
-}
-
-function uicApplyRadius(r) {
-  document.documentElement.style.setProperty('--radius', r);
-  document.querySelectorAll('.uic-radius-opt').forEach(b => b.classList.toggle('active', b.dataset.r===r));
-  uicSettings.radius = r;
-}
-
-async function saveUiCustomize() {
-  const root = document.documentElement;
-  const vars  = ['--bg','--sidebar','--card','--blue','--text','--muted','--border','--green','--red','--amber'];
-  const colors = {};
-  vars.forEach(v => { const val = root.style.getPropertyValue(v); if (val) colors[v] = val; });
-  uicSettings.savedColors = colors;
-  uicSettings.preset      = uicCurrentPreset;
-  uicSettings.background  = uicCurrentBg;
-  uicSettings.radius      = root.style.getPropertyValue('--radius') || '12px';
-  uicSettings.fontFamily  = document.getElementById('uic-font-select')?.value || '';
-  uicSettings.fontSize    = document.getElementById('uic-font-size')?.value   || '14';
-  try {
-    const d = await api('/api/ui/settings', {method:'POST', body:JSON.stringify(uicSettings)});
-    if (d.ok) toast('✅ UI settings saved on server!', true);
-    else toast('❌ Save failed', false);
-  } catch(e) { toast('❌ Save failed', false); }
-}
-
-async function resetUiCustomize() {
-  if (!confirm('Reset all UI customizations to default?')) return;
-  // Delete server settings + background
-  try {
-    await api('/api/ui/settings', {method:'POST', body:JSON.stringify({})});
-    await fetch('/api/ui/background', {method:'DELETE', headers:{'X-Client-Token':getClientToken()}}).catch(()=>{});
-  } catch(e) {}
-  uicSettings = {}; uicCurrentPreset = 'default'; uicCurrentBg = 'none';
-  const root = document.documentElement;
-  ['--bg','--sidebar','--card','--blue','--blue-light','--blue-mid','--text','--muted','--border','--green','--red','--amber','--radius'].forEach(v=>root.style.removeProperty(v));
-  document.body.style.fontFamily = '';
-  document.body.style.fontSize   = '';
-  const bgLayer = document.getElementById('cpm-bg-layer');
-  if (bgLayer) bgLayer.style.cssText = 'position:fixed;inset:0;z-index:-2;pointer-events:none';
-  document.getElementById('cpm-bg-style').innerHTML = '';
-  const vid = document.getElementById('cpm-bg-video');
-  if (vid) { vid.style.display='none'; vid.src=''; }
-  uicRenderPage();
-  toast('↩ Reset to defaults', true);
-}
-
-async function initUiCustomize() {
-  try {
-    const d = await api('/api/ui/settings');
-    if (!d || !Object.keys(d).length) return;
-    uicSettings      = d;
-    uicCurrentPreset = d.preset || 'default';
-    uicCurrentBg     = d.background || 'none';
-    const root = document.documentElement;
-    // Apply saved color overrides
-    if (d.savedColors && Object.keys(d.savedColors).length) {
-      Object.entries(d.savedColors).forEach(([v, val]) => root.style.setProperty(v, val));
-    } else if (d.preset && UIC_PRESETS[d.preset]) {
-      const p = UIC_PRESETS[d.preset];
-      root.style.setProperty('--bg',         p.bg);
-      root.style.setProperty('--sidebar',    p.sidebar);
-      root.style.setProperty('--card',       p.card);
-      root.style.setProperty('--blue',       p.blue);
-      root.style.setProperty('--blue-light', uicHexAlpha(p.blue,0.12));
-      root.style.setProperty('--blue-mid',   uicHexAlpha(p.blue,0.30));
-      root.style.setProperty('--text',       p.text);
-      root.style.setProperty('--muted',      p.muted);
-      root.style.setProperty('--border',     p.border);
-      root.style.setProperty('--green',      p.green);
-      root.style.setProperty('--red',        p.red);
-      root.style.setProperty('--amber',      p.amber);
-    }
-    // Restore background from server URL
-    if (d.bg_url && d.bg_type === 'image') {
-      const bgLayer = document.getElementById('cpm-bg-layer');
-      if (bgLayer) bgLayer.style.cssText = `position:fixed;inset:0;z-index:-2;pointer-events:none;background-image:url('${d.bg_url}');background-size:cover;background-position:center`;
-      root.style.setProperty('--bg','transparent');
-    } else if (d.bg_url && d.bg_type === 'video') {
-      const vid = document.getElementById('cpm-bg-video');
-      if (vid) { vid.src = d.bg_url; vid.style.display = 'block'; vid.load(); vid.play().catch(()=>{}); }
-      const bgLayer = document.getElementById('cpm-bg-layer');
-      if (bgLayer) bgLayer.style.cssText = 'position:fixed;inset:0;z-index:-2;pointer-events:none';
-      root.style.setProperty('--bg','transparent');
-    }
-    // Apply radius, font
-    if (d.radius)     root.style.setProperty('--radius', d.radius);
-    if (d.fontFamily) document.body.style.fontFamily = d.fontFamily+',Segoe UI,system-ui,sans-serif';
-    if (d.fontSize)   document.body.style.fontSize   = d.fontSize+'px';
-  } catch(e) {}
-}
-
-// ── Logout / Switch Account ───────────────────────────────────────────────
-function logoutPanel() {
-  if (!confirm('Log out and return to the startup screen?')) return;
-  ['cpm_activation','cpm_owner_key','cpm_premium_key','cpm_premium_expires'].forEach(k => localStorage.removeItem(k));
-  location.reload();
-}
-
-// ── init & poll ───────────────────────────────────────────────────────────
-activationInit();
-initUiCustomize().then(() => uicRenderPage());
-checkKvmStatus();
-loadStats(); loadVps();
-pollTunnel();
-setInterval(loadStats, 5000);
-setInterval(loadVps, 10000);
-setInterval(checkKvmStatus, 30000);
-</script>
-</body>
-</html>
-
-HTMLEOF
-  ok "index.html written"
-fi
+    ok "index.html already present"
+  else
+    base64 -d > "$DIR/index.html" << 'B64HTMLEOF'
+  PCFET0NUWVBFIGh0bWw+PGh0bWwgbGFuZz0iZW4iPjxoZWFkPjxtZXRhIGNoYXJzZXQ9IlVURi04
+Ii8+PG1ldGEgbmFtZT0idmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCxpbml0
+aWFsLXNjYWxlPTEiLz48dGl0bGU+Q1BNIFBhbmVsIC0gS1ZNIFZQUyBNYW5hZ2VtZW50IFN5c3Rl
+bTwvdGl0bGU+PG1ldGEgbmFtZT0iZGVzY3JpcHRpb24iIGNvbnRlbnQ9Ik1vZGVybiBWUFMgbWFu
+YWdlbWVudCBwYW5lbCB3aXRoIEtWTSB2aXJ0dWFsaXphdGlvbiBzdXBwb3J0Ii8+PG1ldGEgbmFt
+ZT0ia2V5d29yZHMiIGNvbnRlbnQ9IlZQUyBwYW5lbCwgS1ZNIG1hbmFnZXIsIGNsb3VkIFZQUywg
+TGludXggVlBTIGNvbnRyb2wgcGFuZWwiLz48c3R5bGU+ICp7Ym94LXNpemluZzpib3JkZXItYm94
+O21hcmdpbjowO3BhZGRpbmc6MH06cm9vdHstLWJnOiNmMGY0Zjg7LS1zaWRlYmFyOiNmZmZmZmY7
+LS1jYXJkOiNmZmZmZmY7LS1ibHVlOiMyNTYzZWI7LS1ibHVlLWxpZ2h0OiNlZmY2ZmY7LS1ibHVl
+LW1pZDojYmZkYmZlOy0tdGV4dDojMGYxNzJhOy0tbXV0ZWQ6IzY0NzQ4YjstLWJvcmRlcjojZTJl
+OGYwOy0tZ3JlZW46IzE2YTM0YTstLXJlZDojZGMyNjI2Oy0tYW1iZXI6I2Q5NzcwNjstLWdyYXk6
+Izk0YTNiODstLXJhZGl1czoxMnB4Oy0tc2hhZG93OjAgMXB4IDNweCByZ2JhKDAsMCwwLC4wOCks
+MCAxcHggMnB4IHJnYmEoMCwwLDAsLjA0KX0gaHRtbCxib2R5e292ZXJmbG93LXg6aGlkZGVufSBi
+b2R5e2ZvbnQtZmFtaWx5OidTZWdvZSBVSScsc3lzdGVtLXVpLHNhbnMtc2VyaWY7YmFja2dyb3Vu
+ZDp2YXIoLS1iZyk7Y29sb3I6dmFyKC0tdGV4dCk7ZGlzcGxheTpmbGV4O21pbi1oZWlnaHQ6MTAw
+dmg7bWFyZ2luOjB9IGFzaWRle3dpZHRoOjIyMHB4O2JhY2tncm91bmQ6dmFyKC0tc2lkZWJhcik7
+Ym9yZGVyLXJpZ2h0OjFweCBzb2xpZCB2YXIoLS1ib3JkZXIpO2Rpc3BsYXk6ZmxleDtmbGV4LWRp
+cmVjdGlvbjpjb2x1bW47cGFkZGluZzowIDAgMTZweDtmbGV4LXNocmluazowO3Bvc2l0aW9uOnN0
+aWNreTt0b3A6MDtoZWlnaHQ6MTAwdmh9IC5icmFuZHtkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6
+Y2VudGVyO2dhcDoxMHB4O3BhZGRpbmc6MTRweCAxNnB4O2JvcmRlci1ib3R0b206MXB4IHNvbGlk
+IHZhcigtLWJvcmRlcil9IC5icmFuZC1sb2dve3dpZHRoOjQycHg7aGVpZ2h0OjQycHg7b2JqZWN0
+LWZpdDpjb250YWluO2ZsZXgtc2hyaW5rOjB9IC5icmFuZC1pY29ue3dpZHRoOjM2cHg7aGVpZ2h0
+OjM2cHg7YmFja2dyb3VuZDp2YXIoLS1ibHVlKTtib3JkZXItcmFkaXVzOjhweDtkaXNwbGF5OmZs
+ZXg7YWxpZ24taXRlbXM6Y2VudGVyO2p1c3RpZnktY29udGVudDpjZW50ZXI7Y29sb3I6I2ZmZjtm
+b250LXdlaWdodDo3MDA7Zm9udC1zaXplOjE1cHh9IC5icmFuZC1uYW1le2ZvbnQtd2VpZ2h0Ojcw
+MDtmb250LXNpemU6MTVweDtjb2xvcjp2YXIoLS10ZXh0KX0gLmt2bS1iYW5uZXJ7ZGlzcGxheTpu
+b25lO2JhY2tncm91bmQ6I2ZlZjNjNztib3JkZXI6MXB4IHNvbGlkICNmNTllMGI7Ym9yZGVyLXJh
+ZGl1czoxMHB4O3BhZGRpbmc6MTJweCAxOHB4O21hcmdpbi1ib3R0b206MjBweDtmb250LXNpemU6
+MTNweDtjb2xvcjojOTI0MDBlO2FsaWduLWl0ZW1zOmNlbnRlcjtnYXA6MTBweH0gLmt2bS1iYW5u
+ZXIuc2hvd3tkaXNwbGF5OmZsZXh9IC5rdm0tYmFubmVyIHN2Z3tmbGV4LXNocmluazowO2NvbG9y
+OiNkOTc3MDZ9IC5zc2gtb3ZlcmxheXtkaXNwbGF5Om5vbmU7cG9zaXRpb246Zml4ZWQ7aW5zZXQ6
+MDtiYWNrZ3JvdW5kOnJnYmEoMCwwLDAsLjYpO3otaW5kZXg6MjAwO2FsaWduLWl0ZW1zOmNlbnRl
+cjtqdXN0aWZ5LWNvbnRlbnQ6Y2VudGVyO3BhZGRpbmc6MTZweH0gLnNzaC1vdmVybGF5Lm9wZW57
+ZGlzcGxheTpmbGV4fSAuc3NoLXdpbmRvd3tiYWNrZ3JvdW5kOiNmZmY7Ym9yZGVyLXJhZGl1czox
+NnB4O3dpZHRoOm1pbig1ODBweCw5NnZ3KTtib3gtc2hhZG93OjAgMjRweCA3MHB4IHJnYmEoMCww
+LDAsLjI1KTtvdmVyZmxvdzpoaWRkZW59IC5zc2gtaGVhZGVye2JhY2tncm91bmQ6IzBmMTcyYTtw
+YWRkaW5nOjE0cHggMjBweDtkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2p1c3RpZnkt
+Y29udGVudDpzcGFjZS1iZXR3ZWVufSAuc3NoLXRpdGxle2NvbG9yOiNlMmU4ZjA7Zm9udC1zaXpl
+OjE0cHg7Zm9udC13ZWlnaHQ6NjAwO2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7Z2Fw
+OjhweH0gLnNzaC1jbG9zZXtiYWNrZ3JvdW5kOm5vbmU7Ym9yZGVyOm5vbmU7Y29sb3I6IzY0NzQ4
+YjtjdXJzb3I6cG9pbnRlcjtmb250LXNpemU6MjBweDtwYWRkaW5nOjAgNHB4O3RyYW5zaXRpb246
+LjE1c30gLnNzaC1jbG9zZTpob3Zlcntjb2xvcjojZjFmNWY5fSAuc3NoLWJvZHl7cGFkZGluZzoy
+NHB4fSAuc3NoLWxhYmVse2ZvbnQtc2l6ZToxMnB4O2ZvbnQtd2VpZ2h0OjYwMDtjb2xvcjp2YXIo
+LS1tdXRlZCk7dGV4dC10cmFuc2Zvcm06dXBwZXJjYXNlO2xldHRlci1zcGFjaW5nOi4wNWVtO21h
+cmdpbi1ib3R0b206OHB4fSAuc3NoLWJveHtiYWNrZ3JvdW5kOiMwZjE3MmE7Ym9yZGVyLXJhZGl1
+czo4cHg7cGFkZGluZzoxNHB4IDE2cHg7Zm9udC1mYW1pbHk6J0Nhc2NhZGlhIENvZGUnLCdGaXJh
+IENvZGUnLG1vbm9zcGFjZTtmb250LXNpemU6MTNweDtjb2xvcjojNjBhNWZhO3dvcmQtYnJlYWs6
+YnJlYWstYWxsO3Bvc2l0aW9uOnJlbGF0aXZlO21hcmdpbi1ib3R0b206MTZweH0gLmNvcHktYnRu
+e3Bvc2l0aW9uOmFic29sdXRlO3RvcDo4cHg7cmlnaHQ6OHB4O2JhY2tncm91bmQ6IzFlMjkzYjti
+b3JkZXI6bm9uZTtjb2xvcjojOTRhM2I4O2ZvbnQtc2l6ZToxMXB4O2ZvbnQtd2VpZ2h0OjYwMDtw
+YWRkaW5nOjRweCAxMHB4O2JvcmRlci1yYWRpdXM6NnB4O2N1cnNvcjpwb2ludGVyO3RyYW5zaXRp
+b246LjE1c30gLmNvcHktYnRuOmhvdmVye2JhY2tncm91bmQ6IzMzNDE1NTtjb2xvcjojZTJlOGYw
+fSAuc3NoLW5vdGV7Zm9udC1zaXplOjEycHg7Y29sb3I6dmFyKC0tbXV0ZWQpO2xpbmUtaGVpZ2h0
+OjEuNjtiYWNrZ3JvdW5kOnZhcigtLWJsdWUtbGlnaHQpO2JvcmRlci1yYWRpdXM6OHB4O3BhZGRp
+bmc6MTBweCAxNHB4fSAuc3NoLWxvYWRpbmd7dGV4dC1hbGlnbjpjZW50ZXI7cGFkZGluZzozMnB4
+O2NvbG9yOnZhcigtLW11dGVkKTtmb250LXNpemU6MTRweH0gLmJ0bi1zc2h7YmFja2dyb3VuZDoj
+MGYxNzJhO2NvbG9yOiM2MGE1ZmF9LmJ0bi1zc2g6aG92ZXI6bm90KDpkaXNhYmxlZCl7YmFja2dy
+b3VuZDojMWUyOTNifSAucWEtc3Noe2JhY2tncm91bmQ6IzBmMTcyYTtjb2xvcjojNjBhNWZhfS5x
+YS1zc2g6aG92ZXI6bm90KDpkaXNhYmxlZCl7YmFja2dyb3VuZDojMWUyOTNifSBuYXZ7cGFkZGlu
+ZzoxMnB4IDEwcHg7ZmxleDoxfSBuYXYgYXtkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVy
+O2dhcDoxMHB4O3BhZGRpbmc6OXB4IDEycHg7Ym9yZGVyLXJhZGl1czo4cHg7dGV4dC1kZWNvcmF0
+aW9uOm5vbmU7Y29sb3I6dmFyKC0tbXV0ZWQpO2ZvbnQtc2l6ZToxNHB4O2ZvbnQtd2VpZ2h0OjUw
+MDt0cmFuc2l0aW9uOi4xNXM7Y3Vyc29yOnBvaW50ZXI7Ym9yZGVyOm5vbmU7YmFja2dyb3VuZDpu
+b25lO3dpZHRoOjEwMCU7dGV4dC1hbGlnbjpsZWZ0fSBuYXYgYTpob3ZlcntiYWNrZ3JvdW5kOnZh
+cigtLWJsdWUtbGlnaHQpO2NvbG9yOnZhcigtLWJsdWUpfSBuYXYgYS5hY3RpdmV7YmFja2dyb3Vu
+ZDp2YXIoLS1ibHVlKTtjb2xvcjojZmZmfSBuYXYgYSBzdmd7ZmxleC1zaHJpbms6MH0gLnNpZGVi
+YXItZm9vdGVye3BhZGRpbmc6MTJweCAxNnB4O2JvcmRlci10b3A6MXB4IHNvbGlkIHZhcigtLWJv
+cmRlcil9IC5zdGF0dXMtZG90e3dpZHRoOjhweDtoZWlnaHQ6OHB4O2JvcmRlci1yYWRpdXM6NTAl
+O2JhY2tncm91bmQ6dmFyKC0tZ3JlZW4pO2Rpc3BsYXk6aW5saW5lLWJsb2NrO21hcmdpbi1yaWdo
+dDo2cHh9IC5zdGF0dXMtbGFiZWx7Zm9udC1zaXplOjEycHg7Y29sb3I6dmFyKC0tbXV0ZWQpfSAu
+dmVyc2lvbntmb250LXNpemU6MTFweDtjb2xvcjp2YXIoLS1ncmF5KTttYXJnaW4tdG9wOjRweH0g
+LnRvcGJhcntiYWNrZ3JvdW5kOnZhcigtLWNhcmQpO2JvcmRlci1ib3R0b206MXB4IHNvbGlkIHZh
+cigtLWJvcmRlcik7cGFkZGluZzowIDI4cHg7aGVpZ2h0OjUycHg7ZGlzcGxheTpmbGV4O2FsaWdu
+LWl0ZW1zOmNlbnRlcjtnYXA6OHB4O3Bvc2l0aW9uOnN0aWNreTt0b3A6MDt6LWluZGV4OjEwfSAu
+dG9wYmFyLWljb257Y29sb3I6dmFyKC0tYmx1ZSk7ZGlzcGxheTpmbGV4fSAudG9wYmFyLXRleHR7
+Zm9udC1zaXplOjEzcHg7Y29sb3I6dmFyKC0tbXV0ZWQpfSAubWFpbntmbGV4OjE7ZGlzcGxheTpm
+bGV4O2ZsZXgtZGlyZWN0aW9uOmNvbHVtbjttaW4td2lkdGg6MH0gLmNvbnRlbnR7cGFkZGluZzoy
+OHB4O2ZsZXg6MX0gLnBhZ2V7ZGlzcGxheTpub25lfS5wYWdlLmFjdGl2ZXtkaXNwbGF5OmJsb2Nr
+fSBoMXtmb250LXNpemU6MjZweDtmb250LXdlaWdodDo3MDA7bGV0dGVyLXNwYWNpbmc6LS41cHh9
+IC5zdWJ0aXRsZXtjb2xvcjp2YXIoLS1tdXRlZCk7Zm9udC1zaXplOjE0cHg7bWFyZ2luLXRvcDo0
+cHg7bWFyZ2luLWJvdHRvbToyNHB4fSAuY2FyZHtiYWNrZ3JvdW5kOnZhcigtLWNhcmQpO2JvcmRl
+cjoxcHggc29saWQgdmFyKC0tYm9yZGVyKTtib3JkZXItcmFkaXVzOnZhcigtLXJhZGl1cyk7Ym94
+LXNoYWRvdzp2YXIoLS1zaGFkb3cpfSAuY2FyZC1oZWFkZXJ7cGFkZGluZzoxOHB4IDIwcHggMTBw
+eDtib3JkZXItYm90dG9tOjFweCBzb2xpZCB2YXIoLS1ib3JkZXIpfSAuY2FyZC10aXRsZXtmb250
+LXNpemU6MTVweDtmb250LXdlaWdodDo2MDA7ZGlzcGxheTpmbGV4O2FsaWduLWl0ZW1zOmNlbnRl
+cjtnYXA6OHB4fSAuY2FyZC10aXRsZSBzdmd7Y29sb3I6dmFyKC0tYmx1ZSl9IC5jYXJkLWRlc2N7
+Zm9udC1zaXplOjEycHg7Y29sb3I6dmFyKC0tbXV0ZWQpO21hcmdpbi10b3A6M3B4fSAuY2FyZC1i
+b2R5e3BhZGRpbmc6MjBweH0gLmdyaWQtMntkaXNwbGF5OmdyaWQ7Z3JpZC10ZW1wbGF0ZS1jb2x1
+bW5zOjFmciAxZnI7Z2FwOjIwcHh9IC5ncmlkLTN7ZGlzcGxheTpncmlkO2dyaWQtdGVtcGxhdGUt
+Y29sdW1uczpyZXBlYXQoMywxZnIpO2dhcDoyMHB4fSAubWV0ZXItd3JhcHtkaXNwbGF5OmZsZXg7
+anVzdGlmeS1jb250ZW50OmNlbnRlcjthbGlnbi1pdGVtczpjZW50ZXI7cGFkZGluZzo4cHggMH0g
+LnN0YXQtbGFiZWx7Zm9udC1zaXplOjEycHg7Y29sb3I6dmFyKC0tbXV0ZWQpO2ZvbnQtd2VpZ2h0
+OjUwMDtkaXNwbGF5OmZsZXg7anVzdGlmeS1jb250ZW50OnNwYWNlLWJldHdlZW47YWxpZ24taXRl
+bXM6Y2VudGVyfSAuc3RhdC12YWx1ZXtmb250LXNpemU6MjZweDtmb250LXdlaWdodDo3MDA7bWFy
+Z2luLXRvcDo2cHh9IC5zdGF0LXN1Yntmb250LXNpemU6MTJweDtjb2xvcjp2YXIoLS1tdXRlZCk7
+bWFyZ2luLXRvcDozcHh9IC52bS1zdW1tYXJ5e2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50
+ZXI7anVzdGlmeS1jb250ZW50OnNwYWNlLWJldHdlZW47cGFkZGluZzoxNnB4IDIwcHg7YmFja2dy
+b3VuZDp2YXIoLS1ibHVlLWxpZ2h0KTtib3JkZXItcmFkaXVzOjEwcHg7bWFyZ2luLXRvcDo0cHh9
+IC52bS10b3RhbHtmb250LXNpemU6MzRweDtmb250LXdlaWdodDo3MDB9IC52bS1jb3VudHN7ZGlz
+cGxheTpmbGV4O2dhcDoyNHB4fSAudm0tY291bnR7dGV4dC1hbGlnbjpjZW50ZXJ9IC52bS1jb3Vu
+dC1udW17Zm9udC1zaXplOjIycHg7Zm9udC13ZWlnaHQ6NzAwfSAudm0tY291bnQtbGFiZWx7Zm9u
+dC1zaXplOjExcHg7Y29sb3I6dmFyKC0tbXV0ZWQpO3RleHQtdHJhbnNmb3JtOnVwcGVyY2FzZTts
+ZXR0ZXItc3BhY2luZzouMDVlbTttYXJnaW4tdG9wOjJweH0gLnR3by1wYW5lbHtkaXNwbGF5Omdy
+aWQ7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjFmciBtaW5tYXgoMCwzODBweCk7Z2FwOjIwcHg7YWxp
+Z24taXRlbXM6c3RhcnR9IC52cHMtbGlzdHtsaXN0LXN0eWxlOm5vbmV9IC52cHMtaXRlbXtkaXNw
+bGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2p1c3RpZnktY29udGVudDpzcGFjZS1iZXR3ZWVu
+O3BhZGRpbmc6MTRweCAxNnB4O2JvcmRlci1yYWRpdXM6MTBweDtjdXJzb3I6cG9pbnRlcjt0cmFu
+c2l0aW9uOi4xNXM7Ym9yZGVyOjJweCBzb2xpZCB0cmFuc3BhcmVudDttYXJnaW4tYm90dG9tOjhw
+eH0gLnZwcy1pdGVtOmhvdmVye2JhY2tncm91bmQ6dmFyKC0tYmx1ZS1saWdodCl9IC52cHMtaXRl
+bS5zZWxlY3RlZHtib3JkZXItY29sb3I6dmFyKC0tYmx1ZSk7YmFja2dyb3VuZDp2YXIoLS1ibHVl
+LWxpZ2h0KX0gLnZwcy1pbmZve2Rpc3BsYXk6ZmxleDtmbGV4LWRpcmVjdGlvbjpjb2x1bW47Z2Fw
+OjNweH0gLnZwcy1uYW1le2ZvbnQtd2VpZ2h0OjYwMDtmb250LXNpemU6MTRweH0gLnZwcy1tZXRh
+e2ZvbnQtc2l6ZToxMnB4O2NvbG9yOnZhcigtLW11dGVkKTtkaXNwbGF5OmZsZXg7Z2FwOjEwcHh9
+IC5iYWRnZXtkaXNwbGF5OmlubGluZS1mbGV4O2FsaWduLWl0ZW1zOmNlbnRlcjtwYWRkaW5nOjNw
+eCAxMHB4O2JvcmRlci1yYWRpdXM6MjBweDtmb250LXNpemU6MTJweDtmb250LXdlaWdodDo2MDB9
+IC5iYWRnZS1ydW5uaW5ne2JhY2tncm91bmQ6I2RjZmNlNztjb2xvcjojMTY2NTM0fSAuYmFkZ2Ut
+c3RvcHBlZHtiYWNrZ3JvdW5kOiNmZWUyZTI7Y29sb3I6Izk5MWIxYn0gLmJhZGdlLXBhdXNlZCB7
+YmFja2dyb3VuZDojZmVmOWMzO2NvbG9yOiM4NTRkMGV9IC5iYWRnZS11bmtub3due2JhY2tncm91
+bmQ6I2YxZjVmOTtjb2xvcjojNjQ3NDhifSAubm8tc2VsZWN0aW9ue2Rpc3BsYXk6ZmxleDtmbGV4
+LWRpcmVjdGlvbjpjb2x1bW47YWxpZ24taXRlbXM6Y2VudGVyO2p1c3RpZnktY29udGVudDpjZW50
+ZXI7cGFkZGluZzo0OHB4IDIwcHg7Y29sb3I6dmFyKC0tbXV0ZWQpO3RleHQtYWxpZ246Y2VudGVy
+O2dhcDoxMnB4fSAubm8tc2VsZWN0aW9uIHN2Z3tvcGFjaXR5Oi4zfSAuYWN0aW9uLWJ0bnN7ZGlz
+cGxheTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnIgMWZyO2dhcDoxMHB4O21hcmdpbi10
+b3A6MTZweH0gLmJ0bntwYWRkaW5nOjEwcHggMTZweDtib3JkZXItcmFkaXVzOjhweDtmb250LXNp
+emU6MTNweDtmb250LXdlaWdodDo2MDA7Ym9yZGVyOm5vbmU7Y3Vyc29yOnBvaW50ZXI7dHJhbnNp
+dGlvbjouMTVzO2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7anVzdGlmeS1jb250ZW50
+OmNlbnRlcjtnYXA6NnB4fSAuYnRuOmRpc2FibGVke29wYWNpdHk6LjQ1O2N1cnNvcjpub3QtYWxs
+b3dlZH0gLmJ0bi1zdGFydCB7YmFja2dyb3VuZDojZGNmY2U3O2NvbG9yOiMxNjY1MzR9LmJ0bi1z
+dGFydDpob3Zlcjpub3QoOmRpc2FibGVkKSB7YmFja2dyb3VuZDojYmJmN2QwfSAuYnRuLXN0b3Ag
+e2JhY2tncm91bmQ6I2ZlZTJlMjtjb2xvcjojOTkxYjFifS5idG4tc3RvcDpob3Zlcjpub3QoOmRp
+c2FibGVkKSB7YmFja2dyb3VuZDojZmVjYWNhfSAuYnRuLXJlc3RhcnR7YmFja2dyb3VuZDojZmVm
+OWMzO2NvbG9yOiM4NTRkMGV9LmJ0bi1yZXN0YXJ0OmhvdmVyOm5vdCg6ZGlzYWJsZWQpe2JhY2tn
+cm91bmQ6I2ZlZjA4YX0gLmJ0bi1kZWxldGUge2JhY2tncm91bmQ6I2ZlZTJlMjtjb2xvcjojOTkx
+YjFifS5idG4tZGVsZXRlOmhvdmVyOm5vdCg6ZGlzYWJsZWQpIHtiYWNrZ3JvdW5kOiNmZWNhY2F9
+IC5idG4tcHJpbWFyeXtiYWNrZ3JvdW5kOnZhcigtLWJsdWUpO2NvbG9yOiNmZmY7Z3JpZC1jb2x1
+bW46MS8tMX0uYnRuLXByaW1hcnk6aG92ZXI6bm90KDpkaXNhYmxlZCl7YmFja2dyb3VuZDojMWQ0
+ZWQ4fSAuc2VsZWN0ZWQtbmFtZXtmb250LXNpemU6MTVweDtmb250LXdlaWdodDo3MDA7cGFkZGlu
+Zy1ib3R0b206MTJweDtib3JkZXItYm90dG9tOjFweCBzb2xpZCB2YXIoLS1ib3JkZXIpO21hcmdp
+bi1ib3R0b206MTJweDtkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2dhcDo4cHh9IC5m
+b3JtLWdyaWR7ZGlzcGxheTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnIgMWZyO2dhcDox
+NnB4fSAuZm9ybS1maWVsZHtkaXNwbGF5OmZsZXg7ZmxleC1kaXJlY3Rpb246Y29sdW1uO2dhcDo2
+cHh9IC5mb3JtLWZpZWxkLmZ1bGx7Z3JpZC1jb2x1bW46MS8tMX0gbGFiZWx7Zm9udC1zaXplOjEz
+cHg7Zm9udC13ZWlnaHQ6NTAwO2NvbG9yOnZhcigtLW11dGVkKX0gaW5wdXR7cGFkZGluZzo5cHgg
+MTJweDtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWJvcmRlcik7Ym9yZGVyLXJhZGl1czo4cHg7Zm9u
+dC1zaXplOjE0cHg7b3V0bGluZTpub25lO3RyYW5zaXRpb246LjE1cztiYWNrZ3JvdW5kOiNmZmZ9
+IGlucHV0OmZvY3Vze2JvcmRlci1jb2xvcjp2YXIoLS1ibHVlKTtib3gtc2hhZG93OjAgMCAwIDNw
+eCByZ2JhKDM3LDk5LDIzNSwuMSl9IC5oaW50e2ZvbnQtc2l6ZToxMXB4O2NvbG9yOnZhcigtLWdy
+YXkpfSAjdG9hc3Qtd3JhcHtwb3NpdGlvbjpmaXhlZDtib3R0b206MjRweDtyaWdodDoyNHB4O2Rp
+c3BsYXk6ZmxleDtmbGV4LWRpcmVjdGlvbjpjb2x1bW47Z2FwOjhweDt6LWluZGV4Ojk5OTl9IC50
+b2FzdHtwYWRkaW5nOjEycHggMThweDtib3JkZXItcmFkaXVzOjEwcHg7Zm9udC1zaXplOjEzcHg7
+Zm9udC13ZWlnaHQ6NTAwO2JveC1zaGFkb3c6MCA0cHggMTJweCByZ2JhKDAsMCwwLC4xNSk7YW5p
+bWF0aW9uOnNsaWRlLWluIC4yNXMgZWFzZTttYXgtd2lkdGg6MzIwcHh9IC50b2FzdC1vayB7YmFj
+a2dyb3VuZDojMTY2NTM0O2NvbG9yOiNmZmZ9IC50b2FzdC1lcnIge2JhY2tncm91bmQ6Izk5MWIx
+Yjtjb2xvcjojZmZmfSBAa2V5ZnJhbWVzIHNsaWRlLWlue2Zyb217dHJhbnNmb3JtOnRyYW5zbGF0
+ZVgoMTAwJSk7b3BhY2l0eTowfXRve3RyYW5zZm9ybTpub25lO29wYWNpdHk6MX19IC5vdmVybGF5
+e2Rpc3BsYXk6bm9uZTtwb3NpdGlvbjpmaXhlZDtpbnNldDowO2JhY2tncm91bmQ6cmdiYSgwLDAs
+MCwuNCk7ei1pbmRleDoxMDA7YWxpZ24taXRlbXM6Y2VudGVyO2p1c3RpZnktY29udGVudDpjZW50
+ZXJ9IC5vdmVybGF5Lm9wZW57ZGlzcGxheTpmbGV4fSAubW9kYWx7YmFja2dyb3VuZDojZmZmO2Jv
+cmRlci1yYWRpdXM6MTZweDtwYWRkaW5nOjI4cHg7d2lkdGg6MzgwcHg7Ym94LXNoYWRvdzowIDIw
+cHggNjBweCByZ2JhKDAsMCwwLC4yKX0gLm1vZGFsIGgze2ZvbnQtc2l6ZToxOHB4O2ZvbnQtd2Vp
+Z2h0OjcwMDttYXJnaW4tYm90dG9tOjhweH0gLm1vZGFsIHB7Y29sb3I6dmFyKC0tbXV0ZWQpO2Zv
+bnQtc2l6ZToxNHB4O21hcmdpbi1ib3R0b206MjBweH0gLm1vZGFsLWJ0bnN7ZGlzcGxheTpmbGV4
+O2dhcDoxMHB4O2p1c3RpZnktY29udGVudDpmbGV4LWVuZH0gLmJ0bi1jYW5jZWx7cGFkZGluZzo5
+cHggMThweDtib3JkZXItcmFkaXVzOjhweDtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWJvcmRlcik7
+YmFja2dyb3VuZDojZmZmO2N1cnNvcjpwb2ludGVyO2ZvbnQtc2l6ZToxM3B4O2ZvbnQtd2VpZ2h0
+OjYwMH0gLmJ0bi1jb25maXJte3BhZGRpbmc6OXB4IDE4cHg7Ym9yZGVyLXJhZGl1czo4cHg7Ym9y
+ZGVyOm5vbmU7YmFja2dyb3VuZDojZGMyNjI2O2NvbG9yOiNmZmY7Y3Vyc29yOnBvaW50ZXI7Zm9u
+dC1zaXplOjEzcHg7Zm9udC13ZWlnaHQ6NjAwfSAubW9iLW5hdntkaXNwbGF5Om5vbmU7cG9zaXRp
+b246Zml4ZWQ7Ym90dG9tOjA7bGVmdDowO3JpZ2h0OjA7YmFja2dyb3VuZDojZmZmO2JvcmRlci10
+b3A6MXB4IHNvbGlkIHZhcigtLWJvcmRlcik7ei1pbmRleDo1MDtwYWRkaW5nOjZweCAwIGVudihz
+YWZlLWFyZWEtaW5zZXQtYm90dG9tLDZweCl9IC5tb2ItbmF2LWlubmVye2Rpc3BsYXk6ZmxleDtq
+dXN0aWZ5LWNvbnRlbnQ6c3BhY2UtYXJvdW5kfSAubW9iLW5hdiBhe2Rpc3BsYXk6ZmxleDtmbGV4
+LWRpcmVjdGlvbjpjb2x1bW47YWxpZ24taXRlbXM6Y2VudGVyO2dhcDozcHg7cGFkZGluZzo2cHgg
+MTJweDtib3JkZXItcmFkaXVzOjhweDt0ZXh0LWRlY29yYXRpb246bm9uZTtjb2xvcjp2YXIoLS1t
+dXRlZCk7Zm9udC1zaXplOjEwcHg7Zm9udC13ZWlnaHQ6NTAwO2JvcmRlcjpub25lO2JhY2tncm91
+bmQ6bm9uZTtjdXJzb3I6cG9pbnRlcjttaW4td2lkdGg6NjBweH0gLm1vYi1uYXYgYS5hY3RpdmV7
+Y29sb3I6dmFyKC0tYmx1ZSl9IC5tb2ItbmF2IGEgc3Zne2ZsZXgtc2hyaW5rOjB9IC5kYXNoLWJv
+dHRvbXtkaXNwbGF5OmdyaWQ7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOjFmciAzMjBweDtnYXA6MjBw
+eDttYXJnaW4tdG9wOjIwcHh9IC5kYXNoLXZwcy1saXN0e2xpc3Qtc3R5bGU6bm9uZTttYXgtaGVp
+Z2h0OjI4MHB4O292ZXJmbG93LXk6YXV0b30gLmRhc2gtdnBzLWl0ZW17ZGlzcGxheTpmbGV4O2Fs
+aWduLWl0ZW1zOmNlbnRlcjtqdXN0aWZ5LWNvbnRlbnQ6c3BhY2UtYmV0d2VlbjtwYWRkaW5nOjEw
+cHggMTJweDtib3JkZXItcmFkaXVzOjhweDtjdXJzb3I6cG9pbnRlcjt0cmFuc2l0aW9uOi4xNXM7
+Ym9yZGVyOjJweCBzb2xpZCB0cmFuc3BhcmVudDttYXJnaW4tYm90dG9tOjZweH0gLmRhc2gtdnBz
+LWl0ZW06aG92ZXJ7YmFja2dyb3VuZDp2YXIoLS1ibHVlLWxpZ2h0KX0gLmRhc2gtdnBzLWl0ZW0u
+c2VsZWN0ZWR7Ym9yZGVyLWNvbG9yOnZhcigtLWJsdWUpO2JhY2tncm91bmQ6dmFyKC0tYmx1ZS1s
+aWdodCl9IC5xYS1idG5ze2Rpc3BsYXk6ZmxleDtmbGV4LWRpcmVjdGlvbjpjb2x1bW47Z2FwOjEw
+cHg7bWFyZ2luLXRvcDoxMnB4fSAucWEtYnRue3BhZGRpbmc6MTJweCAxNnB4O2JvcmRlci1yYWRp
+dXM6OHB4O2ZvbnQtc2l6ZToxNHB4O2ZvbnQtd2VpZ2h0OjYwMDtib3JkZXI6bm9uZTtjdXJzb3I6
+cG9pbnRlcjt0cmFuc2l0aW9uOi4xNXM7ZGlzcGxheTpmbGV4O2FsaWduLWl0ZW1zOmNlbnRlcjtn
+YXA6OHB4fSAucWEtYnRuOmRpc2FibGVke29wYWNpdHk6LjQ7Y3Vyc29yOm5vdC1hbGxvd2VkfSAu
+cWEtc3RhcnQge2JhY2tncm91bmQ6I2RjZmNlNztjb2xvcjojMTY2NTM0fS5xYS1zdGFydDpob3Zl
+cjpub3QoOmRpc2FibGVkKSB7YmFja2dyb3VuZDojYmJmN2QwfSAucWEtc3RvcCB7YmFja2dyb3Vu
+ZDojZmVlMmUyO2NvbG9yOiM5OTFiMWJ9LnFhLXN0b3A6aG92ZXI6bm90KDpkaXNhYmxlZCkge2Jh
+Y2tncm91bmQ6I2ZlY2FjYX0gLnFhLXJlc3RhcnR7YmFja2dyb3VuZDojZmVmOWMzO2NvbG9yOiM4
+NTRkMGV9LnFhLXJlc3RhcnQ6aG92ZXI6bm90KDpkaXNhYmxlZCl7YmFja2dyb3VuZDojZmVmMDhh
+fSAucWEtbm9uZXtjb2xvcjp2YXIoLS1tdXRlZCk7Zm9udC1zaXplOjEzcHg7cGFkZGluZzoyNHB4
+IDA7dGV4dC1hbGlnbjpjZW50ZXJ9IC5oYW1idXJnZXJ7ZGlzcGxheTpub25lO2JhY2tncm91bmQ6
+bm9uZTtib3JkZXI6bm9uZTtjdXJzb3I6cG9pbnRlcjtwYWRkaW5nOjZweCA4cHg7Ym9yZGVyLXJh
+ZGl1czo2cHg7Y29sb3I6dmFyKC0tdGV4dCk7ZmxleC1zaHJpbms6MH0gLmhhbWJ1cmdlcjpob3Zl
+cntiYWNrZ3JvdW5kOnZhcigtLWJsdWUtbGlnaHQpfSAuaGFtYnVyZ2VyIHN2Z3tkaXNwbGF5OmJs
+b2NrfSAuc2lkZWJhci1vdmVybGF5e2Rpc3BsYXk6bm9uZTtwb3NpdGlvbjpmaXhlZDtpbnNldDow
+O2JhY2tncm91bmQ6cmdiYSgwLDAsMCwuNCk7ei1pbmRleDo0MH0gLnNpZGViYXItb3ZlcmxheS5v
+cGVue2Rpc3BsYXk6YmxvY2t9IC50dW5uZWwtYmFubmVye2Rpc3BsYXk6bm9uZTtiYWNrZ3JvdW5k
+OiMwZjE3MmE7Y29sb3I6IzYwYTVmYTtmb250LXNpemU6MTJweDtmb250LWZhbWlseTptb25vc3Bh
+Y2U7cGFkZGluZzo3cHggMTZweDthbGlnbi1pdGVtczpjZW50ZXI7Z2FwOjEwcHg7Ym9yZGVyLWJv
+dHRvbToxcHggc29saWQgIzFlM2E1ZjtmbGV4LXdyYXA6d3JhcH0gLnR1bm5lbC1iYW5uZXIuc2hv
+d3tkaXNwbGF5OmZsZXh9IC50dW5uZWwtdXJse2ZsZXg6MTt3b3JkLWJyZWFrOmJyZWFrLWFsbDts
+ZXR0ZXItc3BhY2luZzouMDNlbX0gLnR1bm5lbC1jb3B5e2JhY2tncm91bmQ6IzFlMjkzYjtib3Jk
+ZXI6bm9uZTtjb2xvcjojOTRhM2I4O2ZvbnQtc2l6ZToxMXB4O2ZvbnQtd2VpZ2h0OjYwMDtwYWRk
+aW5nOjRweCAxMHB4O2JvcmRlci1yYWRpdXM6NnB4O2N1cnNvcjpwb2ludGVyO3doaXRlLXNwYWNl
+Om5vd3JhcDtmbGV4LXNocmluazowfSAudHVubmVsLWNvcHk6aG92ZXJ7YmFja2dyb3VuZDojMzM0
+MTU1O2NvbG9yOiNlMmU4ZjB9IEBtZWRpYShtYXgtd2lkdGg6OTAwcHgpe2FzaWRle2Rpc3BsYXk6
+bm9uZTtwb3NpdGlvbjpmaXhlZDt0b3A6MDtsZWZ0OjA7Ym90dG9tOjA7d2lkdGg6MjYwcHg7ei1p
+bmRleDo1MDtib3gtc2hhZG93OjRweCAwIDI0cHggcmdiYSgwLDAsMCwuMTgpO292ZXJmbG93LXk6
+YXV0b30gYXNpZGUub3BlbntkaXNwbGF5OmZsZXggIWltcG9ydGFudH0gLm1vYi1uYXZ7ZGlzcGxh
+eTpub25lfSAubWFpbntwYWRkaW5nLWJvdHRvbTowfSAuY29udGVudHtwYWRkaW5nOjE2cHh9IC5n
+cmlkLTIsLmdyaWQtMywudHdvLXBhbmVsLC5kYXNoLWJvdHRvbXtncmlkLXRlbXBsYXRlLWNvbHVt
+bnM6MWZyfSAuZm9ybS1ncmlke2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnJ9IGgxe2ZvbnQtc2l6
+ZToyMHB4fSAudG9wYmFye3BhZGRpbmc6MCAxNnB4fSAuY2FyZC1ib2R5e3BhZGRpbmc6MTRweH0g
+LmhhbWJ1cmdlcntkaXNwbGF5OmlubGluZS1mbGV4ICFpbXBvcnRhbnQ7YWxpZ24taXRlbXM6Y2Vu
+dGVyO2p1c3RpZnktY29udGVudDpjZW50ZXJ9IH0gLmFjdC1vdmVybGF5e3Bvc2l0aW9uOmZpeGVk
+O2luc2V0OjA7YmFja2dyb3VuZDpsaW5lYXItZ3JhZGllbnQoMTM1ZGVnLCMwZjE3MmEgMCUsIzFl
+MjkzYiA1MCUsIzBmMTcyYSAxMDAlKTt6LWluZGV4Ojk5OTk7ZGlzcGxheTpmbGV4O2FsaWduLWl0
+ZW1zOmNlbnRlcjtqdXN0aWZ5LWNvbnRlbnQ6Y2VudGVyO3BhZGRpbmc6MTZweH0gLmFjdC1vdmVy
+bGF5LmhpZGRlbntkaXNwbGF5Om5vbmV9IC5hY3QtY2FyZHtiYWNrZ3JvdW5kOiMxZTI5M2I7Ym9y
+ZGVyOjFweCBzb2xpZCAjMzM0MTU1O2JvcmRlci1yYWRpdXM6MjBweDtwYWRkaW5nOjQwcHggMzZw
+eDt3aWR0aDptaW4oNDQwcHgsMTAwJSk7Ym94LXNoYWRvdzowIDMwcHggODBweCByZ2JhKDAsMCww
+LC42KTt0ZXh0LWFsaWduOmNlbnRlcn0gLmFjdC1sb2dve3dpZHRoOjcycHg7aGVpZ2h0OjcycHg7
+Ym9yZGVyLXJhZGl1czoxNnB4O21hcmdpbjowIGF1dG8gMjBweDtkaXNwbGF5OmZsZXg7YWxpZ24t
+aXRlbXM6Y2VudGVyO2p1c3RpZnktY29udGVudDpjZW50ZXJ9IC5hY3QtbG9nbyBpbWd7d2lkdGg6
+NzJweDtoZWlnaHQ6NzJweDtvYmplY3QtZml0OmNvbnRhaW47Ym9yZGVyLXJhZGl1czoxNnB4fSAu
+YWN0LWxvZ28tZmFsbGJhY2t7d2lkdGg6NzJweDtoZWlnaHQ6NzJweDtiYWNrZ3JvdW5kOmxpbmVh
+ci1ncmFkaWVudCgxMzVkZWcsIzI1NjNlYiwjM2I4MmY2KTtib3JkZXItcmFkaXVzOjE2cHg7ZGlz
+cGxheTpmbGV4O2FsaWduLWl0ZW1zOmNlbnRlcjtqdXN0aWZ5LWNvbnRlbnQ6Y2VudGVyO2NvbG9y
+OiNmZmY7Zm9udC13ZWlnaHQ6ODAwO2ZvbnQtc2l6ZToyOHB4fSAuYWN0LXRpdGxle2ZvbnQtc2l6
+ZToyMnB4O2ZvbnQtd2VpZ2h0OjcwMDtjb2xvcjojZjFmNWY5O21hcmdpbi1ib3R0b206NnB4fSAu
+YWN0LXN1Yntmb250LXNpemU6MTNweDtjb2xvcjojNjQ3NDhiO21hcmdpbi1ib3R0b206MjhweDts
+aW5lLWhlaWdodDoxLjV9IC5hY3QtaW5wdXR7d2lkdGg6MTAwJTtiYWNrZ3JvdW5kOiMwZjE3MmE7
+Ym9yZGVyOjEuNXB4IHNvbGlkICMzMzQxNTU7Ym9yZGVyLXJhZGl1czoxMHB4O3BhZGRpbmc6MTNw
+eCAxNnB4O2ZvbnQtc2l6ZToxNHB4O2NvbG9yOiNlMmU4ZjA7Zm9udC1mYW1pbHk6J0Nhc2NhZGlh
+IENvZGUnLCdGaXJhIENvZGUnLG1vbm9zcGFjZTtsZXR0ZXItc3BhY2luZzouMDhlbTtvdXRsaW5l
+Om5vbmU7dHJhbnNpdGlvbjouMnM7bWFyZ2luLWJvdHRvbTo2cHh9IC5hY3QtaW5wdXQ6Zm9jdXN7
+Ym9yZGVyLWNvbG9yOiMyNTYzZWI7Ym94LXNoYWRvdzowIDAgMCAzcHggcmdiYSgzNyw5OSwyMzUs
+LjI1KX0gLmFjdC1pbnB1dC5lcnJvcntib3JkZXItY29sb3I6I2RjMjYyNjtib3gtc2hhZG93OjAg
+MCAwIDNweCByZ2JhKDIyMCwzOCwzOCwuMil9IC5hY3QtaW5wdXQuc3VjY2Vzc3tib3JkZXItY29s
+b3I6IzE2YTM0YTtib3gtc2hhZG93OjAgMCAwIDNweCByZ2JhKDIyLDE2Myw3NCwuMil9IC5hY3Qt
+ZXJye2ZvbnQtc2l6ZToxMnB4O2NvbG9yOiNkYzI2MjY7bWFyZ2luLWJvdHRvbToxNnB4O21pbi1o
+ZWlnaHQ6MThweDt0ZXh0LWFsaWduOmxlZnR9IC5hY3QtYnRue3dpZHRoOjEwMCU7cGFkZGluZzox
+M3B4O2JvcmRlcjpub25lO2JvcmRlci1yYWRpdXM6MTBweDtmb250LXNpemU6MTRweDtmb250LXdl
+aWdodDo2MDA7Y3Vyc29yOnBvaW50ZXI7dHJhbnNpdGlvbjouMnM7bWFyZ2luLWJvdHRvbToxMHB4
+fSAuYWN0LWJ0bi1wYWlke2JhY2tncm91bmQ6bGluZWFyLWdyYWRpZW50KDEzNWRlZywjMjU2M2Vi
+LCMxZDRlZDgpO2NvbG9yOiNmZmZ9IC5hY3QtYnRuLXBhaWQ6aG92ZXJ7YmFja2dyb3VuZDpsaW5l
+YXItZ3JhZGllbnQoMTM1ZGVnLCMxZDRlZDgsIzFlNDBhZik7dHJhbnNmb3JtOnRyYW5zbGF0ZVko
+LTFweCl9IC5hY3QtYnRuLXBhaWQ6YWN0aXZle3RyYW5zZm9ybTp0cmFuc2xhdGVZKDApfSAuYWN0
+LWJ0bi1mcmVle2JhY2tncm91bmQ6dHJhbnNwYXJlbnQ7Ym9yZGVyOjEuNXB4IHNvbGlkICMzMzQx
+NTUgIWltcG9ydGFudDtjb2xvcjojOTRhM2I4fSAuYWN0LWJ0bi1mcmVlOmhvdmVye2JvcmRlci1j
+b2xvcjojNDc1NTY5ICFpbXBvcnRhbnQ7Y29sb3I6I2NiZDVlMTtiYWNrZ3JvdW5kOiMzMzQxNTV9
+IC5hY3QtZGl2aWRlcntkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2dhcDoxMHB4O21h
+cmdpbjo0cHggMCA0cHg7Y29sb3I6IzQ3NTU2OTtmb250LXNpemU6MTFweH0gLmFjdC1kaXZpZGVy
+OjpiZWZvcmUsLmFjdC1kaXZpZGVyOjphZnRlcntjb250ZW50OicnO2ZsZXg6MTtoZWlnaHQ6MXB4
+O2JhY2tncm91bmQ6IzMzNDE1NX0gLmFjdC1iYWRnZXtkaXNwbGF5OmlubGluZS1mbGV4O2FsaWdu
+LWl0ZW1zOmNlbnRlcjtnYXA6NXB4O2JhY2tncm91bmQ6IzBmMTcyYTtib3JkZXI6MXB4IHNvbGlk
+ICMxZTNhNWY7Ym9yZGVyLXJhZGl1czoyMHB4O3BhZGRpbmc6NHB4IDEycHg7Zm9udC1zaXplOjEx
+cHg7Y29sb3I6IzYwYTVmYTttYXJnaW4tYm90dG9tOjIwcHh9IC5hY3QtbW9kZS1iYW5uZXJ7cG9z
+aXRpb246Zml4ZWQ7dG9wOjA7bGVmdDowO3JpZ2h0OjA7ei1pbmRleDoxMDA7cGFkZGluZzo3cHgg
+MTZweDtmb250LXNpemU6MTJweDtmb250LXdlaWdodDo2MDA7dGV4dC1hbGlnbjpjZW50ZXI7cG9p
+bnRlci1ldmVudHM6bm9uZX0gLmFjdC1tb2RlLWJhbm5lci5wYWlke2JhY2tncm91bmQ6I2RjZmNl
+Nztjb2xvcjojMTZhMzRhO2JvcmRlci1ib3R0b206MXB4IHNvbGlkICNiYmY3ZDB9IC5hY3QtbW9k
+ZS1iYW5uZXIuZnJlZXtiYWNrZ3JvdW5kOiNmZWY5YzM7Y29sb3I6Izg1NGQwZTtib3JkZXItYm90
+dG9tOjFweCBzb2xpZCAjZmVmMDhhfSAucGxhbi1iYWRnZXtkaXNwbGF5OmlubGluZS1mbGV4O2Fs
+aWduLWl0ZW1zOmNlbnRlcjtnYXA6NXB4O3BhZGRpbmc6M3B4IDExcHg7Ym9yZGVyLXJhZGl1czoy
+MHB4O2ZvbnQtc2l6ZToxMXB4O2ZvbnQtd2VpZ2h0OjcwMH0gLnBsYW4tYmFkZ2UucHJlbWl1bXti
+YWNrZ3JvdW5kOiNmZWYzYzc7Y29sb3I6I2Q5NzcwNjtib3JkZXI6MXB4IHNvbGlkICNmY2QzNGR9
+IC5wbGFuLWJhZGdlLmZyZWV7YmFja2dyb3VuZDojZjFmNWY5O2NvbG9yOiM2NDc0OGI7Ym9yZGVy
+OjFweCBzb2xpZCAjZTJlOGYwfSAudG9wYmFyLWJyYW5ke21hcmdpbi1sZWZ0OmF1dG87Zm9udC1z
+aXplOjEycHg7Zm9udC13ZWlnaHQ6NzAwO2NvbG9yOiM5NGEzYjg7ZGlzcGxheTpmbGV4O2FsaWdu
+LWl0ZW1zOmNlbnRlcjtnYXA6MTJweDt3aGl0ZS1zcGFjZTpub3dyYXB9IC50b3BiYXItYnJhbmQg
+LmJyYW5kLXBvd2VyZWR7Y29sb3I6I2Y1OWUwYn0gLnRvcGJhci1icmFuZCAuYnJhbmQtbmFtZS10
+eHR7Y29sb3I6IzBmMTcyYTtmb250LXdlaWdodDo4MDB9IC5vd25lci1tb2RhbC1vdmVybGF5e3Bv
+c2l0aW9uOmZpeGVkO2luc2V0OjA7YmFja2dyb3VuZDpyZ2JhKDAsMCwwLC43NSk7ei1pbmRleDo4
+MDAwO2Rpc3BsYXk6bm9uZTthbGlnbi1pdGVtczpjZW50ZXI7anVzdGlmeS1jb250ZW50OmNlbnRl
+cjtwYWRkaW5nOjE2cHh9IC5vd25lci1tb2RhbC1vdmVybGF5Lm9wZW57ZGlzcGxheTpmbGV4fSAu
+b3duZXItbW9kYWx7YmFja2dyb3VuZDojMWUyOTNiO2JvcmRlcjoxcHggc29saWQgIzMzNDE1NTti
+b3JkZXItcmFkaXVzOjE4cHg7d2lkdGg6bWluKDQyMHB4LDk2dncpO292ZXJmbG93OmhpZGRlbjti
+b3gtc2hhZG93OjAgMzBweCA4MHB4IHJnYmEoMCwwLDAsLjUpfSAub3duZXItbW9kYWwtaGVhZGVy
+e2JhY2tncm91bmQ6IzBmMTcyYTtwYWRkaW5nOjE2cHggMjBweDtkaXNwbGF5OmZsZXg7YWxpZ24t
+aXRlbXM6Y2VudGVyO2p1c3RpZnktY29udGVudDpzcGFjZS1iZXR3ZWVufSAub3duZXItbW9kYWwt
+dGl0bGV7Y29sb3I6I2YxZjVmOTtmb250LXNpemU6MTVweDtmb250LXdlaWdodDo3MDA7ZGlzcGxh
+eTpmbGV4O2FsaWduLWl0ZW1zOmNlbnRlcjtnYXA6OHB4fSAub3duZXItbW9kYWwtYm9keXtwYWRk
+aW5nOjI4cHh9IC5vd25lci1pbnB1dHt3aWR0aDoxMDAlO2JhY2tncm91bmQ6IzBmMTcyYTtib3Jk
+ZXI6MS41cHggc29saWQgIzMzNDE1NTtib3JkZXItcmFkaXVzOjhweDtwYWRkaW5nOjEycHggMTRw
+eDtmb250LXNpemU6MTRweDtjb2xvcjojZTJlOGYwO291dGxpbmU6bm9uZTt0cmFuc2l0aW9uOi4y
+czttYXJnaW4tYm90dG9tOjhweDtmb250LWZhbWlseTptb25vc3BhY2U7bGV0dGVyLXNwYWNpbmc6
+LjA2ZW19IC5vd25lci1pbnB1dDpmb2N1c3tib3JkZXItY29sb3I6IzdjM2FlZDtib3gtc2hhZG93
+OjAgMCAwIDNweCByZ2JhKDEyNCw1OCwyMzcsLjIpfSAub3duZXItaW5wdXQuZXJyb3J7Ym9yZGVy
+LWNvbG9yOiNkYzI2MjZ9IC5vd25lci1lcnJ7Zm9udC1zaXplOjEycHg7Y29sb3I6I2RjMjYyNjtt
+YXJnaW4tYm90dG9tOjE0cHg7bWluLWhlaWdodDoxNnB4fSAub3duZXItYnRue3dpZHRoOjEwMCU7
+cGFkZGluZzoxMnB4O2JvcmRlcjpub25lO2JvcmRlci1yYWRpdXM6OHB4O2ZvbnQtc2l6ZToxNHB4
+O2ZvbnQtd2VpZ2h0OjYwMDtjdXJzb3I6cG9pbnRlcjt0cmFuc2l0aW9uOi4yczttYXJnaW4tYm90
+dG9tOjhweH0gLm93bmVyLWJ0bi1wcmltYXJ5e2JhY2tncm91bmQ6bGluZWFyLWdyYWRpZW50KDEz
+NWRlZywjN2MzYWVkLCM0ZjQ2ZTUpO2NvbG9yOiNmZmZ9IC5vd25lci1idG4tcHJpbWFyeTpob3Zl
+cntiYWNrZ3JvdW5kOmxpbmVhci1ncmFkaWVudCgxMzVkZWcsIzZkMjhkOSwjNDMzOGNhKTt0cmFu
+c2Zvcm06dHJhbnNsYXRlWSgtMXB4KX0gLm93bmVyLWJ0bi1zZWNvbmRhcnl7YmFja2dyb3VuZDoj
+MzM0MTU1O2NvbG9yOiM5NGEzYjh9IC5vd25lci1idG4tc2Vjb25kYXJ5OmhvdmVye2JhY2tncm91
+bmQ6IzQ3NTU2OTtjb2xvcjojZTJlOGYwfSAub3duZXItdGFic3tkaXNwbGF5OmZsZXg7Z2FwOjRw
+eDttYXJnaW4tYm90dG9tOjI0cHg7YmFja2dyb3VuZDp2YXIoLS1ibHVlLWxpZ2h0KTtib3JkZXIt
+cmFkaXVzOjEwcHg7cGFkZGluZzo0cHg7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1ibHVlLW1pZCl9
+IC5vd25lci10YWJ7cGFkZGluZzo4cHggMThweDtib3JkZXI6bm9uZTtib3JkZXItcmFkaXVzOjdw
+eDtmb250LXNpemU6MTNweDtmb250LXdlaWdodDo2MDA7Y3Vyc29yOnBvaW50ZXI7dHJhbnNpdGlv
+bjouMTVzO2NvbG9yOnZhcigtLW11dGVkKTtiYWNrZ3JvdW5kOm5vbmV9IC5vd25lci10YWIuYWN0
+aXZle2JhY2tncm91bmQ6I2ZmZjtjb2xvcjp2YXIoLS1ibHVlKTtib3gtc2hhZG93OjAgMXB4IDRw
+eCByZ2JhKDAsMCwwLC4xKX0gLm93bmVyLXRhYi1wYW5lbHtkaXNwbGF5Om5vbmV9Lm93bmVyLXRh
+Yi1wYW5lbC5hY3RpdmV7ZGlzcGxheTpibG9ja30gLm93bmVyLWFuYWx5dGljc3tkaXNwbGF5Omdy
+aWQ7Z3JpZC10ZW1wbGF0ZS1jb2x1bW5zOnJlcGVhdChhdXRvLWZpbGwsbWlubWF4KDE1MHB4LDFm
+cikpO2dhcDoxNHB4O21hcmdpbi1ib3R0b206MjRweH0gLmFuYS1jYXJke2JhY2tncm91bmQ6I2Zm
+Zjtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWJvcmRlcik7Ym9yZGVyLXJhZGl1czoxMnB4O3BhZGRp
+bmc6MThweCAxNnB4O3RleHQtYWxpZ246Y2VudGVyfSAuYW5hLW51bXtmb250LXNpemU6MjhweDtm
+b250LXdlaWdodDo4MDA7bWFyZ2luLWJvdHRvbTo0cHh9IC5hbmEtbGFiZWx7Zm9udC1zaXplOjEx
+cHg7Y29sb3I6dmFyKC0tbXV0ZWQpO2ZvbnQtd2VpZ2h0OjYwMDt0ZXh0LXRyYW5zZm9ybTp1cHBl
+cmNhc2U7bGV0dGVyLXNwYWNpbmc6LjA1ZW19IC5rZXktdGFibGV7d2lkdGg6MTAwJTtib3JkZXIt
+Y29sbGFwc2U6Y29sbGFwc2U7Zm9udC1zaXplOjEzcHh9IC5rZXktdGFibGUgdGh7dGV4dC1hbGln
+bjpsZWZ0O3BhZGRpbmc6MTBweCAxMnB4O2ZvbnQtc2l6ZToxMXB4O2ZvbnQtd2VpZ2h0OjcwMDt0
+ZXh0LXRyYW5zZm9ybTp1cHBlcmNhc2U7bGV0dGVyLXNwYWNpbmc6LjA1ZW07Y29sb3I6dmFyKC0t
+bXV0ZWQpO2JvcmRlci1ib3R0b206MnB4IHNvbGlkIHZhcigtLWJvcmRlcik7YmFja2dyb3VuZDoj
+ZjhmYWZjfSAua2V5LXRhYmxlIHRke3BhZGRpbmc6MTBweCAxMnB4O2JvcmRlci1ib3R0b206MXB4
+IHNvbGlkICNmMWY1Zjk7dmVydGljYWwtYWxpZ246bWlkZGxlfSAua2V5LXRhYmxlIHRyOmhvdmVy
+IHRke2JhY2tncm91bmQ6I2Y4ZmFmY30gLmtleS10YWJsZSAub3ZlcmZsb3cteHtvdmVyZmxvdy14
+OmF1dG99IC5rZXktbW9ub3tmb250LWZhbWlseTonQ2FzY2FkaWEgQ29kZScsJ0ZpcmEgQ29kZScs
+bW9ub3NwYWNlO2ZvbnQtc2l6ZToxMnB4O2NvbG9yOiMyNTYzZWI7bGV0dGVyLXNwYWNpbmc6LjA2
+ZW07d29yZC1icmVhazpicmVhay1hbGx9IC5zdGF0dXMtcGlsbHtkaXNwbGF5OmlubGluZS1ibG9j
+aztwYWRkaW5nOjJweCAxMHB4O2JvcmRlci1yYWRpdXM6MjBweDtmb250LXNpemU6MTFweDtmb250
+LXdlaWdodDo3MDA7dGV4dC10cmFuc2Zvcm06dXBwZXJjYXNlfSAucGlsbC1hY3RpdmV7YmFja2dy
+b3VuZDojZGNmY2U3O2NvbG9yOiMxNmEzNGF9IC5waWxsLXVzZWR7YmFja2dyb3VuZDojZTBmMmZl
+O2NvbG9yOiMwMzY5YTF9IC5waWxsLWV4cGlyZWR7YmFja2dyb3VuZDojZmVlMmUyO2NvbG9yOiNk
+YzI2MjZ9IC5waWxsLXJldm9rZWR7YmFja2dyb3VuZDojZjFmNWY5O2NvbG9yOiM5NGEzYjg7dGV4
+dC1kZWNvcmF0aW9uOmxpbmUtdGhyb3VnaH0gLnRibC1idG57cGFkZGluZzo0cHggMTBweDtib3Jk
+ZXI6bm9uZTtib3JkZXItcmFkaXVzOjZweDtmb250LXNpemU6MTJweDtmb250LXdlaWdodDo2MDA7
+Y3Vyc29yOnBvaW50ZXI7dHJhbnNpdGlvbjouMTVzO21hcmdpbi1yaWdodDo0cHh9IC50YmwtYnRu
+LXJldm9rZXtiYWNrZ3JvdW5kOiNmZWYzYzc7Y29sb3I6I2Q5NzcwNn0udGJsLWJ0bi1yZXZva2U6
+aG92ZXJ7YmFja2dyb3VuZDojZmRlNjhhfSAudGJsLWJ0bi1kZWxldGV7YmFja2dyb3VuZDojZmVl
+MmUyO2NvbG9yOiNkYzI2MjZ9LnRibC1idG4tZGVsZXRlOmhvdmVye2JhY2tncm91bmQ6I2ZjYTVh
+NTtjb2xvcjojZmZmfSAuZ2VuLXBhbmVse2JhY2tncm91bmQ6dmFyKC0tYmx1ZS1saWdodCk7Ym9y
+ZGVyOjFweCBzb2xpZCB2YXIoLS1ibHVlLW1pZCk7Ym9yZGVyLXJhZGl1czoxMnB4O3BhZGRpbmc6
+MjBweDttYXJnaW4tYm90dG9tOjIwcHh9IC5nZW4tcm93e2Rpc3BsYXk6ZmxleDtmbGV4LXdyYXA6
+d3JhcDtnYXA6MTJweDthbGlnbi1pdGVtczpmbGV4LWVuZDttYXJnaW4tYm90dG9tOjEycHh9IC5n
+ZW4tZmllbGR7ZGlzcGxheTpmbGV4O2ZsZXgtZGlyZWN0aW9uOmNvbHVtbjtnYXA6NXB4O2ZsZXg6
+MTttaW4td2lkdGg6MTQwcHh9IC5nZW4tbGFiZWx7Zm9udC1zaXplOjExcHg7Zm9udC13ZWlnaHQ6
+NzAwO3RleHQtdHJhbnNmb3JtOnVwcGVyY2FzZTtsZXR0ZXItc3BhY2luZzouMDRlbTtjb2xvcjp2
+YXIoLS1tdXRlZCl9IC5nZW4taW5wdXQsLmdlbi1zZWxlY3R7YmFja2dyb3VuZDojZmZmO2JvcmRl
+cjoxLjVweCBzb2xpZCB2YXIoLS1ib3JkZXIpO2JvcmRlci1yYWRpdXM6OHB4O3BhZGRpbmc6OXB4
+IDEycHg7Zm9udC1zaXplOjEzcHg7Y29sb3I6dmFyKC0tdGV4dCk7b3V0bGluZTpub25lO3RyYW5z
+aXRpb246LjJzO3dpZHRoOjEwMCV9IC5nZW4taW5wdXQ6Zm9jdXMsLmdlbi1zZWxlY3Q6Zm9jdXN7
+Ym9yZGVyLWNvbG9yOnZhcigtLWJsdWUpO2JveC1zaGFkb3c6MCAwIDAgM3B4IHJnYmEoMzcsOTks
+MjM1LC4xMil9IC5mZWF0LXJvd3tkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO3BhZGRp
+bmc6MTRweCAwO2JvcmRlci1ib3R0b206MXB4IHNvbGlkICNmMWY1Zjk7Z2FwOjEycHh9IC5mZWF0
+LXJvdzpsYXN0LWNoaWxke2JvcmRlci1ib3R0b206bm9uZX0gLmZlYXQtaW5mb3tmbGV4OjE7bWlu
+LXdpZHRoOjB9IC5mZWF0LW5hbWV7Zm9udC1zaXplOjE0cHg7Zm9udC13ZWlnaHQ6NjAwO2NvbG9y
+OnZhcigtLXRleHQpfSAuZmVhdC1jYXR7Zm9udC1zaXplOjExcHg7Y29sb3I6dmFyKC0tbXV0ZWQp
+O21hcmdpbi10b3A6MnB4fSAudGllci10b2dnbGV7ZGlzcGxheTppbmxpbmUtZmxleDtiYWNrZ3Jv
+dW5kOiNmMWY1Zjk7Ym9yZGVyLXJhZGl1czoyMHB4O3BhZGRpbmc6MnB4O2dhcDoycHg7Ym9yZGVy
+OjFweCBzb2xpZCB2YXIoLS1ib3JkZXIpfSAudGllci1idG57cGFkZGluZzo1cHggMTRweDtib3Jk
+ZXI6bm9uZTtib3JkZXItcmFkaXVzOjE4cHg7Zm9udC1zaXplOjEycHg7Zm9udC13ZWlnaHQ6NzAw
+O2N1cnNvcjpwb2ludGVyO3RyYW5zaXRpb246LjJzO2JhY2tncm91bmQ6bm9uZTtjb2xvcjp2YXIo
+LS1tdXRlZCl9IC50aWVyLWJ0bi5hY3RpdmUtZnJlZXtiYWNrZ3JvdW5kOiMyMmM1NWU7Y29sb3I6
+I2ZmZn0gLnRpZXItYnRuLmFjdGl2ZS1wcmVtaXVte2JhY2tncm91bmQ6bGluZWFyLWdyYWRpZW50
+KDEzNWRlZywjZjU5ZTBiLCNkOTc3MDYpO2NvbG9yOiNmZmZ9IC5sb2ctcm93e2Rpc3BsYXk6Zmxl
+eDtmbGV4LXdyYXA6d3JhcDthbGlnbi1pdGVtczpjZW50ZXI7cGFkZGluZzoxMHB4IDEycHg7Ym9y
+ZGVyLWJvdHRvbToxcHggc29saWQgI2YxZjVmOTtnYXA6OHB4O2ZvbnQtc2l6ZToxM3B4fSAubG9n
+LXRpbWV7Zm9udC1zaXplOjExcHg7Y29sb3I6dmFyKC0tbXV0ZWQpO21pbi13aWR0aDoxMzVweDtm
+b250LWZhbWlseTptb25vc3BhY2V9IC5sb2cta2V5e2ZvbnQtZmFtaWx5Om1vbm9zcGFjZTtmb250
+LXNpemU6MTJweDtjb2xvcjojMjU2M2VifSAuc3RvcmFnZS1iYXItd3JhcHtiYWNrZ3JvdW5kOiNm
+MWY1Zjk7Ym9yZGVyLXJhZGl1czo4cHg7aGVpZ2h0OjEwcHg7b3ZlcmZsb3c6aGlkZGVuO21hcmdp
+bi1ib3R0b206NHB4fSAuc3RvcmFnZS1iYXItZmlsbHtoZWlnaHQ6MTAwJTtiYWNrZ3JvdW5kOmxp
+bmVhci1ncmFkaWVudCg5MGRlZywjMjU2M2ViLCM2MGE1ZmEpO2JvcmRlci1yYWRpdXM6OHB4O3Ry
+YW5zaXRpb246LjVzfSAuc3RvcmFnZS1jcnVtYntkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2Vu
+dGVyO2dhcDoycHg7ZmxleC13cmFwOndyYXA7Zm9udC1zaXplOjEzcHg7bWFyZ2luLWJvdHRvbTox
+NHB4fSAuZmlsZS10YWJsZXt3aWR0aDoxMDAlO2JvcmRlci1jb2xsYXBzZTpjb2xsYXBzZTtmb250
+LXNpemU6MTNweH0gLmZpbGUtdGFibGUgdGh7dGV4dC1hbGlnbjpsZWZ0O3BhZGRpbmc6MTBweCAx
+NHB4O2ZvbnQtc2l6ZToxMXB4O2ZvbnQtd2VpZ2h0OjcwMDt0ZXh0LXRyYW5zZm9ybTp1cHBlcmNh
+c2U7bGV0dGVyLXNwYWNpbmc6LjA1ZW07Y29sb3I6dmFyKC0tbXV0ZWQpO2JvcmRlci1ib3R0b206
+MnB4IHNvbGlkIHZhcigtLWJvcmRlcik7YmFja2dyb3VuZDojZjhmYWZjfSAuZmlsZS10YWJsZSB0
+ZHtwYWRkaW5nOjExcHggMTRweDtib3JkZXItYm90dG9tOjFweCBzb2xpZCAjZjFmNWY5O3ZlcnRp
+Y2FsLWFsaWduOm1pZGRsZX0gLmZpbGUtdGFibGUgdHI6aG92ZXIgdGR7YmFja2dyb3VuZDojZjhm
+YWZjfSAuZmlsZS1uYW1lLWJ0bntiYWNrZ3JvdW5kOm5vbmU7Ym9yZGVyOm5vbmU7Zm9udC1zaXpl
+OjEzcHg7Zm9udC13ZWlnaHQ6NTAwO2NvbG9yOnZhcigtLXRleHQpO2N1cnNvcjpwb2ludGVyO3Bh
+ZGRpbmc6MDt0ZXh0LWFsaWduOmxlZnR9IC5maWxlLW5hbWUtYnRuOmhvdmVye2NvbG9yOnZhcigt
+LWJsdWUpO3RleHQtZGVjb3JhdGlvbjp1bmRlcmxpbmV9IC5zdG9yYWdlLXRvb2xiYXJ7ZGlzcGxh
+eTpmbGV4O2dhcDo4cHg7ZmxleC13cmFwOndyYXA7bWFyZ2luLWJvdHRvbToxNnB4fSAudXBncmFk
+ZS1vdmVybGF5e3Bvc2l0aW9uOmZpeGVkO2luc2V0OjA7YmFja2dyb3VuZDpyZ2JhKDAsMCwwLC43
+NSk7ei1pbmRleDo3MDAwO2Rpc3BsYXk6bm9uZTthbGlnbi1pdGVtczpjZW50ZXI7anVzdGlmeS1j
+b250ZW50OmNlbnRlcjtwYWRkaW5nOjE2cHh9IC51cGdyYWRlLW92ZXJsYXkub3BlbntkaXNwbGF5
+OmZsZXh9IC51cGdyYWRlLWNhcmR7YmFja2dyb3VuZDojMWUyOTNiO2JvcmRlcjoxcHggc29saWQg
+IzMzNDE1NTtib3JkZXItcmFkaXVzOjE4cHg7d2lkdGg6bWluKDQwMHB4LDk2dncpO3BhZGRpbmc6
+MzJweCAyOHB4O3RleHQtYWxpZ246Y2VudGVyO2JveC1zaGFkb3c6MCAyNHB4IDcwcHggcmdiYSgw
+LDAsMCwuNSl9IC51cGdyYWRlLXRpdGxle2ZvbnQtc2l6ZToyMHB4O2ZvbnQtd2VpZ2h0OjgwMDtj
+b2xvcjojZjFmNWY5O21hcmdpbi1ib3R0b206OHB4fSAudXBncmFkZS1zdWJ7Zm9udC1zaXplOjEz
+cHg7Y29sb3I6IzY0NzQ4YjttYXJnaW4tYm90dG9tOjIycHg7bGluZS1oZWlnaHQ6MS42fSAudXBn
+cmFkZS1pbnB7d2lkdGg6MTAwJTtiYWNrZ3JvdW5kOiMwZjE3MmE7Ym9yZGVyOjEuNXB4IHNvbGlk
+ICMzMzQxNTU7Ym9yZGVyLXJhZGl1czo4cHg7cGFkZGluZzoxMnB4IDE0cHg7Zm9udC1zaXplOjE0
+cHg7Y29sb3I6I2UyZThmMDtvdXRsaW5lOm5vbmU7dHJhbnNpdGlvbjouMnM7bWFyZ2luLWJvdHRv
+bTo4cHg7Zm9udC1mYW1pbHk6bW9ub3NwYWNlO2xldHRlci1zcGFjaW5nOi4wNmVtfSAudXBncmFk
+ZS1pbnA6Zm9jdXN7Ym9yZGVyLWNvbG9yOiNmNTllMGI7Ym94LXNoYWRvdzowIDAgMCAzcHggcmdi
+YSgyNDUsMTU4LDExLC4yKX0gLnVwZ3JhZGUtZXJye2ZvbnQtc2l6ZToxMnB4O2NvbG9yOiNkYzI2
+MjY7bWluLWhlaWdodDoxNnB4O21hcmdpbi1ib3R0b206MTJweDt0ZXh0LWFsaWduOmxlZnR9IC5z
+ZWFyY2gtaW5we2JhY2tncm91bmQ6I2ZmZjtib3JkZXI6MS41cHggc29saWQgdmFyKC0tYm9yZGVy
+KTtib3JkZXItcmFkaXVzOjhweDtwYWRkaW5nOjhweCAxMnB4O2ZvbnQtc2l6ZToxM3B4O291dGxp
+bmU6bm9uZTt0cmFuc2l0aW9uOi4yczt3aWR0aDoyMjBweH0gLnNlYXJjaC1pbnA6Zm9jdXN7Ym9y
+ZGVyLWNvbG9yOnZhcigtLWJsdWUpO2JveC1zaGFkb3c6MCAwIDAgMnB4IHJnYmEoMzcsOTksMjM1
+LC4xKX0gQG1lZGlhKG1heC13aWR0aDo2MDBweCl7Lm93bmVyLXRhYnN7ZmxleC13cmFwOndyYXB9
+Lm93bmVyLXRhYntmbGV4OjE7bWluLXdpZHRoOjgwcHg7dGV4dC1hbGlnbjpjZW50ZXI7Zm9udC1z
+aXplOjExcHg7cGFkZGluZzo3cHggOHB4fS5nZW4tcm93e2ZsZXgtZGlyZWN0aW9uOmNvbHVtbn19
+IC51aWMtc2VjdGlvbnttYXJnaW4tYm90dG9tOjIycHh9IC51aWMtbGFiZWx7Zm9udC1zaXplOjEx
+cHg7Zm9udC13ZWlnaHQ6NzAwO3RleHQtdHJhbnNmb3JtOnVwcGVyY2FzZTtsZXR0ZXItc3BhY2lu
+ZzouMDdlbTtjb2xvcjp2YXIoLS1tdXRlZCk7bWFyZ2luLWJvdHRvbToxMHB4O2Rpc3BsYXk6Zmxl
+eDthbGlnbi1pdGVtczpjZW50ZXI7Z2FwOjZweH0gLnVpYy1wcmVzZXRze2Rpc3BsYXk6ZmxleDtm
+bGV4LXdyYXA6d3JhcDtnYXA6OHB4O21hcmdpbi1ib3R0b206NHB4fSAudWljLXByZXNldHtwYWRk
+aW5nOjhweCAxNnB4O2JvcmRlci1yYWRpdXM6MjBweDtib3JkZXI6MnB4IHNvbGlkIHZhcigtLWJv
+cmRlcik7YmFja2dyb3VuZDp2YXIoLS1jYXJkKTtjb2xvcjp2YXIoLS10ZXh0KTtmb250LXNpemU6
+MTNweDtmb250LXdlaWdodDo2MDA7Y3Vyc29yOnBvaW50ZXI7dHJhbnNpdGlvbjouMnN9IC51aWMt
+cHJlc2V0OmhvdmVye2JvcmRlci1jb2xvcjp2YXIoLS1ibHVlKTtjb2xvcjp2YXIoLS1ibHVlKX0g
+LnVpYy1wcmVzZXQuYWN0aXZle2JvcmRlci1jb2xvcjp2YXIoLS1ibHVlKTtiYWNrZ3JvdW5kOnZh
+cigtLWJsdWUpO2NvbG9yOiNmZmZ9IC51aWMtY29sb3ItZ3JpZHtkaXNwbGF5OmdyaWQ7Z3JpZC10
+ZW1wbGF0ZS1jb2x1bW5zOnJlcGVhdChhdXRvLWZpbGwsbWlubWF4KDE3NXB4LDFmcikpO2dhcDox
+MHB4fSAudWljLWNvbG9yLXJvd3tkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2dhcDox
+MHB4O3BhZGRpbmc6MTBweCAxMnB4O2JhY2tncm91bmQ6dmFyKC0tYmx1ZS1saWdodCk7Ym9yZGVy
+OjFweCBzb2xpZCB2YXIoLS1ibHVlLW1pZCk7Ym9yZGVyLXJhZGl1czoxMHB4fSAudWljLXN3YXRj
+aHt3aWR0aDozNnB4O2hlaWdodDozNnB4O2JvcmRlci1yYWRpdXM6OHB4O2JvcmRlcjoycHggc29s
+aWQgdmFyKC0tYm9yZGVyKTtjdXJzb3I6cG9pbnRlcjtmbGV4LXNocmluazowO3BhZGRpbmc6MDtv
+dmVyZmxvdzpoaWRkZW47cG9zaXRpb246cmVsYXRpdmV9IC51aWMtc3dhdGNoIGlucHV0W3R5cGU9
+Y29sb3Jde3Bvc2l0aW9uOmFic29sdXRlO2luc2V0Oi00cHg7d2lkdGg6Y2FsYygxMDAlICsgOHB4
+KTtoZWlnaHQ6Y2FsYygxMDAlICsgOHB4KTtib3JkZXI6bm9uZTtjdXJzb3I6cG9pbnRlcjtwYWRk
+aW5nOjB9IC51aWMtY29sb3ItbmFtZXtmb250LXNpemU6MTJweDtmb250LXdlaWdodDo2MDA7Y29s
+b3I6dmFyKC0tdGV4dCk7ZmxleDoxO3doaXRlLXNwYWNlOm5vd3JhcDtvdmVyZmxvdzpoaWRkZW47
+dGV4dC1vdmVyZmxvdzplbGxpcHNpc30gLnVpYy1iZy1ncmlke2Rpc3BsYXk6Z3JpZDtncmlkLXRl
+bXBsYXRlLWNvbHVtbnM6cmVwZWF0KGF1dG8tZmlsbCxtaW5tYXgoMTQwcHgsMWZyKSk7Z2FwOjEy
+cHg7bWFyZ2luLWJvdHRvbToxMnB4fSAudWljLWJnLWNhcmR7Ym9yZGVyLXJhZGl1czoxMnB4O292
+ZXJmbG93OmhpZGRlbjtjdXJzb3I6cG9pbnRlcjtib3JkZXI6M3B4IHNvbGlkIHRyYW5zcGFyZW50
+O3RyYW5zaXRpb246LjJzO2JveC1zaGFkb3c6dmFyKC0tc2hhZG93KX0gLnVpYy1iZy1jYXJkOmhv
+dmVye2JvcmRlci1jb2xvcjp2YXIoLS1ibHVlKTt0cmFuc2Zvcm06dHJhbnNsYXRlWSgtMnB4KX0g
+LnVpYy1iZy1jYXJkLmFjdGl2ZXtib3JkZXItY29sb3I6dmFyKC0tYmx1ZSk7Ym94LXNoYWRvdzow
+IDAgMCAzcHggcmdiYSgzNyw5OSwyMzUsLjI1KX0gLnVpYy1iZy10aHVtYntoZWlnaHQ6ODBweDt3
+aWR0aDoxMDAlO2Rpc3BsYXk6YmxvY2s7YmFja2dyb3VuZC1zaXplOmNvdmVyO2JhY2tncm91bmQt
+cG9zaXRpb246Y2VudGVyO2JhY2tncm91bmQtc2l6ZToyMDAlIDIwMCU7YW5pbWF0aW9uOmNwbS10
+aHVtYi1pZGxlIDZzIGVhc2UgaW5maW5pdGV9IC51aWMtYmctbmFtZXtwYWRkaW5nOjZweCAxMHB4
+O2ZvbnQtc2l6ZToxMnB4O2ZvbnQtd2VpZ2h0OjYwMDtiYWNrZ3JvdW5kOnZhcigtLWNhcmQpO2Nv
+bG9yOnZhcigtLXRleHQpO3RleHQtYWxpZ246Y2VudGVyfSAudWljLWN1c3RvbS1yb3d7ZGlzcGxh
+eTpmbGV4O2dhcDoxMHB4O2FsaWduLWl0ZW1zOmNlbnRlcjtmbGV4LXdyYXA6d3JhcDttYXJnaW4t
+dG9wOjhweH0gLnVpYy11cmwtaW5we2ZsZXg6MTttaW4td2lkdGg6MjAwcHg7cGFkZGluZzo5cHgg
+MTJweDtib3JkZXI6MS41cHggc29saWQgdmFyKC0tYm9yZGVyKTtib3JkZXItcmFkaXVzOjhweDtm
+b250LXNpemU6MTNweDtiYWNrZ3JvdW5kOnZhcigtLWNhcmQpO2NvbG9yOnZhcigtLXRleHQpO291
+dGxpbmU6bm9uZTt0cmFuc2l0aW9uOi4yc30gLnVpYy11cmwtaW5wOmZvY3Vze2JvcmRlci1jb2xv
+cjp2YXIoLS1ibHVlKTtib3gtc2hhZG93OjAgMCAwIDNweCByZ2JhKDM3LDk5LDIzNSwuMSl9IC51
+aWMtYXBwbHktYnRue3BhZGRpbmc6OXB4IDE4cHg7Ym9yZGVyLXJhZGl1czo4cHg7Ym9yZGVyOm5v
+bmU7YmFja2dyb3VuZDp2YXIoLS1ibHVlKTtjb2xvcjojZmZmO2ZvbnQtc2l6ZToxM3B4O2ZvbnQt
+d2VpZ2h0OjYwMDtjdXJzb3I6cG9pbnRlcjt0cmFuc2l0aW9uOi4yczt3aGl0ZS1zcGFjZTpub3dy
+YXB9IC51aWMtYXBwbHktYnRuOmhvdmVye2JhY2tncm91bmQ6IzFkNGVkOH0gLnVpYy1mb250LXJv
+d3tkaXNwbGF5OmZsZXg7Z2FwOjEycHg7YWxpZ24taXRlbXM6Y2VudGVyO2ZsZXgtd3JhcDp3cmFw
+fSAudWljLXNlbGVjdHtwYWRkaW5nOjlweCAxMnB4O2JvcmRlcjoxLjVweCBzb2xpZCB2YXIoLS1i
+b3JkZXIpO2JvcmRlci1yYWRpdXM6OHB4O2ZvbnQtc2l6ZToxM3B4O2JhY2tncm91bmQ6dmFyKC0t
+Y2FyZCk7Y29sb3I6dmFyKC0tdGV4dCk7b3V0bGluZTpub25lO3RyYW5zaXRpb246LjJzO2N1cnNv
+cjpwb2ludGVyO3dpZHRoOjEwMCU7bWF4LXdpZHRoOjM0MHB4fSAudWljLXNlbGVjdDpmb2N1c3ti
+b3JkZXItY29sb3I6dmFyKC0tYmx1ZSl9IC51aWMtcmFuZ2Utcm93e2Rpc3BsYXk6ZmxleDthbGln
+bi1pdGVtczpjZW50ZXI7Z2FwOjEycHh9IC51aWMtcmFuZ2V7ZmxleDoxO2FjY2VudC1jb2xvcjp2
+YXIoLS1ibHVlKTtoZWlnaHQ6NXB4O21heC13aWR0aDozMDBweH0gLnVpYy1yYW5nZS12YWx7Zm9u
+dC1zaXplOjEzcHg7Zm9udC13ZWlnaHQ6NzAwO2NvbG9yOnZhcigtLWJsdWUpO21pbi13aWR0aDo0
+MHB4fSAudWljLWFjdGlvbi1iYXJ7ZGlzcGxheTpmbGV4O2dhcDoxMnB4O2ZsZXgtd3JhcDp3cmFw
+O3BhZGRpbmctdG9wOjhweH0gLnVpYy1zYXZlLWJ0bntwYWRkaW5nOjExcHggMjZweDtiYWNrZ3Jv
+dW5kOnZhcigtLWJsdWUpO2NvbG9yOiNmZmY7Ym9yZGVyOm5vbmU7Ym9yZGVyLXJhZGl1czoxMHB4
+O2ZvbnQtc2l6ZToxNHB4O2ZvbnQtd2VpZ2h0OjcwMDtjdXJzb3I6cG9pbnRlcjt0cmFuc2l0aW9u
+Oi4yc30gLnVpYy1zYXZlLWJ0bjpob3ZlcntiYWNrZ3JvdW5kOiMxZDRlZDg7dHJhbnNmb3JtOnRy
+YW5zbGF0ZVkoLTFweCl9IC51aWMtcmVzZXQtYnRue3BhZGRpbmc6MTFweCAyNnB4O2JhY2tncm91
+bmQ6dmFyKC0tY2FyZCk7Y29sb3I6dmFyKC0tbXV0ZWQpO2JvcmRlcjoxLjVweCBzb2xpZCB2YXIo
+LS1ib3JkZXIpO2JvcmRlci1yYWRpdXM6MTBweDtmb250LXNpemU6MTRweDtmb250LXdlaWdodDo2
+MDA7Y3Vyc29yOnBvaW50ZXI7dHJhbnNpdGlvbjouMnN9IC51aWMtcmVzZXQtYnRuOmhvdmVye2Jv
+cmRlci1jb2xvcjojZGMyNjI2O2NvbG9yOiNkYzI2MjZ9IC51aWMtcmFkaXVzLXJvd3tkaXNwbGF5
+OmZsZXg7Z2FwOjhweDtmbGV4LXdyYXA6d3JhcH0gLnVpYy1yYWRpdXMtb3B0e3BhZGRpbmc6OHB4
+IDE2cHg7Ym9yZGVyLXJhZGl1czo4cHg7Ym9yZGVyOjJweCBzb2xpZCB2YXIoLS1ib3JkZXIpO2Jh
+Y2tncm91bmQ6dmFyKC0tY2FyZCk7Y29sb3I6dmFyKC0tdGV4dCk7Zm9udC1zaXplOjEzcHg7Zm9u
+dC13ZWlnaHQ6NjAwO2N1cnNvcjpwb2ludGVyO3RyYW5zaXRpb246LjJzfSAudWljLXJhZGl1cy1v
+cHQ6aG92ZXJ7Ym9yZGVyLWNvbG9yOnZhcigtLWJsdWUpO2NvbG9yOnZhcigtLWJsdWUpfSAudWlj
+LXJhZGl1cy1vcHQuYWN0aXZle2JvcmRlci1jb2xvcjp2YXIoLS1ibHVlKTtiYWNrZ3JvdW5kOnZh
+cigtLWJsdWUpO2NvbG9yOiNmZmZ9IC51aWMtdXBsb2FkLWdyaWR7ZGlzcGxheTpncmlkO2dyaWQt
+dGVtcGxhdGUtY29sdW1uczoxZnIgMWZyO2dhcDoxNnB4O21hcmdpbi1ib3R0b206MTRweH0gLnVp
+Yy11cGxvYWQtZHJvcHtib3JkZXI6MnB4IGRhc2hlZCB2YXIoLS1ib3JkZXIpO2JvcmRlci1yYWRp
+dXM6MTJweDtoZWlnaHQ6MTQwcHg7ZGlzcGxheTpmbGV4O2FsaWduLWl0ZW1zOmNlbnRlcjtqdXN0
+aWZ5LWNvbnRlbnQ6Y2VudGVyO2N1cnNvcjpwb2ludGVyO3RyYW5zaXRpb246LjJzO292ZXJmbG93
+OmhpZGRlbjtiYWNrZ3JvdW5kOnZhcigtLWJsdWUtbGlnaHQpO21hcmdpbi1ib3R0b206OHB4fSAu
+dWljLXVwbG9hZC1kcm9wOmhvdmVye2JvcmRlci1jb2xvcjp2YXIoLS1ibHVlKX0gLnVpYy1jbGVh
+ci1idG57d2lkdGg6MTAwJTtwYWRkaW5nOjhweDtib3JkZXI6bm9uZTtib3JkZXItcmFkaXVzOjhw
+eDtiYWNrZ3JvdW5kOiNmZWUyZTI7Y29sb3I6I2RjMjYyNjtmb250LXNpemU6MTJweDtmb250LXdl
+aWdodDo2MDA7Y3Vyc29yOnBvaW50ZXI7dHJhbnNpdGlvbjouMTVzfSAudWljLWNsZWFyLWJ0bjpo
+b3ZlcntiYWNrZ3JvdW5kOiNmY2E1YTV9IC51aWMtdGlwe2ZvbnQtc2l6ZToxMnB4O2NvbG9yOnZh
+cigtLW11dGVkKTtwYWRkaW5nOjhweCAxMnB4O2JhY2tncm91bmQ6dmFyKC0tYmx1ZS1saWdodCk7
+Ym9yZGVyLXJhZGl1czo4cHg7bWFyZ2luLXRvcDo4cHh9IEBrZXlmcmFtZXMgY3BtLWdyYWR7MCV7
+YmFja2dyb3VuZC1wb3NpdGlvbjowJSA1MCV9NTAle2JhY2tncm91bmQtcG9zaXRpb246MTAwJSA1
+MCV9MTAwJXtiYWNrZ3JvdW5kLXBvc2l0aW9uOjAlIDUwJX19IEBrZXlmcmFtZXMgY3BtLXRodW1i
+LWlkbGV7MCV7YmFja2dyb3VuZC1wb3NpdGlvbjowJSA1MCV9NTAle2JhY2tncm91bmQtcG9zaXRp
+b246MTAwJSA1MCV9MTAwJXtiYWNrZ3JvdW5kLXBvc2l0aW9uOjAlIDUwJX19IDwvc3R5bGU+PC9o
+ZWFkPjxib2R5PjxkaXYgaWQ9ImNwbS1iZy1sYXllciIgc3R5bGU9InBvc2l0aW9uOmZpeGVkO2lu
+c2V0OjA7ei1pbmRleDotMjtwb2ludGVyLWV2ZW50czpub25lO3RyYW5zaXRpb246YmFja2dyb3Vu
+ZCAuNnMsYmFja2dyb3VuZC1pbWFnZSAuNnMiPjwvZGl2PjxkaXYgaWQ9ImNwbS1iZy1zdHlsZSI+
+PC9kaXY+PHZpZGVvIGlkPSJjcG0tYmctdmlkZW8iIGF1dG9wbGF5IGxvb3AgbXV0ZWQgcGxheXNp
+bmxpbmUgc3R5bGU9ImRpc3BsYXk6bm9uZTtwb3NpdGlvbjpmaXhlZDtpbnNldDowO3otaW5kZXg6
+LTM7d2lkdGg6MTAwJTtoZWlnaHQ6MTAwJTtvYmplY3QtZml0OmNvdmVyO3BvaW50ZXItZXZlbnRz
+Om5vbmUiPjwvdmlkZW8+PGRpdiBjbGFzcz0iYWN0LW92ZXJsYXkiIGlkPSJhY3Qtb3ZlcmxheSI+
+PGRpdiBjbGFzcz0iYWN0LWNhcmQiPjxkaXYgY2xhc3M9ImFjdC1sb2dvIj48aW1nIHNyYz0iL2xv
+Z28ucG5nIiBhbHQ9IkNQTSBQYW5lbCIgb25lcnJvcj0idGhpcy5wYXJlbnRFbGVtZW50LmlubmVy
+SFRNTD0nPGRpdiBjbGFzcz0mcXVvdDthY3QtbG9nby1mYWxsYmFjayZxdW90Oz5DUDwvZGl2Pici
+Lz48L2Rpdj48ZGl2IGNsYXNzPSJhY3QtdGl0bGUiPkNQTSBQYW5lbDwvZGl2PjxkaXYgY2xhc3M9
+ImFjdC1zdWIiPkVudGVyIHlvdXIga2V5IHRvIGNvbnRpbnVlLiBPd25lciBrZXkgb3BlbnMgdGhl
+IE93bmVyIFBhbmVsLiBQYWlkIGtleSBhY3RpdmF0ZXMgUHJlbWl1bSBtb2RlLjwvZGl2PjxkaXYg
+Y2xhc3M9ImFjdC1iYWRnZSI+PHN2ZyB3aWR0aD0iMTIiIGhlaWdodD0iMTIiIGZpbGw9Im5vbmUi
+IHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHZpZXdCb3g9IjAgMCAyNCAy
+NCI+PHBhdGggZD0iTTEyIDIyczgtNCA4LTEwVjVsLTgtMy04IDN2N2MwIDYgOCAxMCA4IDEweiIv
+Pjwvc3ZnPkNQTSBQYW5lbCAmbWRhc2g7IEtWTSBWUFMgTWFuYWdlcjwvZGl2PjxkaXYgaWQ9ImFj
+dC1tYWluLWZvcm0iPjxpbnB1dCBjbGFzcz0iYWN0LWlucHV0IiBpZD0iYWN0LWtleS1pbnB1dCIg
+dHlwZT0icGFzc3dvcmQiIHBsYWNlaG9sZGVyPSJFbnRlciB5b3VyIGtleeKApiIgbWF4bGVuZ3Ro
+PSI2NCIgYXV0b2NvbXBsZXRlPSJvZmYiIHNwZWxsY2hlY2s9ImZhbHNlIi8+PGRpdiBjbGFzcz0i
+YWN0LWVyciIgaWQ9ImFjdC1lcnIiPjwvZGl2PjxidXR0b24gY2xhc3M9ImFjdC1idG4gYWN0LWJ0
+bi1wYWlkIiBpZD0iYWN0LWJ0bi1wYWlkIiBvbmNsaWNrPSJhY3RpdmF0ZVBhbmVsKCkiPvCflJEg
+QWNjZXNzIFBhbmVsPC9idXR0b24+PGRpdiBjbGFzcz0iYWN0LWRpdmlkZXIiPm9yPC9kaXY+PGJ1
+dHRvbiBjbGFzcz0iYWN0LWJ0biBhY3QtYnRuLWZyZWUiIG9uY2xpY2s9InVzZUZyZWVWZXJzaW9u
+KCkiIHN0eWxlPSJtYXJnaW4tdG9wOjhweCI+Q29udGludWUgd2l0aCBGcmVlIFZlcnNpb248L2J1
+dHRvbj48ZGl2IHN0eWxlPSJtYXJnaW4tdG9wOjE0cHg7dGV4dC1hbGlnbjpjZW50ZXIiPjxidXR0
+b24gb25jbGljaz0ic2hvd0FjdFNldHVwKCkiIHN0eWxlPSJiYWNrZ3JvdW5kOm5vbmU7Ym9yZGVy
+Om5vbmU7Y29sb3I6IzQ3NTU2OTtmb250LXNpemU6MTJweDtjdXJzb3I6cG9pbnRlcjt0ZXh0LWRl
+Y29yYXRpb246dW5kZXJsaW5lIj5GaXJzdCB0aW1lPyBTZXQgdXAgb3duZXIga2V5IOKGkjwvYnV0
+dG9uPjwvZGl2PjwvZGl2PjxkaXYgaWQ9ImFjdC1zZXR1cC1mb3JtIiBzdHlsZT0iZGlzcGxheTpu
+b25lIj48ZGl2IHN0eWxlPSJmb250LXNpemU6MTNweDtjb2xvcjojOTRhM2I4O21hcmdpbi1ib3R0
+b206MTZweDtsaW5lLWhlaWdodDoxLjY7dGV4dC1hbGlnbjpsZWZ0Ij5ObyBvd25lciBrZXkgc2V0
+IHlldC4gQ3JlYXRlIHlvdXIgc2VjcmV0IG93bmVyIGtleSBiZWxvdy48YnI+PHN0cm9uZyBzdHls
+ZT0iY29sb3I6I2Y1OWUwYiI+S2VlcCBpdCBzYWZlIOKAlCBpdCBjYW5ub3QgYmUgcmVjb3ZlcmVk
+Ljwvc3Ryb25nPjwvZGl2PjxpbnB1dCBjbGFzcz0iYWN0LWlucHV0IiBpZD0iYWN0LXNldHVwLWtl
+eSIgdHlwZT0icGFzc3dvcmQiIHBsYWNlaG9sZGVyPSJDcmVhdGUgb3duZXIga2V5IChtaW4gNiBj
+aGFycykiIG1heGxlbmd0aD0iNjQiIGF1dG9jb21wbGV0ZT0ibmV3LXBhc3N3b3JkIi8+PGRpdiBj
+bGFzcz0iYWN0LWVyciIgaWQ9ImFjdC1zZXR1cC1lcnIiPjwvZGl2PjxidXR0b24gY2xhc3M9ImFj
+dC1idG4gYWN0LWJ0bi1wYWlkIiBpZD0iYWN0LXNldHVwLWJ0biIgb25jbGljaz0ic3VibWl0QWN0
+T3duZXJTZXR1cCgpIj7wn5SQIFNldCBPd25lciBLZXkgJiBFbnRlcjwvYnV0dG9uPjxidXR0b24g
+Y2xhc3M9ImFjdC1idG4gYWN0LWJ0bi1mcmVlIiBvbmNsaWNrPSJoaWRlQWN0U2V0dXAoKSIgc3R5
+bGU9Im1hcmdpbi10b3A6NnB4Ij7ihpAgQmFjazwvYnV0dG9uPjwvZGl2PjwvZGl2PjwvZGl2Pjxk
+aXYgY2xhc3M9ImFjdC1tb2RlLWJhbm5lciBwYWlkIiBpZD0iYWN0LW1vZGUtYmFubmVyIiBzdHls
+ZT0iZGlzcGxheTpub25lIj48L2Rpdj48YXNpZGU+PGRpdiBjbGFzcz0iYnJhbmQiPjxpbWcgc3Jj
+PSIvbG9nby5wbmciIGNsYXNzPSJicmFuZC1sb2dvIiBhbHQ9IkNQTSBQYW5lbCIgb25lcnJvcj0i
+dGhpcy5zdHlsZS5kaXNwbGF5PSdub25lJzt0aGlzLm5leHRFbGVtZW50U2libGluZy5zdHlsZS5k
+aXNwbGF5PSdmbGV4JyIvPjxkaXYgY2xhc3M9ImJyYW5kLWljb24iIHN0eWxlPSJkaXNwbGF5Om5v
+bmUiPkNQPC9kaXY+PHNwYW4gY2xhc3M9ImJyYW5kLW5hbWUiPkNQTSBQYW5lbDwvc3Bhbj48L2Rp
+dj48bmF2PjxhIGNsYXNzPSJhY3RpdmUiIG9uY2xpY2s9InNob3dQYWdlKCdkYXNoYm9hcmQnLHRo
+aXMpIj48c3ZnIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJy
+ZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIgdmlld0JveD0iMCAwIDI0IDI0Ij48cmVjdCB4PSIz
+IiB5PSIzIiB3aWR0aD0iNyIgaGVpZ2h0PSI3IiByeD0iMSIvPjxyZWN0IHg9IjE0IiB5PSIzIiB3
+aWR0aD0iNyIgaGVpZ2h0PSI3IiByeD0iMSIvPjxyZWN0IHg9IjMiIHk9IjE0IiB3aWR0aD0iNyIg
+aGVpZ2h0PSI3IiByeD0iMSIvPjxyZWN0IHg9IjE0IiB5PSIxNCIgd2lkdGg9IjciIGhlaWdodD0i
+NyIgcng9IjEiLz48L3N2Zz5EYXNoYm9hcmQ8L2E+PGEgb25jbGljaz0ic2hvd1BhZ2UoJ3Zwcycs
+dGhpcykiPjxzdmcgd2lkdGg9IjE2IiBoZWlnaHQ9IjE2IiBmaWxsPSJub25lIiBzdHJva2U9ImN1
+cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiB2aWV3Qm94PSIwIDAgMjQgMjQiPjxyZWN0IHg9
+IjIiIHk9IjMiIHdpZHRoPSIyMCIgaGVpZ2h0PSI4IiByeD0iMSIvPjxyZWN0IHg9IjIiIHk9IjEz
+IiB3aWR0aD0iMjAiIGhlaWdodD0iOCIgcng9IjEiLz48Y2lyY2xlIGN4PSI2IiBjeT0iNyIgcj0i
+MSIgZmlsbD0iY3VycmVudENvbG9yIi8+PGNpcmNsZSBjeD0iNiIgY3k9IjE3IiByPSIxIiBmaWxs
+PSJjdXJyZW50Q29sb3IiLz48L3N2Zz5WUFMgTWFuYWdlcjwvYT48YSBvbmNsaWNrPSJzaG93UGFn
+ZSgnY3JlYXRlJyx0aGlzKSI+PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIGZpbGw9Im5vbmUi
+IHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHZpZXdCb3g9IjAgMCAyNCAy
+NCI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiLz48bGluZSB4MT0iMTIiIHkxPSI4IiB4
+Mj0iMTIiIHkyPSIxNiIvPjxsaW5lIHgxPSI4IiB5MT0iMTIiIHgyPSIxNiIgeTI9IjEyIi8+PC9z
+dmc+Q3JlYXRlIFZQUzwvYT48YSBvbmNsaWNrPSJvcGVuU3RvcmFnZVdpdGhDaGVjayh0aGlzKSI+
+PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENv
+bG9yIiBzdHJva2Utd2lkdGg9IjIiIHZpZXdCb3g9IjAgMCAyNCAyNCI+PGVsbGlwc2UgY3g9IjEy
+IiBjeT0iNSIgcng9IjkiIHJ5PSIzIi8+PHBhdGggZD0iTTIxIDEyYzAgMS42Ni00LjAzIDMtOSAz
+UzMgMTMuNjYgMyAxMiIvPjxwYXRoIGQ9Ik0zIDV2MTRjMCAxLjY2IDQuMDMgMyA5IDNzOS0xLjM0
+IDktM1Y1Ii8+PC9zdmc+Q2xvdWQgU3RvcmFnZTwvYT48YSBvbmNsaWNrPSJvcGVuVWlDdXN0b21p
+emVXaXRoQ2hlY2sodGhpcykiPjxzdmcgd2lkdGg9IjE2IiBoZWlnaHQ9IjE2IiBmaWxsPSJub25l
+IiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiB2aWV3Qm94PSIwIDAgMjQg
+MjQiPjxwYXRoIGQ9Ik0xMiAyMkM2LjUgMjIgMiAxNy41IDIgMTJjMC01LjUgNC41LTEwIDEwLTEw
+IDQuNSAwIDggMy4xIDggNyAwIDIuOC0yLjIgNS01IDVoLTEuNGMtLjYgMC0xIC41LTEgMS4xIDAg
+LjMuMS41LjEuOC4xLjUtLjIgMS0uNyAxLjF6Ii8+PGNpcmNsZSBjeD0iOC41IiBjeT0iOS41IiBy
+PSIxLjUiIGZpbGw9ImN1cnJlbnRDb2xvciIgc3Ryb2tlPSJub25lIi8+PGNpcmNsZSBjeD0iMTIi
+IGN5PSI3IiByPSIxLjUiIGZpbGw9ImN1cnJlbnRDb2xvciIgc3Ryb2tlPSJub25lIi8+PGNpcmNs
+ZSBjeD0iMTUuNSIgY3k9IjkuNSIgcj0iMS41IiBmaWxsPSJjdXJyZW50Q29sb3IiIHN0cm9rZT0i
+bm9uZSIvPjwvc3ZnPlVJIEN1c3RvbWl6ZTwvYT48L25hdj48YSBvbmNsaWNrPSJlbnRlck93bmVy
+UGFuZWwoKSIgaWQ9Im5hdi1vd25lciIgc3R5bGU9ImRpc3BsYXk6bm9uZTttYXJnaW4tdG9wOmF1
+dG87YmFja2dyb3VuZDpsaW5lYXItZ3JhZGllbnQoMTM1ZGVnLCNmZWYzYzcsI2ZkZTY4YSk7Y29s
+b3I6IzkyNDAwZTtib3JkZXItcmFkaXVzOjhweDttYXJnaW46MCAxMHB4IDhweCI+PHN2ZyB3aWR0
+aD0iMTUiIGhlaWdodD0iMTUiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJv
+a2Utd2lkdGg9IjIiIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTIgNGwzIDEyaDE0bDMt
+MTItNiA1LTQtNy00IDctNi01eiIvPjwvc3ZnPk93bmVyIFBhbmVsPC9hPjxkaXYgY2xhc3M9InNp
+ZGViYXItZm9vdGVyIj48ZGl2PjxzcGFuIGNsYXNzPSJzdGF0dXMtZG90IiBpZD0iZG90Ij48L3Nw
+YW4+PHNwYW4gY2xhc3M9InN0YXR1cy1sYWJlbCIgaWQ9InN0YXR1cy10eHQiPkNvbm5lY3Rpbmfi
+gKY8L3NwYW4+PC9kaXY+PGRpdiBjbGFzcz0idmVyc2lvbiI+djEuMC4wPC9kaXY+PGJ1dHRvbiBv
+bmNsaWNrPSJsb2dvdXRQYW5lbCgpIiBzdHlsZT0ibWFyZ2luLXRvcDo4cHg7d2lkdGg6MTAwJTti
+YWNrZ3JvdW5kOm5vbmU7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1ib3JkZXIpO2JvcmRlci1yYWRp
+dXM6NnB4O3BhZGRpbmc6NXB4IDA7Zm9udC1zaXplOjEycHg7Y29sb3I6dmFyKC0tbXV0ZWQpO2N1
+cnNvcjpwb2ludGVyO3RyYW5zaXRpb246LjE1cyIgb25tb3VzZW92ZXI9InRoaXMuc3R5bGUuYmFj
+a2dyb3VuZD0nI2ZlZTJlMic7dGhpcy5zdHlsZS5jb2xvcj0nI2RjMjYyNic7dGhpcy5zdHlsZS5i
+b3JkZXJDb2xvcj0nI2ZjYTVhNSciIG9ubW91c2VvdXQ9InRoaXMuc3R5bGUuYmFja2dyb3VuZD0n
+bm9uZSc7dGhpcy5zdHlsZS5jb2xvcj0ndmFyKC0tbXV0ZWQpJzt0aGlzLnN0eWxlLmJvcmRlckNv
+bG9yPSd2YXIoLS1ib3JkZXIpJyI+8J+UkyBMb2dvdXQgLyBTd2l0Y2ggQWNjb3VudDwvYnV0dG9u
+PjwvZGl2PjwvYXNpZGU+PGRpdiBjbGFzcz0ibWFpbiI+PGRpdiBjbGFzcz0idHVubmVsLWJhbm5l
+ciIgaWQ9InR1bm5lbC1iYW5uZXIiPjxzdmcgd2lkdGg9IjE0IiBoZWlnaHQ9IjE0IiBmaWxsPSJu
+b25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiB2aWV3Qm94PSIwIDAg
+MjQgMjQiPjxjaXJjbGUgY3g9IjEyIiBjeT0iMTIiIHI9IjEwIi8+PGxpbmUgeDE9IjIiIHkxPSIx
+MiIgeDI9IjIyIiB5Mj0iMTIiLz48cGF0aCBkPSJNMTIgMmExNS4zIDE1LjMgMCAwMTAgMjBNMTIg
+MmExNS4zIDE1LjMgMCAwMDAgMjAiLz48L3N2Zz48c3BhbiBzdHlsZT0iY29sb3I6Izk0YTNiODt3
+aGl0ZS1zcGFjZTpub3dyYXAiPlB1YmxpYyBVUkw6PC9zcGFuPjxzcGFuIGNsYXNzPSJ0dW5uZWwt
+dXJsIiBpZD0idHVubmVsLXVybC10ZXh0Ij7igJQ8L3NwYW4+PGJ1dHRvbiBjbGFzcz0idHVubmVs
+LWNvcHkiIG9uY2xpY2s9ImNvcHlUdW5uZWxVcmwoKSI+Q29weTwvYnV0dG9uPjwvZGl2PjxkaXYg
+Y2xhc3M9InRvcGJhciI+PGJ1dHRvbiBjbGFzcz0iaGFtYnVyZ2VyIiBvbmNsaWNrPSJ0b2dnbGVT
+aWRlYmFyKCkiIGFyaWEtbGFiZWw9IlRvZ2dsZSBtZW51Ij48c3ZnIHdpZHRoPSIyMCIgaGVpZ2h0
+PSIyMCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMi41
+IiB2aWV3Qm94PSIwIDAgMjQgMjQiPjxsaW5lIHgxPSIzIiB5MT0iNiIgeDI9IjIxIiB5Mj0iNiIv
+PjxsaW5lIHgxPSIzIiB5MT0iMTIiIHgyPSIyMSIgeTI9IjEyIi8+PGxpbmUgeDE9IjMiIHkxPSIx
+OCIgeDI9IjIxIiB5Mj0iMTgiLz48L3N2Zz48L2J1dHRvbj48ZGl2IGNsYXNzPSJ0b3BiYXItaWNv
+biI+PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVu
+dENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTEy
+IDIyczgtNCA4LTEwVjVsLTgtMy04IDN2N2MwIDYgOCAxMCA4IDEweiIvPjwvc3ZnPjwvZGl2Pjxz
+cGFuIGNsYXNzPSJ0b3BiYXItdGV4dCIgaWQ9Imt2bS1zdGF0dXMiPkNoZWNraW5nIEtWTeKApjwv
+c3Bhbj48ZGl2IGNsYXNzPSJ0b3BiYXItYnJhbmQiPjxzcGFuIGlkPSJwbGFuLWJhZGdlIiBjbGFz
+cz0icGxhbi1iYWRnZSBmcmVlIj7wn5STIEZyZWU8L3NwYW4+PHNwYW4+4pqhIDxzcGFuIGNsYXNz
+PSJicmFuZC1wb3dlcmVkIj5Qb3dlcmVkIGJ5PC9zcGFuPjxzcGFuIGNsYXNzPSJicmFuZC1uYW1l
+LXR4dCI+QWJkdWxsYWg8L3NwYW4+PC9zcGFuPjwvZGl2PjwvZGl2PjxtYWluIGNsYXNzPSJjb250
+ZW50Ij48c2VjdGlvbiBjbGFzcz0icGFnZSBhY3RpdmUiIGlkPSJwYWdlLWRhc2hib2FyZCI+PGgx
+PkRhc2hib2FyZDwvaDE+PHAgY2xhc3M9InN1YnRpdGxlIj5TeXN0ZW0gb3ZlcnZpZXcgYW5kIHJl
+c291cmNlIHV0aWxpc2F0aW9uLjwvcD48ZGl2IGNsYXNzPSJrdm0tYmFubmVyIiBpZD0ia3ZtLWJh
+bm5lciI+PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3Vy
+cmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0i
+TTEwLjI5IDMuODZMMS44MiAxOGEyIDIgMCAwMDEuNzEgM2gxNi45NGEyIDIgMCAwMDEuNzEtM0wx
+My43MSAzLjg2YTIgMiAwIDAwLTMuNDIgMHoiLz48bGluZSB4MT0iMTIiIHkxPSI5IiB4Mj0iMTIi
+IHkyPSIxMyIvPjxsaW5lIHgxPSIxMiIgeTE9IjE3IiB4Mj0iMTIuMDEiIHkyPSIxNyIvPjwvc3Zn
+PjxzcGFuIGlkPSJrdm0tYmFubmVyLW1zZyI+S1ZNIHZpcnR1YWxpc2F0aW9uIGlzIG5vdCBzdXBw
+b3J0ZWQgb24gdGhpcyBob3N0IOKAlCBWUFMgaW5zdGFuY2UgY29udHJvbHMgYXJlIGRpc2FibGVk
+Ljwvc3Bhbj48L2Rpdj48ZGl2IGNsYXNzPSJncmlkLTIiIHN0eWxlPSJtYXJnaW4tYm90dG9tOjIw
+cHgiPjxkaXYgY2xhc3M9ImNhcmQiPjxkaXYgY2xhc3M9ImNhcmQtaGVhZGVyIj48ZGl2IGNsYXNz
+PSJjYXJkLXRpdGxlIj48c3ZnIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgZmlsbD0ibm9uZSIgc3Ry
+b2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIgdmlld0JveD0iMCAwIDI0IDI0Ij48
+cG9seWxpbmUgcG9pbnRzPSIyMiAxMiAxOCAxMiAxNSAyMSA5IDMgNiAxMiAyIDEyIi8+PC9zdmc+
+TWVtb3J5IFVzYWdlPC9kaXY+PGRpdiBjbGFzcz0iY2FyZC1kZXNjIj5TeXN0ZW0gUkFNIHV0aWxp
+c2F0aW9uPC9kaXY+PC9kaXY+PGRpdiBjbGFzcz0iY2FyZC1ib2R5IG1ldGVyLXdyYXAiPjxzdmcg
+aWQ9Im1ldGVyLXJhbSIgdmlld0JveD0iMCAwIDIwMCAxMzIiIHdpZHRoPSIyMDAiIGhlaWdodD0i
+MTMyIj48L3N2Zz48L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJjYXJkIj48ZGl2IGNsYXNzPSJjYXJk
+LWhlYWRlciI+PGRpdiBjbGFzcz0iY2FyZC10aXRsZSI+PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0i
+MTYiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHZp
+ZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3QgeD0iMiIgeT0iMiIgd2lkdGg9IjIwIiBoZWlnaHQ9IjIw
+IiByeD0iMiIvPjxjaXJjbGUgY3g9IjEyIiBjeT0iMTIiIHI9IjMiLz48L3N2Zz5TdG9yYWdlIFVz
+YWdlPC9kaXY+PGRpdiBjbGFzcz0iY2FyZC1kZXNjIj5TeXN0ZW0gZGlzayB1dGlsaXNhdGlvbjwv
+ZGl2PjwvZGl2PjxkaXYgY2xhc3M9ImNhcmQtYm9keSBtZXRlci13cmFwIj48c3ZnIGlkPSJtZXRl
+ci1kaXNrIiB2aWV3Qm94PSIwIDAgMjAwIDEzMiIgd2lkdGg9IjIwMCIgaGVpZ2h0PSIxMzIiPjwv
+c3ZnPjwvZGl2PjwvZGl2PjwvZGl2PjxkaXYgY2xhc3M9ImdyaWQtMyIgc3R5bGU9Im1hcmdpbi1i
+b3R0b206MjBweCI+PGRpdiBjbGFzcz0iY2FyZCBjYXJkLWJvZHkiPjxkaXYgY2xhc3M9InN0YXQt
+bGFiZWwiPkNQVSBVc2FnZSA8c3ZnIHdpZHRoPSIxNCIgaGVpZ2h0PSIxNCIgZmlsbD0ibm9uZSIg
+c3Ryb2tlPSIjMjU2M2ViIiBzdHJva2Utd2lkdGg9IjIiIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJl
+Y3QgeD0iNCIgeT0iNCIgd2lkdGg9IjE2IiBoZWlnaHQ9IjE2IiByeD0iMiIvPjxyZWN0IHg9Ijki
+IHk9IjkiIHdpZHRoPSI2IiBoZWlnaHQ9IjYiLz48bGluZSB4MT0iOSIgeTE9IjIiIHgyPSI5IiB5
+Mj0iNCIvPjxsaW5lIHgxPSIxNSIgeTE9IjIiIHgyPSIxNSIgeTI9IjQiLz48bGluZSB4MT0iOSIg
+eTE9IjIwIiB4Mj0iOSIgeTI9IjIyIi8+PGxpbmUgeDE9IjE1IiB5MT0iMjAiIHgyPSIxNSIgeTI9
+IjIyIi8+PGxpbmUgeDE9IjIiIHkxPSI5IiB4Mj0iNCIgeTI9IjkiLz48bGluZSB4MT0iMiIgeTE9
+IjE1IiB4Mj0iNCIgeTI9IjE1Ii8+PGxpbmUgeDE9IjIwIiB5MT0iOSIgeDI9IjIyIiB5Mj0iOSIv
+PjxsaW5lIHgxPSIyMCIgeTE9IjE1IiB4Mj0iMjIiIHkyPSIxNSIvPjwvc3ZnPjwvZGl2PjxkaXYg
+Y2xhc3M9InN0YXQtdmFsdWUiIGlkPSJjcHUtcGN0Ij7igJQ8L2Rpdj48ZGl2IGNsYXNzPSJzdGF0
+LXN1YiIgaWQ9ImNwdS1tb2RlbCI+4oCUPC9kaXY+PC9kaXY+PGRpdiBjbGFzcz0iY2FyZCBjYXJk
+LWJvZHkiPjxkaXYgY2xhc3M9InN0YXQtbGFiZWwiPk5ldHdvcmsgVHJhZmZpYyA8c3ZnIHdpZHRo
+PSIxNCIgaGVpZ2h0PSIxNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMjU2M2ViIiBzdHJva2Utd2lk
+dGg9IjIiIHZpZXdCb3g9IjAgMCAyNCAyNCI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMyIv
+PjxsaW5lIHgxPSIxMiIgeTE9IjMiIHgyPSIxMiIgeTI9IjkiLz48bGluZSB4MT0iMTIiIHkxPSIx
+NSIgeDI9IjEyIiB5Mj0iMjEiLz48bGluZSB4MT0iMyIgeTE9IjEyIiB4Mj0iOSIgeTI9IjEyIi8+
+PGxpbmUgeDE9IjE1IiB5MT0iMTIiIHgyPSIyMSIgeTI9IjEyIi8+PC9zdmc+PC9kaXY+PGRpdiBz
+dHlsZT0iZGlzcGxheTpmbGV4O2p1c3RpZnktY29udGVudDpzcGFjZS1iZXR3ZWVuO21hcmdpbi10
+b3A6NnB4Ij48ZGl2PjxkaXYgY2xhc3M9InN0YXQtdmFsdWUiIHN0eWxlPSJmb250LXNpemU6MThw
+eCIgaWQ9Im5ldC1yeCI+4oCUPC9kaXY+PGRpdiBjbGFzcz0ic3RhdC1zdWIiPlJlY2VpdmVkIChS
+WCk8L2Rpdj48L2Rpdj48ZGl2PjxkaXYgY2xhc3M9InN0YXQtdmFsdWUiIHN0eWxlPSJmb250LXNp
+emU6MThweDt0ZXh0LWFsaWduOnJpZ2h0IiBpZD0ibmV0LXR4Ij7igJQ8L2Rpdj48ZGl2IGNsYXNz
+PSJzdGF0LXN1YiI+U2VudCAoVFgpPC9kaXY+PC9kaXY+PC9kaXY+PC9kaXY+PGRpdiBjbGFzcz0i
+Y2FyZCBjYXJkLWJvZHkiPjxkaXYgY2xhc3M9InN0YXQtbGFiZWwiPlN5c3RlbSBVcHRpbWUgPHN2
+ZyB3aWR0aD0iMTQiIGhlaWdodD0iMTQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzI1NjNlYiIgc3Ry
+b2tlLXdpZHRoPSIyIiB2aWV3Qm94PSIwIDAgMjQgMjQiPjxjaXJjbGUgY3g9IjEyIiBjeT0iMTIi
+IHI9IjEwIi8+PHBvbHlsaW5lIHBvaW50cz0iMTIgNiAxMiAxMiAxNiAxNCIvPjwvc3ZnPjwvZGl2
+PjxkaXYgY2xhc3M9InN0YXQtdmFsdWUiIGlkPSJ1cHRpbWUiPuKAlDwvZGl2PjxkaXYgY2xhc3M9
+InN0YXQtc3ViIj5Ub3RhbCBjb250aW51b3VzIHVwdGltZTwvZGl2PjwvZGl2PjwvZGl2PjxkaXYg
+Y2xhc3M9ImNhcmQiPjxkaXYgY2xhc3M9ImNhcmQtaGVhZGVyIj48ZGl2IGNsYXNzPSJjYXJkLXRp
+dGxlIj48c3ZnIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJy
+ZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIgdmlld0JveD0iMCAwIDI0IDI0Ij48cmVjdCB4PSIy
+IiB5PSIzIiB3aWR0aD0iMjAiIGhlaWdodD0iOCIgcng9IjEiLz48cmVjdCB4PSIyIiB5PSIxMyIg
+d2lkdGg9IjIwIiBoZWlnaHQ9IjgiIHJ4PSIxIi8+PC9zdmc+VmlydHVhbCBNYWNoaW5lczwvZGl2
+PjwvZGl2PjxkaXYgY2xhc3M9ImNhcmQtYm9keSI+PGRpdiBjbGFzcz0idm0tc3VtbWFyeSI+PGRp
+dj48ZGl2IGNsYXNzPSJ2bS10b3RhbCIgaWQ9InZtLXRvdGFsIj7igJQ8L2Rpdj48ZGl2IGNsYXNz
+PSJzdGF0LXN1YiI+VG90YWwgSW5zdGFuY2VzPC9kaXY+PC9kaXY+PGRpdiBjbGFzcz0idm0tY291
+bnRzIj48ZGl2IGNsYXNzPSJ2bS1jb3VudCI+PGRpdiBjbGFzcz0idm0tY291bnQtbnVtIiBzdHls
+ZT0iY29sb3I6dmFyKC0tZ3JlZW4pIiBpZD0idm0tcnVubmluZyI+4oCUPC9kaXY+PGRpdiBjbGFz
+cz0idm0tY291bnQtbGFiZWwiPlJ1bm5pbmc8L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJ2bS1jb3Vu
+dCI+PGRpdiBjbGFzcz0idm0tY291bnQtbnVtIiBzdHlsZT0iY29sb3I6dmFyKC0tcmVkKSIgaWQ9
+InZtLXN0b3BwZWQiPuKAlDwvZGl2PjxkaXYgY2xhc3M9InZtLWNvdW50LWxhYmVsIj5TdG9wcGVk
+PC9kaXY+PC9kaXY+PGRpdiBjbGFzcz0idm0tY291bnQiPjxkaXYgY2xhc3M9InZtLWNvdW50LW51
+bSIgc3R5bGU9ImNvbG9yOnZhcigtLWFtYmVyKSIgaWQ9InZtLXBhdXNlZCI+4oCUPC9kaXY+PGRp
+diBjbGFzcz0idm0tY291bnQtbGFiZWwiPlBhdXNlZDwvZGl2PjwvZGl2PjwvZGl2PjwvZGl2Pjwv
+ZGl2PjwvZGl2PjxkaXYgY2xhc3M9ImRhc2gtYm90dG9tIj48ZGl2IGNsYXNzPSJjYXJkIj48ZGl2
+IGNsYXNzPSJjYXJkLWhlYWRlciI+PGRpdiBjbGFzcz0iY2FyZC10aXRsZSI+PHN2ZyB3aWR0aD0i
+MTUiIGhlaWdodD0iMTUiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Ut
+d2lkdGg9IjIiIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3QgeD0iMiIgeT0iMyIgd2lkdGg9IjIw
+IiBoZWlnaHQ9IjgiIHJ4PSIxIi8+PHJlY3QgeD0iMiIgeT0iMTMiIHdpZHRoPSIyMCIgaGVpZ2h0
+PSI4IiByeD0iMSIvPjwvc3ZnPkluc3RhbmNlczwvZGl2PjxkaXYgY2xhc3M9ImNhcmQtZGVzYyI+
+U2VsZWN0IGFuIGluc3RhbmNlIHRvIGNvbnRyb2wgaXQ8L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJj
+YXJkLWJvZHkiPjx1bCBjbGFzcz0iZGFzaC12cHMtbGlzdCIgaWQ9ImRhc2gtdnBzLWxpc3QiPjxs
+aSBzdHlsZT0iY29sb3I6dmFyKC0tbXV0ZWQpO2ZvbnQtc2l6ZToxM3B4Ij5Mb2FkaW5n4oCmPC9s
+aT48L3VsPjwvZGl2PjwvZGl2PjxkaXYgY2xhc3M9ImNhcmQiPjxkaXYgY2xhc3M9ImNhcmQtaGVh
+ZGVyIj48ZGl2IGNsYXNzPSJjYXJkLXRpdGxlIj48c3ZnIHdpZHRoPSIxNSIgaGVpZ2h0PSIxNSIg
+ZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIgdmlld0Jv
+eD0iMCAwIDI0IDI0Ij48cG9seWdvbiBwb2ludHM9IjEzIDIgMyAxNCAxMiAxNCAxMSAyMiAyMSAx
+MCAxMiAxMCAxMyAyIi8+PC9zdmc+UXVpY2sgQWN0aW9uczwvZGl2PjxkaXYgY2xhc3M9ImNhcmQt
+ZGVzYyIgaWQ9InFhLXNlbGVjdGVkLW5hbWUiPk5vIGluc3RhbmNlIHNlbGVjdGVkPC9kaXY+PC9k
+aXY+PGRpdiBjbGFzcz0iY2FyZC1ib2R5IiBpZD0icWEtYm9keSI+PGRpdiBjbGFzcz0icWEtbm9u
+ZSI+U2VsZWN0IGFuIGluc3RhbmNlIGZyb20gdGhlIGxpc3Q8L2Rpdj48L2Rpdj48L2Rpdj48L2Rp
+dj48L3NlY3Rpb24+PHNlY3Rpb24gY2xhc3M9InBhZ2UiIGlkPSJwYWdlLXZwcyI+PGgxPlZQUyBN
+YW5hZ2VyPC9oMT48cCBjbGFzcz0ic3VidGl0bGUiPk1hbmFnZSwgbW9uaXRvciwgYW5kIGNvbnRy
+b2wgeW91ciB2aXJ0dWFsIGluc3RhbmNlcy48L3A+PGRpdiBjbGFzcz0idHdvLXBhbmVsIj48ZGl2
+IGNsYXNzPSJjYXJkIj48ZGl2IGNsYXNzPSJjYXJkLWhlYWRlciI+PGRpdiBjbGFzcz0iY2FyZC10
+aXRsZSI+SW5zdGFuY2VzPC9kaXY+PC9kaXY+PGRpdiBjbGFzcz0iY2FyZC1ib2R5Ij48dWwgY2xh
+c3M9InZwcy1saXN0IiBpZD0idnBzLWxpc3QiPjxsaSBzdHlsZT0iY29sb3I6dmFyKC0tbXV0ZWQp
+O2ZvbnQtc2l6ZToxNHB4Ij5Mb2FkaW5n4oCmPC9saT48L3VsPjwvZGl2PjwvZGl2PjxkaXYgY2xh
+c3M9ImNhcmQiPjxkaXYgY2xhc3M9ImNhcmQtaGVhZGVyIj48ZGl2IGNsYXNzPSJjYXJkLXRpdGxl
+Ij5Db250cm9sczwvZGl2PjwvZGl2PjxkaXYgY2xhc3M9ImNhcmQtYm9keSIgaWQ9ImNvbnRyb2xz
+LWJvZHkiPjxkaXYgY2xhc3M9Im5vLXNlbGVjdGlvbiI+PHN2ZyB3aWR0aD0iNDAiIGhlaWdodD0i
+NDAiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjEuNSIg
+dmlld0JveD0iMCAwIDI0IDI0Ij48cmVjdCB4PSIyIiB5PSIzIiB3aWR0aD0iMjAiIGhlaWdodD0i
+OCIgcng9IjEiLz48cmVjdCB4PSIyIiB5PSIxMyIgd2lkdGg9IjIwIiBoZWlnaHQ9IjgiIHJ4PSIx
+Ii8+PC9zdmc+PHNwYW4gc3R5bGU9ImZvbnQtc2l6ZToxNHB4Ij5TZWxlY3QgYW4gaW5zdGFuY2Ug
+dG8gbWFuYWdlPC9zcGFuPjwvZGl2PjwvZGl2PjwvZGl2PjwvZGl2Pjwvc2VjdGlvbj48c2VjdGlv
+biBjbGFzcz0icGFnZSIgaWQ9InBhZ2UtY3JlYXRlIj48aDE+Q3JlYXRlIEluc3RhbmNlPC9oMT48
+cCBjbGFzcz0ic3VidGl0bGUiPkRlcGxveSBhIG5ldyBLVk0gdmlydHVhbCBtYWNoaW5lLjwvcD48
+ZGl2IGNsYXNzPSJjYXJkIiBzdHlsZT0ibWF4LXdpZHRoOjY4MHB4Ij48ZGl2IGNsYXNzPSJjYXJk
+LWhlYWRlciI+PGRpdiBjbGFzcz0iY2FyZC10aXRsZSI+PHN2ZyB3aWR0aD0iMTUiIGhlaWdodD0i
+MTUiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHZp
+ZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3QgeD0iMiIgeT0iMyIgd2lkdGg9IjIwIiBoZWlnaHQ9Ijgi
+IHJ4PSIxIi8+PHJlY3QgeD0iMiIgeT0iMTMiIHdpZHRoPSIyMCIgaGVpZ2h0PSI4IiByeD0iMSIv
+Pjwvc3ZnPkluc3RhbmNlIERldGFpbHM8L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJjYXJkLWJvZHki
+Pjxmb3JtIGlkPSJjcmVhdGUtZm9ybSIgb25zdWJtaXQ9InN1Ym1pdENyZWF0ZShldmVudCkiPjxk
+aXYgY2xhc3M9ImZvcm0tZ3JpZCI+PGRpdiBjbGFzcz0iZm9ybS1maWVsZCI+PGxhYmVsPkluc3Rh
+bmNlIE5hbWUgKjwvbGFiZWw+PGlucHV0IGlkPSJmLW5hbWUiIHBsYWNlaG9sZGVyPSJlLmcuIHdl
+Yi1zZXJ2ZXItMDEiIHJlcXVpcmVkIHBhdHRlcm49IlthLXpBLVowLTlfXC1dezEsNjR9Ii8+PHNw
+YW4gY2xhc3M9ImhpbnQiPkxldHRlcnMsIG51bWJlcnMsIGRhc2gsIHVuZGVyc2NvcmUgb25seS48
+L3NwYW4+PC9kaXY+PGRpdiBjbGFzcz0iZm9ybS1maWVsZCI+PGxhYmVsPk9TIFZhcmlhbnQ8L2xh
+YmVsPjxpbnB1dCBpZD0iZi12YXJpYW50IiB2YWx1ZT0idWJ1bnR1MjIuMDQiIHBsYWNlaG9sZGVy
+PSJ1YnVudHUyMi4wNCIvPjxzcGFuIGNsYXNzPSJoaW50Ij5Vc2VkIGJ5IHZpcnQtaW5zdGFsbCBm
+b3Igb3B0aW1pc2F0aW9ucy48L3NwYW4+PC9kaXY+PGRpdiBjbGFzcz0iZm9ybS1maWVsZCI+PGxh
+YmVsPlJBTSAoTUIpICo8L2xhYmVsPjxpbnB1dCBpZD0iZi1yYW0iIHR5cGU9Im51bWJlciIgbWlu
+PSIxMjgiIG1heD0iNTI0Mjg4IiB2YWx1ZT0iMTAyNCIgcmVxdWlyZWQvPjxzcGFuIGNsYXNzPSJo
+aW50Ij5NaW5pbXVtIDEyOCBNQi48L3NwYW4+PC9kaXY+PGRpdiBjbGFzcz0iZm9ybS1maWVsZCI+
+PGxhYmVsPnZDUFVzICo8L2xhYmVsPjxpbnB1dCBpZD0iZi12Y3B1cyIgdHlwZT0ibnVtYmVyIiBt
+aW49IjEiIG1heD0iMTI4IiB2YWx1ZT0iMSIgcmVxdWlyZWQvPjwvZGl2PjxkaXYgY2xhc3M9ImZv
+cm0tZmllbGQiPjxsYWJlbD5EaXNrIChHQikgKjwvbGFiZWw+PGlucHV0IGlkPSJmLWRpc2siIHR5
+cGU9Im51bWJlciIgbWluPSIxIiBtYXg9IjEwMDAwIiB2YWx1ZT0iMjAiIHJlcXVpcmVkLz48L2Rp
+dj48ZGl2IGNsYXNzPSJmb3JtLWZpZWxkIj48bGFiZWw+SVNPIFBhdGggKG9wdGlvbmFsKTwvbGFi
+ZWw+PGlucHV0IGlkPSJmLWlzbyIgcGxhY2Vob2xkZXI9Ii92YXIvbGliL2xpYnZpcnQvaW1hZ2Vz
+L3VidW50dS5pc28iLz48c3BhbiBjbGFzcz0iaGludCI+TGVhdmUgYmxhbmsgZm9yIG5ldHdvcmsv
+dGVtcGxhdGUgaW5zdGFsbC48L3NwYW4+PC9kaXY+PGRpdiBjbGFzcz0iZm9ybS1maWVsZCBmdWxs
+IiBzdHlsZT0ibWFyZ2luLXRvcDo4cHgiPjxidXR0b24gdHlwZT0ic3VibWl0IiBjbGFzcz0iYnRu
+IGJ0bi1wcmltYXJ5Ij48c3ZnIHdpZHRoPSIxNSIgaGVpZ2h0PSIxNSIgZmlsbD0ibm9uZSIgc3Ry
+b2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIgdmlld0JveD0iMCAwIDI0IDI0Ij48
+Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSIxMCIvPjxsaW5lIHgxPSIxMiIgeTE9IjgiIHgyPSIx
+MiIgeTI9IjE2Ii8+PGxpbmUgeDE9IjgiIHkxPSIxMiIgeDI9IjE2IiB5Mj0iMTIiLz48L3N2Zz5D
+cmVhdGUgSW5zdGFuY2U8L2J1dHRvbj48L2Rpdj48L2Rpdj48L2Zvcm0+PC9kaXY+PC9kaXY+PC9z
+ZWN0aW9uPjxzZWN0aW9uIGNsYXNzPSJwYWdlIiBpZD0icGFnZS1vd25lciI+PGgxPvCfkZEgT3du
+ZXIgUGFuZWw8L2gxPjxwIGNsYXNzPSJzdWJ0aXRsZSI+R2VuZXJhdGUgcHJlbWl1bSBrZXlzLCBt
+YW5hZ2UgZmVhdHVyZSBhY2Nlc3MsIGFuZCB2aWV3IGFuYWx5dGljcy48L3A+PGRpdiBjbGFzcz0i
+b3duZXItdGFicyI+PGJ1dHRvbiBjbGFzcz0ib3duZXItdGFiIGFjdGl2ZSIgb25jbGljaz0ib3du
+ZXJUYWIoJ2FuYWx5dGljcycsdGhpcykiPvCfk4ogQW5hbHl0aWNzPC9idXR0b24+PGJ1dHRvbiBj
+bGFzcz0ib3duZXItdGFiIiBvbmNsaWNrPSJvd25lclRhYigna2V5cycsdGhpcykiPvCflJEgS2V5
+czwvYnV0dG9uPjxidXR0b24gY2xhc3M9Im93bmVyLXRhYiIgb25jbGljaz0ib3duZXJUYWIoJ2xv
+Z3MnLHRoaXMpIj7wn5OLIExvZ3M8L2J1dHRvbj48L2Rpdj48ZGl2IGNsYXNzPSJvd25lci10YWIt
+cGFuZWwgYWN0aXZlIiBpZD0ib3RhYi1hbmFseXRpY3MiPjxkaXYgY2xhc3M9Im93bmVyLWFuYWx5
+dGljcyIgaWQ9ImFuYS1jYXJkcyI+PGRpdiBjbGFzcz0iYW5hLWNhcmQiPjxkaXYgY2xhc3M9ImFu
+YS1udW0iIHN0eWxlPSJjb2xvcjp2YXIoLS1ibHVlKSI+4oCUPC9kaXY+PGRpdiBjbGFzcz0iYW5h
+LWxhYmVsIj5Ub3RhbCBLZXlzPC9kaXY+PC9kaXY+PGRpdiBjbGFzcz0iYW5hLWNhcmQiPjxkaXYg
+Y2xhc3M9ImFuYS1udW0iIHN0eWxlPSJjb2xvcjp2YXIoLS1ncmVlbikiPuKAlDwvZGl2PjxkaXYg
+Y2xhc3M9ImFuYS1sYWJlbCI+QWN0aXZlIEtleXM8L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJhbmEt
+Y2FyZCI+PGRpdiBjbGFzcz0iYW5hLW51bSIgc3R5bGU9ImNvbG9yOiMwMzY5YTEiPuKAlDwvZGl2
+PjxkaXYgY2xhc3M9ImFuYS1sYWJlbCI+VXNlZCBLZXlzPC9kaXY+PC9kaXY+PGRpdiBjbGFzcz0i
+YW5hLWNhcmQiPjxkaXYgY2xhc3M9ImFuYS1udW0iIHN0eWxlPSJjb2xvcjojN2MzYWVkIj7igJQ8
+L2Rpdj48ZGl2IGNsYXNzPSJhbmEtbGFiZWwiPkFjdGl2YXRpb25zPC9kaXY+PC9kaXY+PC9kaXY+
+PGRpdiBjbGFzcz0iY2FyZCI+PGRpdiBjbGFzcz0iY2FyZC1oZWFkZXIiPjxkaXYgY2xhc3M9ImNh
+cmQtdGl0bGUiPlJlY2VudCBBY3RpdmF0aW9uczwvZGl2PjwvZGl2PjxkaXYgY2xhc3M9ImNhcmQt
+Ym9keSIgaWQ9ImFuYS1yZWNlbnQtbG9ncyI+PGRpdiBzdHlsZT0iY29sb3I6dmFyKC0tbXV0ZWQp
+O2ZvbnQtc2l6ZToxNHB4Ij5Mb2FkaW5n4oCmPC9kaXY+PC9kaXY+PC9kaXY+PC9kaXY+PGRpdiBj
+bGFzcz0ib3duZXItdGFiLXBhbmVsIiBpZD0ib3RhYi1rZXlzIj48ZGl2IGNsYXNzPSJnZW4tcGFu
+ZWwgY2FyZCIgc3R5bGU9InBhZGRpbmc6MjBweDttYXJnaW4tYm90dG9tOjIwcHgiPjxkaXYgY2xh
+c3M9ImNhcmQtdGl0bGUiIHN0eWxlPSJtYXJnaW4tYm90dG9tOjE2cHgiPjxzdmcgd2lkdGg9IjE1
+IiBoZWlnaHQ9IjE1IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdp
+ZHRoPSIyIiB2aWV3Qm94PSIwIDAgMjQgMjQiPjxjaXJjbGUgY3g9IjEyIiBjeT0iMTIiIHI9IjEw
+Ii8+PGxpbmUgeDE9IjEyIiB5MT0iOCIgeDI9IjEyIiB5Mj0iMTYiLz48bGluZSB4MT0iOCIgeTE9
+IjEyIiB4Mj0iMTYiIHkyPSIxMiIvPjwvc3ZnPkdlbmVyYXRlIE5ldyBLZXk8L2Rpdj48ZGl2IGNs
+YXNzPSJnZW4tcm93Ij48ZGl2IGNsYXNzPSJnZW4tZmllbGQiPjxsYWJlbCBjbGFzcz0iZ2VuLWxh
+YmVsIj5DdXN0b20gS2V5IChvcHRpb25hbCk8L2xhYmVsPjxpbnB1dCBjbGFzcz0iZ2VuLWlucHV0
+IiBpZD0iZ2VuLWN1c3RvbSIgcGxhY2Vob2xkZXI9IkNQTS1YWFhYLVhYWFggYXV0byBpZiBibGFu
+ayIvPjwvZGl2PjxkaXYgY2xhc3M9Imdlbi1maWVsZCI+PGxhYmVsIGNsYXNzPSJnZW4tbGFiZWwi
+PkV4cGlyeSBWYWx1ZTwvbGFiZWw+PGlucHV0IGNsYXNzPSJnZW4taW5wdXQiIGlkPSJnZW4tZXhw
+LXZhbCIgdHlwZT0ibnVtYmVyIiBtaW49IjEiIHBsYWNlaG9sZGVyPSJMZWF2ZSBibGFuayA9IG5l
+dmVyIi8+PC9kaXY+PGRpdiBjbGFzcz0iZ2VuLWZpZWxkIj48bGFiZWwgY2xhc3M9Imdlbi1sYWJl
+bCI+RXhwaXJ5IFVuaXQ8L2xhYmVsPjxzZWxlY3QgY2xhc3M9Imdlbi1zZWxlY3QiIGlkPSJnZW4t
+ZXhwLXVuaXQiPjxvcHRpb24gdmFsdWU9ImRheXMiPkRheXM8L29wdGlvbj48b3B0aW9uIHZhbHVl
+PSJtb250aHMiPk1vbnRoczwvb3B0aW9uPjxvcHRpb24gdmFsdWU9InllYXJzIj5ZZWFyczwvb3B0
+aW9uPjwvc2VsZWN0PjwvZGl2PjxkaXYgY2xhc3M9Imdlbi1maWVsZCI+PGxhYmVsIGNsYXNzPSJn
+ZW4tbGFiZWwiPk1heCBVc2VzPC9sYWJlbD48c2VsZWN0IGNsYXNzPSJnZW4tc2VsZWN0IiBpZD0i
+Z2VuLXVzZXMiPjxvcHRpb24gdmFsdWU9IjEiPjEgKE9uZS10aW1lKTwvb3B0aW9uPjxvcHRpb24g
+dmFsdWU9IjUiPjU8L29wdGlvbj48b3B0aW9uIHZhbHVlPSIxMCI+MTA8L29wdGlvbj48b3B0aW9u
+IHZhbHVlPSItMSI+VW5saW1pdGVkPC9vcHRpb24+PC9zZWxlY3Q+PC9kaXY+PGRpdiBjbGFzcz0i
+Z2VuLWZpZWxkIj48bGFiZWwgY2xhc3M9Imdlbi1sYWJlbCI+Tm90ZTwvbGFiZWw+PGlucHV0IGNs
+YXNzPSJnZW4taW5wdXQiIGlkPSJnZW4tbm90ZSIgcGxhY2Vob2xkZXI9Ik9wdGlvbmFsIG5vdGUi
+Lz48L2Rpdj48ZGl2IGNsYXNzPSJnZW4tZmllbGQiPjxsYWJlbCBjbGFzcz0iZ2VuLWxhYmVsIj4m
+bmJzcDs8L2xhYmVsPjxidXR0b24gY2xhc3M9ImJ0biBidG4tcHJpbWFyeSIgb25jbGljaz0ib3du
+ZXJHZW5lcmF0ZUtleSgpIj7imqEgR2VuZXJhdGU8L2J1dHRvbj48L2Rpdj48L2Rpdj48L2Rpdj48
+ZGl2IGNsYXNzPSJjYXJkIj48ZGl2IGNsYXNzPSJjYXJkLWhlYWRlciI+PGRpdiBjbGFzcz0iY2Fy
+ZC10aXRsZSI+UHJlbWl1bSBLZXlzPC9kaXY+PGJ1dHRvbiBjbGFzcz0iYnRuIGJ0bi1zZWNvbmRh
+cnkiIG9uY2xpY2s9Im93bmVyTG9hZEtleXMoKSIgc3R5bGU9InBhZGRpbmc6NnB4IDE0cHg7Zm9u
+dC1zaXplOjEycHgiPuKGuyBSZWZyZXNoPC9idXR0b24+PC9kaXY+PGRpdiBjbGFzcz0iY2FyZC1i
+b2R5IiBzdHlsZT0ib3ZlcmZsb3cteDphdXRvO3BhZGRpbmc6MCI+PHRhYmxlIGNsYXNzPSJrZXkt
+dGFibGUiPjx0aGVhZD48dHI+PHRoPktleSAvIElEPC90aD48dGg+U3RhdHVzPC90aD48dGg+RXhw
+aXJlczwvdGg+PHRoPlVzZXM8L3RoPjx0aD5BY3Rpb25zPC90aD48L3RyPjwvdGhlYWQ+PHRib2R5
+IGlkPSJrZXlzLXRib2R5Ij48dHI+PHRkIGNvbHNwYW49IjUiIHN0eWxlPSJ0ZXh0LWFsaWduOmNl
+bnRlcjtjb2xvcjp2YXIoLS1tdXRlZCk7cGFkZGluZzoyNHB4Ij5Mb2FkaW5n4oCmPC90ZD48L3Ry
+PjwvdGJvZHk+PC90YWJsZT48L2Rpdj48L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJvd25lci10YWIt
+cGFuZWwiIGlkPSJvdGFiLWxvZ3MiPjxkaXYgY2xhc3M9ImNhcmQiPjxkaXYgY2xhc3M9ImNhcmQt
+aGVhZGVyIj48ZGl2IGNsYXNzPSJjYXJkLXRpdGxlIj5BY3RpdmF0aW9uIExvZ3M8L2Rpdj48YnV0
+dG9uIGNsYXNzPSJidG4gYnRuLXNlY29uZGFyeSIgb25jbGljaz0ib3duZXJMb2FkTG9ncygpIiBz
+dHlsZT0icGFkZGluZzo2cHggMTRweDtmb250LXNpemU6MTJweCI+4oa7IFJlZnJlc2g8L2J1dHRv
+bj48L2Rpdj48ZGl2IGNsYXNzPSJjYXJkLWJvZHkiIHN0eWxlPSJwYWRkaW5nOjAiIGlkPSJsb2ct
+bGlzdCI+PGRpdiBzdHlsZT0iY29sb3I6dmFyKC0tbXV0ZWQpO3BhZGRpbmc6MjRweDtmb250LXNp
+emU6MTRweCI+TG9hZGluZ+KApjwvZGl2PjwvZGl2PjwvZGl2PjwvZGl2Pjwvc2VjdGlvbj48c2Vj
+dGlvbiBjbGFzcz0icGFnZSIgaWQ9InBhZ2Utc3RvcmFnZSI+PGgxPkNsb3VkIFN0b3JhZ2U8L2gx
+PjxwIGNsYXNzPSJzdWJ0aXRsZSI+U3RvcmUgYW5kIG1hbmFnZSBmaWxlcyBkaXJlY3RseSBvbiB5
+b3VyIFZQUyBkaXNrLjwvcD48ZGl2IGNsYXNzPSJjYXJkIiBzdHlsZT0ibWFyZ2luLWJvdHRvbToy
+MHB4Ij48ZGl2IGNsYXNzPSJjYXJkLWJvZHkiIHN0eWxlPSJwYWRkaW5nOjE2cHggMjJweCI+PGRp
+diBzdHlsZT0iZGlzcGxheTpmbGV4O2p1c3RpZnktY29udGVudDpzcGFjZS1iZXR3ZWVuO2FsaWdu
+LWl0ZW1zOmNlbnRlcjttYXJnaW4tYm90dG9tOjhweCI+PGRpdiBzdHlsZT0iZm9udC1zaXplOjEz
+cHg7Zm9udC13ZWlnaHQ6NjAwO2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7Z2FwOjZw
+eCI+PHN2ZyB3aWR0aD0iMTQiIGhlaWdodD0iMTQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVu
+dENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHZpZXdCb3g9IjAgMCAyNCAyNCI+PGVsbGlwc2UgY3g9
+IjEyIiBjeT0iNSIgcng9IjkiIHJ5PSIzIi8+PHBhdGggZD0iTTIxIDEyYzAgMS42Ni00LjAzIDMt
+OSAzUzMgMTMuNjYgMyAxMiIvPjxwYXRoIGQ9Ik0zIDV2MTRjMCAxLjY2IDQuMDMgMyA5IDNzOS0x
+LjM0IDktM1Y1Ii8+PC9zdmc+RGlzayBVc2FnZTwvZGl2PjxkaXYgc3R5bGU9ImZvbnQtc2l6ZTox
+MnB4O2NvbG9yOnZhcigtLW11dGVkKSIgaWQ9InN0b3JhZ2UtdXNhZ2UtdGV4dCI+4oCUPC9kaXY+
+PC9kaXY+PGRpdiBjbGFzcz0ic3RvcmFnZS1iYXItd3JhcCI+PGRpdiBjbGFzcz0ic3RvcmFnZS1i
+YXItZmlsbCIgaWQ9InN0b3JhZ2UtYmFyIiBzdHlsZT0id2lkdGg6MCUiPjwvZGl2PjwvZGl2Pjxk
+aXYgc3R5bGU9ImZvbnQtc2l6ZToxMXB4O2NvbG9yOnZhcigtLW11dGVkKTttYXJnaW4tdG9wOjRw
+eCI+U3RvcmFnZSByb290OiAvb3B0L2NwbS1zdG9yYWdlLzwvZGl2PjwvZGl2PjwvZGl2PjxkaXYg
+Y2xhc3M9ImNhcmQiPjxkaXYgY2xhc3M9ImNhcmQtaGVhZGVyIiBzdHlsZT0icGFkZGluZy1ib3R0
+b206MTRweCI+PGRpdiBjbGFzcz0ic3RvcmFnZS1jcnVtYiIgaWQ9InN0b3JhZ2UtY3J1bWIiPjxz
+cGFuIG9uY2xpY2s9InN0b3JhZ2VUbygnJykiIHN0eWxlPSJjdXJzb3I6cG9pbnRlcjtjb2xvcjp2
+YXIoLS1ibHVlKTtmb250LXdlaWdodDo2MDAiPvCfk4EgU3RvcmFnZTwvc3Bhbj48L2Rpdj48ZGl2
+IGNsYXNzPSJzdG9yYWdlLXRvb2xiYXIiPjxidXR0b24gY2xhc3M9ImJ0biIgb25jbGljaz0icmVx
+dWlyZVByZW1pdW0oJ2ZpbGVfdXBsb2FkJywoKT0+c3RvcmFnZVVwbG9hZCgpKSIgc3R5bGU9ImJh
+Y2tncm91bmQ6dmFyKC0tYmx1ZSk7Y29sb3I6I2ZmZjtkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6
+Y2VudGVyO2dhcDo2cHgiPjxzdmcgd2lkdGg9IjEzIiBoZWlnaHQ9IjEzIiBmaWxsPSJub25lIiBz
+dHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyLjUiIHZpZXdCb3g9IjAgMCAyNCAy
+NCI+PHBvbHlsaW5lIHBvaW50cz0iMTYgMTYgMTIgMTIgOCAxNiIvPjxsaW5lIHgxPSIxMiIgeTE9
+IjEyIiB4Mj0iMTIiIHkyPSIyMSIvPjxwYXRoIGQ9Ik0yMC4zOSAxOC4zOUE1IDUgMCAwIDAgMTgg
+OWgtMS4yNkE4IDggMCAxIDAgMyAxNi4zIi8+PC9zdmc+VXBsb2FkIEZpbGUg8J+RkTwvYnV0dG9u
+PjxidXR0b24gY2xhc3M9ImJ0biIgb25jbGljaz0ic3RvcmFnZU1rZGlyKCkiIHN0eWxlPSJkaXNw
+bGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2dhcDo2cHgiPjxzdmcgd2lkdGg9IjEzIiBoZWln
+aHQ9IjEzIiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIy
+IiB2aWV3Qm94PSIwIDAgMjQgMjQiPjxwYXRoIGQ9Ik0yMiAxOWEyIDIgMCAwIDEtMiAySDRhMiAy
+IDAgMCAxLTItMlY1YTIgMiAwIDAgMSAyLTJoNWwyIDNoOWEyIDIgMCAwIDEgMiAyeiIvPjxsaW5l
+IHgxPSIxMiIgeTE9IjExIiB4Mj0iMTIiIHkyPSIxNyIvPjxsaW5lIHgxPSI5IiB5MT0iMTQiIHgy
+PSIxNSIgeTI9IjE0Ii8+PC9zdmc+TmV3IEZvbGRlcjwvYnV0dG9uPjwvZGl2PjwvZGl2PjxkaXYg
+Y2xhc3M9ImNhcmQtYm9keSIgc3R5bGU9InBhZGRpbmc6MCI+PGRpdiBpZD0ic3RvcmFnZS1maWxl
+LWxpc3QiPjxkaXYgc3R5bGU9InBhZGRpbmc6MzJweDtjb2xvcjp2YXIoLS1tdXRlZCk7dGV4dC1h
+bGlnbjpjZW50ZXIiPk9wZW4gdGhlIENsb3VkIFN0b3JhZ2UgcGFnZSB0byBsb2FkIGZpbGVzLjwv
+ZGl2PjwvZGl2PjwvZGl2PjwvZGl2PjxpbnB1dCB0eXBlPSJmaWxlIiBpZD0ic3RvcmFnZS1maWxl
+LWlucHV0IiBzdHlsZT0iZGlzcGxheTpub25lIiBtdWx0aXBsZSBvbmNoYW5nZT0ic3RvcmFnZURv
+VXBsb2FkKHRoaXMpIi8+PC9zZWN0aW9uPjxzZWN0aW9uIGNsYXNzPSJwYWdlIiBpZD0icGFnZS11
+aWN1c3RvbSI+PGgxPvCfjqggVUkgQ3VzdG9taXphdGlvbjwvaDE+PHAgY2xhc3M9InN1YnRpdGxl
+Ij5QZXJzb25hbGl6ZSBldmVyeSBhc3BlY3Qgb2YgeW91ciBwYW5lbCdzIGFwcGVhcmFuY2Ug4oCU
+IGNoYW5nZXMgYXBwbHkgbGl2ZSBpbnN0YW50bHkuPC9wPjxkaXYgY2xhc3M9ImNhcmQiIHN0eWxl
+PSJtYXJnaW4tYm90dG9tOjIwcHgiPjxkaXYgY2xhc3M9ImNhcmQtaGVhZGVyIj48ZGl2IGNsYXNz
+PSJjYXJkLXRpdGxlIj48c3ZnIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgZmlsbD0ibm9uZSIgc3Ry
+b2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIgdmlld0JveD0iMCAwIDI0IDI0Ij48
+cGF0aCBkPSJNMTIgMjJDNi41IDIyIDIgMTcuNSAyIDEyYzAtNS41IDQuNS0xMCAxMC0xMCA0LjUg
+MCA4IDMuMSA4IDcgMCAyLjgtMi4yIDUtNSA1aC0xLjRjLS42IDAtMSAuNS0xIDEuMSAwIC4zLjEu
+NS4xLjguMS41LS4yIDEtLjcgMS4xeiIvPjxjaXJjbGUgY3g9IjguNSIgY3k9IjkuNSIgcj0iMS41
+IiBmaWxsPSJjdXJyZW50Q29sb3IiIHN0cm9rZT0ibm9uZSIvPjxjaXJjbGUgY3g9IjEyIiBjeT0i
+NyIgcj0iMS41IiBmaWxsPSJjdXJyZW50Q29sb3IiIHN0cm9rZT0ibm9uZSIvPjxjaXJjbGUgY3g9
+IjE1LjUiIGN5PSI5LjUiIHI9IjEuNSIgZmlsbD0iY3VycmVudENvbG9yIiBzdHJva2U9Im5vbmUi
+Lz48L3N2Zz5Db2xvciBUaGVtZXM8L2Rpdj48cCBjbGFzcz0iY2FyZC1kZXNjIj5PbmUtY2xpY2sg
+cHJlc2V0cyB0aGF0IHN0eWxlIHRoZSB3aG9sZSBwYW5lbCBpbnN0YW50bHk8L3A+PC9kaXY+PGRp
+diBjbGFzcz0iY2FyZC1ib2R5Ij48ZGl2IGNsYXNzPSJ1aWMtc2VjdGlvbiI+PGRpdiBjbGFzcz0i
+dWljLWxhYmVsIj5UaGVtZSBQcmVzZXRzPC9kaXY+PGRpdiBjbGFzcz0idWljLXByZXNldHMiIGlk
+PSJ1aWMtcHJlc2V0LWJ0bnMiPjwvZGl2PjwvZGl2PjxkaXYgY2xhc3M9InVpYy1zZWN0aW9uIiBz
+dHlsZT0ibWFyZ2luLXRvcDoxNnB4O3BhZGRpbmctdG9wOjE0cHg7Ym9yZGVyLXRvcDoxcHggc29s
+aWQgdmFyKC0tYm9yZGVyKSI+PGRpdiBjbGFzcz0idWljLWxhYmVsIj5RdWljayBDb2xvciBBZGp1
+c3RtZW50czwvZGl2PjxkaXYgc3R5bGU9ImRpc3BsYXk6ZmxleDtnYXA6MjBweDtmbGV4LXdyYXA6
+d3JhcDttYXJnaW4tdG9wOjEwcHgiPjxkaXYgY2xhc3M9InVpYy1jb2xvci1yb3ciPjxkaXYgY2xh
+c3M9InVpYy1zd2F0Y2giIGlkPSJzdy10ZXh0Ij48aW5wdXQgdHlwZT0iY29sb3IiIGlkPSJ1aWMt
+Y2xyLXRleHQiIG9uaW5wdXQ9InVpY1BpY2tDb2xvcigndGV4dCcsdGhpcykiIG9uY2hhbmdlPSJ1
+aWNQaWNrQ29sb3IoJ3RleHQnLHRoaXMpIi8+PC9kaXY+PHNwYW4gY2xhc3M9InVpYy1jb2xvci1u
+YW1lIj5UZXh0IENvbG9yPC9zcGFuPjwvZGl2PjxkaXYgY2xhc3M9InVpYy1jb2xvci1yb3ciPjxk
+aXYgY2xhc3M9InVpYy1zd2F0Y2giIGlkPSJzdy1ibHVlIj48aW5wdXQgdHlwZT0iY29sb3IiIGlk
+PSJ1aWMtY2xyLWJsdWUiIG9uaW5wdXQ9InVpY1BpY2tDb2xvcignYmx1ZScsdGhpcykiIG9uY2hh
+bmdlPSJ1aWNQaWNrQ29sb3IoJ2JsdWUnLHRoaXMpIi8+PC9kaXY+PHNwYW4gY2xhc3M9InVpYy1j
+b2xvci1uYW1lIj5CdXR0b24gQ29sb3I8L3NwYW4+PC9kaXY+PC9kaXY+PGRpdiBjbGFzcz0idWlj
+LXRpcCIgc3R5bGU9Im1hcmdpbi10b3A6MTBweCI+8J+SoSBUaGVzZSBhZGp1c3RtZW50cyBvdmVy
+cmlkZSB0aGUgY3VycmVudCB0aGVtZS4gU2VsZWN0IGFueSBwcmVzZXQgdG8gcmVzZXQgdGhlbS48
+L2Rpdj48L2Rpdj48L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJjYXJkIiBzdHlsZT0ibWFyZ2luLWJv
+dHRvbToyMHB4Ij48ZGl2IGNsYXNzPSJjYXJkLWhlYWRlciI+PGRpdiBjbGFzcz0iY2FyZC10aXRs
+ZSI+PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVu
+dENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3QgeD0iMiIg
+eT0iMyIgd2lkdGg9IjIwIiBoZWlnaHQ9IjE0IiByeD0iMiIvPjxwYXRoIGQ9Ik04IDIxaDhNMTIg
+MTd2NCIvPjwvc3ZnPkJhY2tncm91bmQ8L2Rpdj48cCBjbGFzcz0iY2FyZC1kZXNjIj5VcGxvYWQg
+eW91ciBvd24gaW1hZ2Ugb3IgdmlkZW8gYXMgYSBmdWxsLXNjcmVlbiBwYW5lbCBiYWNrZ3JvdW5k
+PC9wPjwvZGl2PjxkaXYgY2xhc3M9ImNhcmQtYm9keSI+PGRpdiBjbGFzcz0idWljLXVwbG9hZC1n
+cmlkIj48ZGl2PjxkaXYgY2xhc3M9InVpYy1sYWJlbCI+8J+TtyBCYWNrZ3JvdW5kIEltYWdlPC9k
+aXY+PGRpdiBjbGFzcz0idWljLXVwbG9hZC1kcm9wIiBpZD0idWljLWltZy1kcm9wIiBvbmNsaWNr
+PSJkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgndWljLWltZy1maWxlJykuY2xpY2soKSIgb25kcmFn
+b3Zlcj0iZXZlbnQucHJldmVudERlZmF1bHQoKSIgb25kcm9wPSJ1aWNEcm9wSW1hZ2UoZXZlbnQp
+Ij48ZGl2IGlkPSJ1aWMtaW1nLXByZXZpZXctd3JhcCIgc3R5bGU9ImRpc3BsYXk6ZmxleDtmbGV4
+LWRpcmVjdGlvbjpjb2x1bW47YWxpZ24taXRlbXM6Y2VudGVyO2dhcDo4cHg7Y29sb3I6dmFyKC0t
+bXV0ZWQpIj48c3ZnIHdpZHRoPSIzMiIgaGVpZ2h0PSIzMiIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJj
+dXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMS41IiB2aWV3Qm94PSIwIDAgMjQgMjQiPjxyZWN0
+IHg9IjMiIHk9IjMiIHdpZHRoPSIxOCIgaGVpZ2h0PSIxOCIgcng9IjIiLz48Y2lyY2xlIGN4PSI4
+LjUiIGN5PSI4LjUiIHI9IjEuNSIvPjxwYXRoIGQ9Ik0yMSAxNWwtNS01TDUgMjEiLz48L3N2Zz48
+c3BhbiBzdHlsZT0iZm9udC1zaXplOjEzcHg7Zm9udC13ZWlnaHQ6NjAwIj5DbGljayBvciBkcmFn
+IGFuIGltYWdlIGhlcmU8L3NwYW4+PHNwYW4gc3R5bGU9ImZvbnQtc2l6ZToxMXB4Ij5KUEcsIFBO
+RywgR0lGLCBXZWJQIOKAlCBtYXggOCBNQjwvc3Bhbj48L2Rpdj48L2Rpdj48aW5wdXQgdHlwZT0i
+ZmlsZSIgaWQ9InVpYy1pbWctZmlsZSIgYWNjZXB0PSJpbWFnZS8qIiBzdHlsZT0iZGlzcGxheTpu
+b25lIiBvbmNoYW5nZT0idWljVXBsb2FkSW1hZ2UodGhpcykiLz48YnV0dG9uIGlkPSJ1aWMtaW1n
+LWNsZWFyLWJ0biIgY2xhc3M9InVpYy1jbGVhci1idG4iIG9uY2xpY2s9InVpY0NsZWFySW1hZ2Uo
+KSIgc3R5bGU9ImRpc3BsYXk6bm9uZSI+4pyVIFJlbW92ZSBJbWFnZTwvYnV0dG9uPjwvZGl2Pjxk
+aXY+PGRpdiBjbGFzcz0idWljLWxhYmVsIj7wn46sIEJhY2tncm91bmQgVmlkZW88L2Rpdj48ZGl2
+IGNsYXNzPSJ1aWMtdXBsb2FkLWRyb3AiIGlkPSJ1aWMtdmlkLWRyb3AiIG9uY2xpY2s9ImRvY3Vt
+ZW50LmdldEVsZW1lbnRCeUlkKCd1aWMtdmlkLWZpbGUnKS5jbGljaygpIiBvbmRyYWdvdmVyPSJl
+dmVudC5wcmV2ZW50RGVmYXVsdCgpIiBvbmRyb3A9InVpY0Ryb3BWaWRlbyhldmVudCkiPjxkaXYg
+aWQ9InVpYy12aWQtcHJldmlldy13cmFwIiBzdHlsZT0iZGlzcGxheTpmbGV4O2ZsZXgtZGlyZWN0
+aW9uOmNvbHVtbjthbGlnbi1pdGVtczpjZW50ZXI7Z2FwOjhweDtjb2xvcjp2YXIoLS1tdXRlZCki
+Pjxzdmcgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRD
+b2xvciIgc3Ryb2tlLXdpZHRoPSIxLjUiIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBvbHlnb24gcG9p
+bnRzPSIyMyA3IDE2IDEyIDIzIDE3IDIzIDciLz48cmVjdCB4PSIxIiB5PSI1IiB3aWR0aD0iMTUi
+IGhlaWdodD0iMTQiIHJ4PSIyIi8+PC9zdmc+PHNwYW4gc3R5bGU9ImZvbnQtc2l6ZToxM3B4O2Zv
+bnQtd2VpZ2h0OjYwMCI+Q2xpY2sgb3IgZHJhZyBhIHZpZGVvIGhlcmU8L3NwYW4+PHNwYW4gc3R5
+bGU9ImZvbnQtc2l6ZToxMXB4Ij5NUDQsIFdlYk0g4oCUIG1heCAyMCBNQjwvc3Bhbj48L2Rpdj48
+L2Rpdj48aW5wdXQgdHlwZT0iZmlsZSIgaWQ9InVpYy12aWQtZmlsZSIgYWNjZXB0PSJ2aWRlby8q
+IiBzdHlsZT0iZGlzcGxheTpub25lIiBvbmNoYW5nZT0idWljVXBsb2FkVmlkZW8odGhpcykiLz48
+YnV0dG9uIGlkPSJ1aWMtdmlkLWNsZWFyLWJ0biIgY2xhc3M9InVpYy1jbGVhci1idG4iIG9uY2xp
+Y2s9InVpY0NsZWFyVmlkZW8oKSIgc3R5bGU9ImRpc3BsYXk6bm9uZSI+4pyVIFJlbW92ZSBWaWRl
+bzwvYnV0dG9uPjwvZGl2PjwvZGl2PjxkaXYgY2xhc3M9InVpYy10aXAiPvCfkqEgVGlwOiBBZnRl
+ciBzZXR0aW5nIGEgYmFja2dyb3VuZCwgcGljayBhIGRhcmsgdGhlbWUgKERhcmssIE9jZWFuLCBN
+aWRuaWdodCkgc28gdGV4dCBzdGF5cyByZWFkYWJsZSBvbiB0b3AuPC9kaXY+PC9kaXY+PC9kaXY+
+PGRpdiBjbGFzcz0iY2FyZCIgc3R5bGU9Im1hcmdpbi1ib3R0b206MjBweCI+PGRpdiBjbGFzcz0i
+Y2FyZC1oZWFkZXIiPjxkaXYgY2xhc3M9ImNhcmQtdGl0bGUiPjxzdmcgd2lkdGg9IjE2IiBoZWln
+aHQ9IjE2IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIy
+IiB2aWV3Qm94PSIwIDAgMjQgMjQiPjxwb2x5bGluZSBwb2ludHM9IjQgNyA0IDQgMjAgNCAyMCA3
+Ii8+PGxpbmUgeDE9IjkiIHkxPSIyMCIgeDI9IjE1IiB5Mj0iMjAiLz48bGluZSB4MT0iMTIiIHkx
+PSI0IiB4Mj0iMTIiIHkyPSIyMCIvPjwvc3ZnPlR5cG9ncmFwaHk8L2Rpdj48cCBjbGFzcz0iY2Fy
+ZC1kZXNjIj5Gb250IGZhbWlseSBhbmQgYmFzZSBzaXplPC9wPjwvZGl2PjxkaXYgY2xhc3M9ImNh
+cmQtYm9keSI+PGRpdiBjbGFzcz0idWljLXNlY3Rpb24iPjxkaXYgY2xhc3M9InVpYy1sYWJlbCI+
+Rm9udCBGYW1pbHk8L2Rpdj48ZGl2IGNsYXNzPSJ1aWMtZm9udC1yb3ciPjxzZWxlY3QgY2xhc3M9
+InVpYy1zZWxlY3QiIGlkPSJ1aWMtZm9udC1zZWxlY3QiIG9uY2hhbmdlPSJ1aWNBcHBseUZvbnQo
+KSI+PG9wdGlvbiB2YWx1ZT0iIj5TeXN0ZW0gRGVmYXVsdCAoU2Vnb2UgVUkpPC9vcHRpb24+PG9w
+dGlvbiB2YWx1ZT0iSW50ZXIiPkludGVyPC9vcHRpb24+PG9wdGlvbiB2YWx1ZT0iUm9ib3RvIj5S
+b2JvdG88L29wdGlvbj48b3B0aW9uIHZhbHVlPSJQb3BwaW5zIj5Qb3BwaW5zPC9vcHRpb24+PG9w
+dGlvbiB2YWx1ZT0iTnVuaXRvIj5OdW5pdG88L29wdGlvbj48b3B0aW9uIHZhbHVlPSJSYWxld2F5
+Ij5SYWxld2F5PC9vcHRpb24+PG9wdGlvbiB2YWx1ZT0iJ0pldEJyYWlucyBNb25vJywnRmlyYSBD
+b2RlJyxtb25vc3BhY2UiPkpldEJyYWlucyBNb25vIChDb2RlKTwvb3B0aW9uPjxvcHRpb24gdmFs
+dWU9IidDb3VyaWVyIE5ldycsbW9ub3NwYWNlIj5Db3VyaWVyIE5ldyAoTW9ub3NwYWNlKTwvb3B0
+aW9uPjxvcHRpb24gdmFsdWU9Ikdlb3JnaWEsc2VyaWYiPkdlb3JnaWEgKFNlcmlmKTwvb3B0aW9u
+Pjwvc2VsZWN0PjwvZGl2PjwvZGl2PjxkaXYgY2xhc3M9InVpYy1zZWN0aW9uIj48ZGl2IGNsYXNz
+PSJ1aWMtbGFiZWwiPkZvbnQgU2l6ZSDigJQgPHNwYW4gaWQ9InVpYy1zaXplLXZhbCIgc3R5bGU9
+ImNvbG9yOnZhcigtLWJsdWUpO2ZvbnQtc2l6ZToxM3B4Ij4xNHB4PC9zcGFuPjwvZGl2PjxkaXYg
+Y2xhc3M9InVpYy1yYW5nZS1yb3ciPjxpbnB1dCB0eXBlPSJyYW5nZSIgY2xhc3M9InVpYy1yYW5n
+ZSIgaWQ9InVpYy1mb250LXNpemUiIG1pbj0iMTEiIG1heD0iMjAiIHZhbHVlPSIxNCIgb25pbnB1
+dD0idWljQXBwbHlGb250KCkiLz48L2Rpdj48L2Rpdj48L2Rpdj48L2Rpdj48ZGl2IGNsYXNzPSJj
+YXJkIiBzdHlsZT0ibWFyZ2luLWJvdHRvbToyMHB4Ij48ZGl2IGNsYXNzPSJjYXJkLWhlYWRlciI+
+PGRpdiBjbGFzcz0iY2FyZC10aXRsZSI+PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIGZpbGw9
+Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHZpZXdCb3g9IjAg
+MCAyNCAyNCI+PHJlY3QgeD0iMyIgeT0iMyIgd2lkdGg9IjE4IiBoZWlnaHQ9IjE4IiByeD0iNSIv
+Pjwvc3ZnPkNvcm5lciBTdHlsZTwvZGl2PjxwIGNsYXNzPSJjYXJkLWRlc2MiPkNvbnRyb2xzIHJv
+dW5kbmVzcyBvZiBjYXJkcyBhbmQgYnV0dG9ucyBhY3Jvc3MgdGhlIHdob2xlIHBhbmVsPC9wPjwv
+ZGl2PjxkaXYgY2xhc3M9ImNhcmQtYm9keSI+PGRpdiBjbGFzcz0idWljLXJhZGl1cy1yb3ciPjxi
+dXR0b24gY2xhc3M9InVpYy1yYWRpdXMtb3B0IiBkYXRhLXI9IjBweCIgb25jbGljaz0idWljQXBw
+bHlSYWRpdXMoJzBweCcpIj7irJwgU2hhcnA8L2J1dHRvbj48YnV0dG9uIGNsYXNzPSJ1aWMtcmFk
+aXVzLW9wdCIgZGF0YS1yPSI2cHgiIG9uY2xpY2s9InVpY0FwcGx5UmFkaXVzKCc2cHgnKSI+4par
+77iPIFNsaWdodDwvYnV0dG9uPjxidXR0b24gY2xhc3M9InVpYy1yYWRpdXMtb3B0IGFjdGl2ZSIg
+ZGF0YS1yPSIxMnB4IiBvbmNsaWNrPSJ1aWNBcHBseVJhZGl1cygnMTJweCcpIj7wn5SyIFJvdW5k
+ZWQgKERlZmF1bHQpPC9idXR0b24+PGJ1dHRvbiBjbGFzcz0idWljLXJhZGl1cy1vcHQiIGRhdGEt
+cj0iMjBweCIgb25jbGljaz0idWljQXBwbHlSYWRpdXMoJzIwcHgnKSI+4q2VIEV4dHJhIFJvdW5k
+PC9idXR0b24+PC9kaXY+PC9kaXY+PC9kaXY+PGRpdiBjbGFzcz0idWljLWFjdGlvbi1iYXIiPjxi
+dXR0b24gY2xhc3M9InVpYy1zYXZlLWJ0biIgb25jbGljaz0ic2F2ZVVpQ3VzdG9taXplKCkiPvCf
+kr4gU2F2ZSBTZXR0aW5nczwvYnV0dG9uPjxidXR0b24gY2xhc3M9InVpYy1yZXNldC1idG4iIG9u
+Y2xpY2s9InJlc2V0VWlDdXN0b21pemUoKSI+4oapIFJlc2V0IHRvIERlZmF1bHQ8L2J1dHRvbj48
+L2Rpdj48L3NlY3Rpb24+PC9tYWluPjwvZGl2PjxkaXYgY2xhc3M9Im93bmVyLW1vZGFsLW92ZXJs
+YXkiIGlkPSJvd25lci1tb2RhbC1vdmVybGF5Ij48ZGl2IGNsYXNzPSJvd25lci1tb2RhbCI+PGRp
+diBjbGFzcz0ib3duZXItbW9kYWwtaGVhZGVyIj48ZGl2IGNsYXNzPSJvd25lci1tb2RhbC10aXRs
+ZSI+PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVu
+dENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTIg
+NGwzIDEyaDE0bDMtMTItNiA1LTQtNy00IDctNi01eiIvPjwvc3ZnPk93bmVyIEFjY2VzczwvZGl2
+PjxidXR0b24gb25jbGljaz0iY2xvc2VPd25lck1vZGFsKCkiIHN0eWxlPSJiYWNrZ3JvdW5kOm5v
+bmU7Ym9yZGVyOm5vbmU7Y29sb3I6IzY0NzQ4YjtjdXJzb3I6cG9pbnRlcjtmb250LXNpemU6MThw
+eDtwYWRkaW5nOjAgNHB4Ij7inJU8L2J1dHRvbj48L2Rpdj48ZGl2IGNsYXNzPSJvd25lci1tb2Rh
+bC1ib2R5IiBpZD0ib3duZXItbW9kYWwtYm9keSI+PC9kaXY+PC9kaXY+PC9kaXY+PGRpdiBjbGFz
+cz0idXBncmFkZS1vdmVybGF5IiBpZD0idXBncmFkZS1vdmVybGF5Ij48ZGl2IGNsYXNzPSJ1cGdy
+YWRlLWNhcmQiPjxkaXYgc3R5bGU9ImZvbnQtc2l6ZTozNnB4O21hcmdpbi1ib3R0b206OHB4Ij7w
+n5GRPC9kaXY+PGRpdiBjbGFzcz0idXBncmFkZS10aXRsZSI+UHJlbWl1bSBGZWF0dXJlPC9kaXY+
+PGRpdiBjbGFzcz0idXBncmFkZS1zdWIiPlRoaXMgZmVhdHVyZSByZXF1aXJlcyBhIFByZW1pdW0g
+YWN0aXZhdGlvbiBrZXkuIEVudGVyIHlvdXIga2V5IGJlbG93IHRvIHVubG9jayBhbGwgcHJlbWl1
+bSBmZWF0dXJlcyBpbnN0YW50bHkuPC9kaXY+PGlucHV0IGNsYXNzPSJ1cGdyYWRlLWlucCIgaWQ9
+InVwZ3JhZGUta2V5LWlucHV0IiBwbGFjZWhvbGRlcj0iQ1BNLVhYWFgtWFhYWC1YWFhYIiBtYXhs
+ZW5ndGg9IjI1IiBhdXRvY29tcGxldGU9Im9mZiIgc3BlbGxjaGVjaz0iZmFsc2UiLz48ZGl2IGNs
+YXNzPSJ1cGdyYWRlLWVyciIgaWQ9InVwZ3JhZGUtZXJyIj48L2Rpdj48YnV0dG9uIGNsYXNzPSJh
+Y3QtYnRuIGFjdC1idG4tcGFpZCIgb25jbGljaz0ic3VibWl0VXBncmFkZUtleSgpIj7wn5SRIEFj
+dGl2YXRlIFByZW1pdW08L2J1dHRvbj48YnV0dG9uIGNsYXNzPSJhY3QtYnRuIGFjdC1idG4tZnJl
+ZSIgb25jbGljaz0iY2xvc2VVcGdyYWRlKCkiIHN0eWxlPSJtYXJnaW4tdG9wOjRweCI+Q2FuY2Vs
+PC9idXR0b24+PC9kaXY+PC9kaXY+PGRpdiBjbGFzcz0ic3NoLW92ZXJsYXkiIGlkPSJzc2gtb3Zl
+cmxheSI+PGRpdiBjbGFzcz0ic3NoLXdpbmRvdyI+PGRpdiBjbGFzcz0ic3NoLWhlYWRlciI+PGRp
+diBjbGFzcz0ic3NoLXRpdGxlIj48c3ZnIHdpZHRoPSIxNSIgaGVpZ2h0PSIxNSIgZmlsbD0ibm9u
+ZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIgdmlld0JveD0iMCAwIDI0
+IDI0Ij48cG9seWxpbmUgcG9pbnRzPSI0IDE3IDEwIDExIDQgNSIvPjxsaW5lIHgxPSIxMiIgeTE9
+IjE5IiB4Mj0iMjAiIHkyPSIxOSIvPjwvc3ZnPjxzcGFuIGlkPSJzc2gtdGl0bGUtdGV4dCI+U1NI
+IEFjY2Vzczwvc3Bhbj48L2Rpdj48YnV0dG9uIGNsYXNzPSJzc2gtY2xvc2UiIG9uY2xpY2s9ImNs
+b3NlU3NoKCkiPuKclTwvYnV0dG9uPjwvZGl2PjxkaXYgY2xhc3M9InNzaC1ib2R5IiBpZD0ic3No
+LWJvZHkiPjxkaXYgY2xhc3M9InNzaC1sb2FkaW5nIj5TdGFydGluZyB0bWF0ZSBzZXNzaW9u4oCm
+PC9kaXY+PC9kaXY+PC9kaXY+PC9kaXY+PGRpdiBjbGFzcz0ib3ZlcmxheSIgaWQ9ImRlbC1tb2Rh
+bCI+PGRpdiBjbGFzcz0ibW9kYWwiPjxoMz5EZWxldGUgaW5zdGFuY2U/PC9oMz48cCBpZD0iZGVs
+LW1zZyI+VGhpcyB3aWxsIHBlcm1hbmVudGx5IGRlc3Ryb3kgdGhlIFZNIGFuZCBjYW5ub3QgYmUg
+dW5kb25lLjwvcD48ZGl2IGNsYXNzPSJtb2RhbC1idG5zIj48YnV0dG9uIGNsYXNzPSJidG4tY2Fu
+Y2VsIiBvbmNsaWNrPSJjbG9zZU1vZGFsKCkiPkNhbmNlbDwvYnV0dG9uPjxidXR0b24gY2xhc3M9
+ImJ0bi1jb25maXJtIiBpZD0iZGVsLWNvbmZpcm0iPkRlbGV0ZTwvYnV0dG9uPjwvZGl2PjwvZGl2
+PjwvZGl2PjxkaXYgY2xhc3M9InNpZGViYXItb3ZlcmxheSIgaWQ9InNpZGViYXItb3ZlcmxheSIg
+b25jbGljaz0iY2xvc2VTaWRlYmFyKCkiPjwvZGl2PjxuYXYgY2xhc3M9Im1vYi1uYXYiPjxkaXYg
+Y2xhc3M9Im1vYi1uYXYtaW5uZXIiPjxhIGNsYXNzPSJhY3RpdmUiIG9uY2xpY2s9InNob3dQYWdl
+KCdkYXNoYm9hcmQnLHRoaXMpIiBpZD0ibW9iLWRhc2giPjxzdmcgd2lkdGg9IjIwIiBoZWlnaHQ9
+IjIwIiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiB2
+aWV3Qm94PSIwIDAgMjQgMjQiPjxyZWN0IHg9IjMiIHk9IjMiIHdpZHRoPSI3IiBoZWlnaHQ9Ijci
+IHJ4PSIxIi8+PHJlY3QgeD0iMTQiIHk9IjMiIHdpZHRoPSI3IiBoZWlnaHQ9IjciIHJ4PSIxIi8+
+PHJlY3QgeD0iMyIgeT0iMTQiIHdpZHRoPSI3IiBoZWlnaHQ9IjciIHJ4PSIxIi8+PHJlY3QgeD0i
+MTQiIHk9IjE0IiB3aWR0aD0iNyIgaGVpZ2h0PSI3IiByeD0iMSIvPjwvc3ZnPkRhc2hib2FyZDwv
+YT48YSBvbmNsaWNrPSJzaG93UGFnZSgndnBzJyx0aGlzKSIgaWQ9Im1vYi12cHMiPjxzdmcgd2lk
+dGg9IjIwIiBoZWlnaHQ9IjIwIiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ry
+b2tlLXdpZHRoPSIyIiB2aWV3Qm94PSIwIDAgMjQgMjQiPjxyZWN0IHg9IjIiIHk9IjMiIHdpZHRo
+PSIyMCIgaGVpZ2h0PSI4IiByeD0iMSIvPjxyZWN0IHg9IjIiIHk9IjEzIiB3aWR0aD0iMjAiIGhl
+aWdodD0iOCIgcng9IjEiLz48Y2lyY2xlIGN4PSI2IiBjeT0iNyIgcj0iMSIgZmlsbD0iY3VycmVu
+dENvbG9yIi8+PGNpcmNsZSBjeD0iNiIgY3k9IjE3IiByPSIxIiBmaWxsPSJjdXJyZW50Q29sb3Ii
+Lz48L3N2Zz5JbnN0YW5jZXM8L2E+PGEgb25jbGljaz0ic2hvd1BhZ2UoJ2NyZWF0ZScsdGhpcyki
+IGlkPSJtb2ItY3JlYXRlIj48c3ZnIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgZmlsbD0ibm9uZSIg
+c3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIgdmlld0JveD0iMCAwIDI0IDI0
+Ij48Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSIxMCIvPjxsaW5lIHgxPSIxMiIgeTE9IjgiIHgy
+PSIxMiIgeTI9IjE2Ii8+PGxpbmUgeDE9IjgiIHkxPSIxMiIgeDI9IjE2IiB5Mj0iMTIiLz48L3N2
+Zz5DcmVhdGU8L2E+PC9kaXY+PC9uYXY+PGRpdiBpZD0idG9hc3Qtd3JhcCI+PC9kaXY+PHNjcmlw
+dD4KbGV0IHNlbGVjdGVkVnBzID0gbnVsbDsKbGV0IHZwc0RhdGEgPSBbXTsKbGV0IGRlbGV0ZVRh
+cmdldCA9IG51bGw7CmZ1bmN0aW9uIHRvZ2dsZVNpZGViYXIoKSB7CmNvbnN0IGFzaWRlID0gZG9j
+dW1lbnQucXVlcnlTZWxlY3RvcignYXNpZGUnKTsKY29uc3Qgb3ZlcmxheSA9IGRvY3VtZW50Lmdl
+dEVsZW1lbnRCeUlkKCdzaWRlYmFyLW92ZXJsYXknKTsKY29uc3QgaXNPcGVuID0gYXNpZGUuY2xh
+c3NMaXN0LmNvbnRhaW5zKCdvcGVuJyk7CmFzaWRlLmNsYXNzTGlzdC50b2dnbGUoJ29wZW4nLCAh
+aXNPcGVuKTsKb3ZlcmxheS5jbGFzc0xpc3QudG9nZ2xlKCdvcGVuJywgIWlzT3Blbik7Cn0KZnVu
+Y3Rpb24gY2xvc2VTaWRlYmFyKCkgewpkb2N1bWVudC5xdWVyeVNlbGVjdG9yKCdhc2lkZScpLmNs
+YXNzTGlzdC5yZW1vdmUoJ29wZW4nKTsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3NpZGViYXIt
+b3ZlcmxheScpLmNsYXNzTGlzdC5yZW1vdmUoJ29wZW4nKTsKfQpjb25zdCBNT0JfSURTID0ge2Rh
+c2hib2FyZDonbW9iLWRhc2gnLCB2cHM6J21vYi12cHMnLCBjcmVhdGU6J21vYi1jcmVhdGUnfTsK
+ZnVuY3Rpb24gc2hvd1BhZ2UoaWQsIGVsKSB7CmNsb3NlU2lkZWJhcigpOwpkb2N1bWVudC5xdWVy
+eVNlbGVjdG9yQWxsKCcucGFnZScpLmZvckVhY2gocCA9PiBwLmNsYXNzTGlzdC5yZW1vdmUoJ2Fj
+dGl2ZScpKTsKZG9jdW1lbnQucXVlcnlTZWxlY3RvckFsbCgnbmF2IGEsIC5tb2ItbmF2IGEnKS5m
+b3JFYWNoKGEgPT4gYS5jbGFzc0xpc3QucmVtb3ZlKCdhY3RpdmUnKSk7CmRvY3VtZW50LmdldEVs
+ZW1lbnRCeUlkKCdwYWdlLScgKyBpZCkuY2xhc3NMaXN0LmFkZCgnYWN0aXZlJyk7CmlmIChlbCkg
+ZWwuY2xhc3NMaXN0LmFkZCgnYWN0aXZlJyk7CmNvbnN0IG1vYkVsID0gZG9jdW1lbnQuZ2V0RWxl
+bWVudEJ5SWQoTU9CX0lEU1tpZF0pOwppZiAobW9iRWwpIG1vYkVsLmNsYXNzTGlzdC5hZGQoJ2Fj
+dGl2ZScpOwp3aW5kb3cuc2Nyb2xsVG8oMCwwKTsKfQpmdW5jdGlvbiBmbXRCeXRlcyhiKSB7Cmlm
+IChiID49IDFlOSkgcmV0dXJuIChiIC8gMWU5KS50b0ZpeGVkKDIpICsgJyBHQic7CmlmIChiID49
+IDFlNikgcmV0dXJuIChiIC8gMWU2KS50b0ZpeGVkKDIpICsgJyBNQic7CmlmIChiID49IDFlMykg
+cmV0dXJuIChiIC8gMWUzKS50b0ZpeGVkKDEpICsgJyBLQic7CnJldHVybiBiICsgJyBCJzsKfQpm
+dW5jdGlvbiBmbXRVcHRpbWUocykgewpjb25zdCBkID0gTWF0aC5mbG9vcihzLzg2NDAwKSwgaCA9
+IE1hdGguZmxvb3IoKHMlODY0MDApLzM2MDApLAptID0gTWF0aC5mbG9vcigocyUzNjAwKS82MCk7
+CmlmIChkID4gMCkgcmV0dXJuIGAke2R9ZCAke2h9aCAke219bWA7CmlmIChoID4gMCkgcmV0dXJu
+IGAke2h9aCAke219bWA7CnJldHVybiBgJHttfSBtaW5zYDsKfQpmdW5jdGlvbiBkcmF3TWV0ZXIo
+c3ZnSWQsIHBjdCwgbGFiZWwsIHN1Yikgewpjb25zdCBzdmcgPSBkb2N1bWVudC5nZXRFbGVtZW50
+QnlJZChzdmdJZCk7CmlmICghc3ZnKSByZXR1cm47CmNvbnN0IGN4PTEwMCxjeT0xMDAscj03Mixz
+dz0xNDsKY29uc3QgYXJjID0gYE0gJHtjeC1yfSAke2N5fSBBICR7cn0gJHtyfSAwIDAgMSAke2N4
+K3J9ICR7Y3l9YDsKY29uc3QgdG90YWwgPSBNYXRoLlBJICogcjsKY29uc3QgZmlsbCA9IE1hdGgu
+bWluKE1hdGgubWF4KHBjdCwwKSwxMDApIC8gMTAwICogdG90YWw7CmNvbnN0IGNvbG9yID0gcGN0
+ID4gODUgPyAnI2RjMjYyNicgOiBwY3QgPiA2MCA/ICcjZDk3NzA2JyA6ICcjMjU2M2ViJzsKc3Zn
+LmlubmVySFRNTCA9IGAKPHBhdGggZD0iJHthcmN9IiBmaWxsPSJub25lIiBzdHJva2U9IiNlMmU4
+ZjAiIHN0cm9rZS13aWR0aD0iJHtzd30iIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgoke3BjdCA+
+IDAgPyBgPHBhdGggZD0iJHthcmN9IiBmaWxsPSJub25lIiBzdHJva2U9IiR7Y29sb3J9IiBzdHJv
+a2Utd2lkdGg9IiR7c3d9IiBzdHJva2UtbGluZWNhcD0icm91bmQiCnN0cm9rZS1kYXNoYXJyYXk9
+IiR7ZmlsbH0gJHt0b3RhbH0iIHN0eWxlPSJ0cmFuc2l0aW9uOnN0cm9rZS1kYXNoYXJyYXkgMXMg
+ZWFzZSIvPmAgOiAnJ30KPHRleHQgeD0iJHtjeH0iIHk9IiR7Y3ktOH0iIHRleHQtYW5jaG9yPSJt
+aWRkbGUiIGZvbnQtc2l6ZT0iMjgiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMwZjE3MmEiPiR7
+TWF0aC5yb3VuZChwY3QpfSU8L3RleHQ+PHRleHQgeD0iJHtjeH0iIHk9IiR7Y3krMTR9IiB0ZXh0
+LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjEyIiBmb250LXdlaWdodD0iNTAwIiBmaWxsPSIj
+NjQ3NDhiIj4ke2xhYmVsfTwvdGV4dD48dGV4dCB4PSIke2N4fSIgeT0iJHtjeSszMn0iIHRleHQt
+YW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMTEiIGZpbGw9IiM5NGEzYjgiPiR7c3VifTwvdGV4
+dD5gOwp9CmZ1bmN0aW9uIGdldENsaWVudFRva2VuKCkgewpsZXQgdCA9IGxvY2FsU3RvcmFnZS5n
+ZXRJdGVtKCdjcG1fY2xpZW50X3Rva2VuJyk7CmlmICghdCB8fCB0Lmxlbmd0aCA8IDE2KSB7CmNv
+bnN0IGFyciA9IG5ldyBVaW50OEFycmF5KDI0KTsKY3J5cHRvLmdldFJhbmRvbVZhbHVlcyhhcnIp
+Owp0ID0gQXJyYXkuZnJvbShhcnIsIGIgPT4gYi50b1N0cmluZygxNikucGFkU3RhcnQoMiwnMCcp
+KS5qb2luKCcnKTsKbG9jYWxTdG9yYWdlLnNldEl0ZW0oJ2NwbV9jbGllbnRfdG9rZW4nLCB0KTsK
+fQpyZXR1cm4gdDsKfQphc3luYyBmdW5jdGlvbiBhcGkocGF0aCwgb3B0cz17fSkgewpjb25zdCBo
+ZHJzID0geydDb250ZW50LVR5cGUnOidhcHBsaWNhdGlvbi9qc29uJywnWC1DbGllbnQtVG9rZW4n
+OmdldENsaWVudFRva2VuKCksLi4uKG9wdHMuaGVhZGVyc3x8e30pfTsKY29uc3QgciA9IGF3YWl0
+IGZldGNoKHBhdGgsIHsuLi5vcHRzLCBoZWFkZXJzOmhkcnN9KTsKcmV0dXJuIHIuanNvbigpOwp9
+CmZ1bmN0aW9uIHRvYXN0KG1zZywgb2s9dHJ1ZSkgewpjb25zdCB3ID0gZG9jdW1lbnQuZ2V0RWxl
+bWVudEJ5SWQoJ3RvYXN0LXdyYXAnKTsKY29uc3QgZWwgPSBkb2N1bWVudC5jcmVhdGVFbGVtZW50
+KCdkaXYnKTsKZWwuY2xhc3NOYW1lID0gJ3RvYXN0ICcgKyAob2sgPyAndG9hc3Qtb2snIDogJ3Rv
+YXN0LWVycicpOwplbC50ZXh0Q29udGVudCA9IG1zZzsKdy5hcHBlbmRDaGlsZChlbCk7CnNldFRp
+bWVvdXQoKCkgPT4gZWwucmVtb3ZlKCksIDM1MDApOwp9CmFzeW5jIGZ1bmN0aW9uIGxvYWRTdGF0
+cygpIHsKdHJ5IHsKY29uc3QgZCA9IGF3YWl0IGFwaSgnL2FwaS9zeXN0ZW0nKTsKZHJhd01ldGVy
+KCdtZXRlci1yYW0nLCBkLnJhbS5wZXJjZW50LCAnUkFNIFVzZWQnLCBgJHtmbXRCeXRlcyhkLnJh
+bS51c2VkKX0gLyAke2ZtdEJ5dGVzKGQucmFtLnRvdGFsKX1gKTsKZHJhd01ldGVyKCdtZXRlci1k
+aXNrJywgZC5kaXNrLnBlcmNlbnQsICdEaXNrIFVzZWQnLCBgJHtmbXRCeXRlcyhkLmRpc2sudXNl
+ZCl9IC8gJHtmbXRCeXRlcyhkLmRpc2sudG90YWwpfWApOwpkb2N1bWVudC5nZXRFbGVtZW50QnlJ
+ZCgnY3B1LXBjdCcpLnRleHRDb250ZW50ID0gZC5jcHUucGVyY2VudC50b0ZpeGVkKDEpICsgJyUn
+Owpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnY3B1LW1vZGVsJykudGV4dENvbnRlbnQgPSBgJHtk
+LmNwdS5jb3Jlc30gQ29yZXMgwrcgJHtkLmNwdS5tb2RlbH1gOwpkb2N1bWVudC5nZXRFbGVtZW50
+QnlJZCgnbmV0LXJ4JykudGV4dENvbnRlbnQgPSBmbXRCeXRlcyhkLm5ldHdvcmsuYnl0ZXNSZWN2
+KTsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ25ldC10eCcpLnRleHRDb250ZW50ID0gZm10Qnl0
+ZXMoZC5uZXR3b3JrLmJ5dGVzU2VudCk7CmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd1cHRpbWUn
+KS50ZXh0Q29udGVudCA9IGZtdFVwdGltZShkLnVwdGltZSk7CmRvY3VtZW50LmdldEVsZW1lbnRC
+eUlkKCdzdGF0dXMtdHh0JykudGV4dENvbnRlbnQgPSAnU3lzdGVtIE9LJzsKZG9jdW1lbnQuZ2V0
+RWxlbWVudEJ5SWQoJ2RvdCcpLnN0eWxlLmJhY2tncm91bmQgPSAnIzE2YTM0YSc7Cn0gY2F0Y2gg
+KGUpIHsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3N0YXR1cy10eHQnKS50ZXh0Q29udGVudCA9
+ICdPZmZsaW5lJzsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2RvdCcpLnN0eWxlLmJhY2tncm91
+bmQgPSAnI2RjMjYyNic7Cn0KfQpsZXQgZGFzaFNlbGVjdGVkID0gbnVsbDsKYXN5bmMgZnVuY3Rp
+b24gbG9hZFZwcygpIHsKdHJ5IHsKY29uc3QgZCA9IGF3YWl0IGFwaSgnL2FwaS92cHMvbGlzdCcp
+Owp2cHNEYXRhID0gZC52cHMgfHwgW107CmNvbnN0IHJ1bm5pbmcgPSB2cHNEYXRhLmZpbHRlcih2
+PT52LnN0YXRlPT09J3J1bm5pbmcnKS5sZW5ndGg7CmNvbnN0IHN0b3BwZWQgPSB2cHNEYXRhLmZp
+bHRlcih2PT5bJ3N0b3BwZWQnLCdjcmFzaGVkJ10uaW5jbHVkZXModi5zdGF0ZSkpLmxlbmd0aDsK
+Y29uc3QgcGF1c2VkID0gdnBzRGF0YS5maWx0ZXIodj0+di5zdGF0ZT09PSdwYXVzZWQnKS5sZW5n
+dGg7CmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd2bS10b3RhbCcpLnRleHRDb250ZW50ID0gdnBz
+RGF0YS5sZW5ndGg7CmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd2bS1ydW5uaW5nJykudGV4dENv
+bnRlbnQgPSBydW5uaW5nOwpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgndm0tc3RvcHBlZCcpLnRl
+eHRDb250ZW50ID0gc3RvcHBlZDsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3ZtLXBhdXNlZCcp
+LnRleHRDb250ZW50ID0gcGF1c2VkOwpyZW5kZXJWcHNMaXN0KCk7CnJlbmRlckRhc2hMaXN0KCk7
+CmlmIChkYXNoU2VsZWN0ZWQpIHJlbmRlclF1aWNrQWN0aW9ucyhkYXNoU2VsZWN0ZWQpOwp9IGNh
+dGNoIChlKSB7fQp9CmZ1bmN0aW9uIHJlbmRlckRhc2hMaXN0KCkgewpjb25zdCB1bCA9IGRvY3Vt
+ZW50LmdldEVsZW1lbnRCeUlkKCdkYXNoLXZwcy1saXN0Jyk7CmlmICghdWwpIHJldHVybjsKaWYg
+KCF2cHNEYXRhLmxlbmd0aCkgeyB1bC5pbm5lckhUTUwgPSAnPGxpIHN0eWxlPSJjb2xvcjp2YXIo
+LS1tdXRlZCk7Zm9udC1zaXplOjEzcHg7cGFkZGluZzo4cHgiPk5vIGluc3RhbmNlcyBmb3VuZC48
+L2xpPic7IHJldHVybjsgfQp1bC5pbm5lckhUTUwgPSB2cHNEYXRhLm1hcCh2ID0+IGAKPGxpIGNs
+YXNzPSJkYXNoLXZwcy1pdGVtJHtkYXNoU2VsZWN0ZWQ9PT12Lm5hbWU/JyBzZWxlY3RlZCc6Jyd9
+IiBvbmNsaWNrPSJkYXNoU2VsZWN0VnBzKCcke3YubmFtZX0nKSI+PHNwYW4gc3R5bGU9ImZvbnQt
+d2VpZ2h0OjYwMDtmb250LXNpemU6MTNweCI+JHt2Lm5hbWV9PC9zcGFuPjxzcGFuIGNsYXNzPSJi
+YWRnZSAke2JhZGdlQ2xhc3Modi5zdGF0ZSl9Ij4ke3Yuc3RhdGUuY2hhckF0KDApLnRvVXBwZXJD
+YXNlKCkrdi5zdGF0ZS5zbGljZSgxKX08L3NwYW4+PC9saT5gKS5qb2luKCcnKTsKfQpmdW5jdGlv
+biBkYXNoU2VsZWN0VnBzKG5hbWUpIHsKZGFzaFNlbGVjdGVkID0gbmFtZTsKcmVuZGVyRGFzaExp
+c3QoKTsKcmVuZGVyUXVpY2tBY3Rpb25zKG5hbWUpOwp9CmZ1bmN0aW9uIHJlbmRlclF1aWNrQWN0
+aW9ucyhuYW1lKSB7CmNvbnN0IHZtID0gdnBzRGF0YS5maW5kKHY9PnYubmFtZT09PW5hbWUpOwpj
+b25zdCBuYW1lRWwgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgncWEtc2VsZWN0ZWQtbmFtZScp
+Owpjb25zdCBib2R5ID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3FhLWJvZHknKTsKaWYgKCF2
+bSB8fCAhbmFtZUVsIHx8ICFib2R5KSByZXR1cm47Cm5hbWVFbC50ZXh0Q29udGVudCA9IG5hbWU7
+CmNvbnN0IGlzUnVubmluZyA9IHZtLnN0YXRlPT09J3J1bm5pbmcnOwpjb25zdCBpc1N0b3BwZWQg
+PSB2bS5zdGF0ZT09PSdzdG9wcGVkJzsKYm9keS5pbm5lckhUTUwgPSBgCjxkaXYgY2xhc3M9InFh
+LWJ0bnMiPjxidXR0b24gY2xhc3M9InFhLWJ0biBxYS1zdGFydCIgJHtpc1J1bm5pbmc/J2Rpc2Fi
+bGVkJzonJ30gb25jbGljaz0icmVxdWlyZVByZW1pdW0oJ3Zwc19zdGFydCcsKCk9PmRhc2hBY3Rp
+b24oJ3N0YXJ0JykpIj48c3ZnIHdpZHRoPSIxNSIgaGVpZ2h0PSIxNSIgZmlsbD0iY3VycmVudENv
+bG9yIiB2aWV3Qm94PSIwIDAgMjQgMjQiPjxwb2x5Z29uIHBvaW50cz0iNSAzIDE5IDEyIDUgMjEg
+NSAzIi8+PC9zdmc+IFN0YXJ0IEluc3RhbmNlIPCfkZEKPC9idXR0b24+PGJ1dHRvbiBjbGFzcz0i
+cWEtYnRuIHFhLXN0b3AiICR7aXNTdG9wcGVkPydkaXNhYmxlZCc6Jyd9IG9uY2xpY2s9ImRhc2hB
+Y3Rpb24oJ3N0b3AnKSI+PHN2ZyB3aWR0aD0iMTUiIGhlaWdodD0iMTUiIGZpbGw9ImN1cnJlbnRD
+b2xvciIgdmlld0JveD0iMCAwIDI0IDI0Ij48cmVjdCB4PSI2IiB5PSI0IiB3aWR0aD0iNCIgaGVp
+Z2h0PSIxNiIvPjxyZWN0IHg9IjE0IiB5PSI0IiB3aWR0aD0iNCIgaGVpZ2h0PSIxNiIvPjwvc3Zn
+PiBTdG9wIEluc3RhbmNlCjwvYnV0dG9uPjxidXR0b24gY2xhc3M9InFhLWJ0biBxYS1yZXN0YXJ0
+IiAke2lzU3RvcHBlZD8nZGlzYWJsZWQnOicnfSBvbmNsaWNrPSJyZXF1aXJlUHJlbWl1bSgndnBz
+X3Jlc3RhcnQnLCgpPT5kYXNoQWN0aW9uKCdyZXN0YXJ0JykpIj48c3ZnIHdpZHRoPSIxNSIgaGVp
+Z2h0PSIxNSIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0i
+Mi41IiB2aWV3Qm94PSIwIDAgMjQgMjQiPjxwb2x5bGluZSBwb2ludHM9IjIzIDQgMjMgMTAgMTcg
+MTAiLz48cGF0aCBkPSJNMjAuNDkgMTVhOSA5IDAgMSAxLTIuMTItOS4zNkwyMyAxMCIvPjwvc3Zn
+PiBSZXN0YXJ0IEluc3RhbmNlIPCfkZEKPC9idXR0b24+PGJ1dHRvbiBjbGFzcz0icWEtYnRuIHFh
+LXNzaCIgb25jbGljaz0ib3BlblNzaCgnJHtuYW1lfScpIj48c3ZnIHdpZHRoPSIxNSIgaGVpZ2h0
+PSIxNSIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIg
+dmlld0JveD0iMCAwIDI0IDI0Ij48cG9seWxpbmUgcG9pbnRzPSI0IDE3IDEwIDExIDQgNSIvPjxs
+aW5lIHgxPSIxMiIgeTE9IjE5IiB4Mj0iMjAiIHkyPSIxOSIvPjwvc3ZnPiBHZXQgU1NIIEFjY2Vz
+cwo8L2J1dHRvbj48L2Rpdj5gOwp9CmFzeW5jIGZ1bmN0aW9uIGRhc2hBY3Rpb24oYWN0aW9uKSB7
+CmlmICghZGFzaFNlbGVjdGVkKSByZXR1cm47CnRyeSB7CmNvbnN0IGQgPSBhd2FpdCBhcGkoYC9h
+cGkvdnBzLyR7YWN0aW9ufWAsIHttZXRob2Q6J1BPU1QnLCBib2R5OkpTT04uc3RyaW5naWZ5KHtu
+YW1lOmRhc2hTZWxlY3RlZH0pfSk7CmlmIChkLnN1Y2Nlc3MpIHsgdG9hc3QoZC5tZXNzYWdlKTsg
+YXdhaXQgbG9hZFZwcygpOyB9CmVsc2UgdG9hc3QoZC5lcnJvciB8fCAnQWN0aW9uIGZhaWxlZCcs
+IGZhbHNlKTsKfSBjYXRjaChlKSB7IHRvYXN0KCdSZXF1ZXN0IGZhaWxlZCcsIGZhbHNlKTsgfQp9
+CmZ1bmN0aW9uIGJhZGdlQ2xhc3Moc3RhdGUpIHsKcmV0dXJuIHtydW5uaW5nOidiYWRnZS1ydW5u
+aW5nJyxzdG9wcGVkOidiYWRnZS1zdG9wcGVkJyxwYXVzZWQ6J2JhZGdlLXBhdXNlZCd9W3N0YXRl
+XSB8fCAnYmFkZ2UtdW5rbm93bic7Cn0KZnVuY3Rpb24gcmVuZGVyVnBzTGlzdCgpIHsKY29uc3Qg
+dWwgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgndnBzLWxpc3QnKTsKaWYgKCF2cHNEYXRhLmxl
+bmd0aCkgeyB1bC5pbm5lckhUTUwgPSAnPGxpIHN0eWxlPSJjb2xvcjp2YXIoLS1tdXRlZCk7Zm9u
+dC1zaXplOjE0cHg7cGFkZGluZzo4cHgiPk5vIGluc3RhbmNlcyBmb3VuZC48L2xpPic7IHJldHVy
+bjsgfQp1bC5pbm5lckhUTUwgPSB2cHNEYXRhLm1hcCh2ID0+IGAKPGxpIGNsYXNzPSJ2cHMtaXRl
+bSR7c2VsZWN0ZWRWcHM9PT12Lm5hbWU/JyBzZWxlY3RlZCc6Jyd9IiBvbmNsaWNrPSJzZWxlY3RW
+cHMoJyR7di5uYW1lfScpIj48ZGl2IGNsYXNzPSJ2cHMtaW5mbyI+PHNwYW4gY2xhc3M9InZwcy1u
+YW1lIj4ke3YubmFtZX08L3NwYW4+PHNwYW4gY2xhc3M9InZwcy1tZXRhIj4KJHt2LnZjcHVzID8g
+YDxzcGFuPiR7di52Y3B1c30gdkNQVTwvc3Bhbj5gIDogJyd9CiR7di5tZW1vcnkgPyBgPHNwYW4+
+JHt2Lm1lbW9yeX0gTUI8L3NwYW4+YCA6ICcnfQo8L3NwYW4+PC9kaXY+PHNwYW4gY2xhc3M9ImJh
+ZGdlICR7YmFkZ2VDbGFzcyh2LnN0YXRlKX0iPiR7di5zdGF0ZS5jaGFyQXQoMCkudG9VcHBlckNh
+c2UoKSt2LnN0YXRlLnNsaWNlKDEpfTwvc3Bhbj48L2xpPmApLmpvaW4oJycpOwp9CmZ1bmN0aW9u
+IHNlbGVjdFZwcyhuYW1lKSB7CnNlbGVjdGVkVnBzID0gbmFtZTsKcmVuZGVyVnBzTGlzdCgpOwpj
+b25zdCB2bSA9IHZwc0RhdGEuZmluZCh2PT52Lm5hbWU9PT1uYW1lKTsKY29uc3QgaXNSdW5uaW5n
+ID0gdm0/LnN0YXRlID09PSAncnVubmluZyc7CmNvbnN0IGlzU3RvcHBlZCA9IHZtPy5zdGF0ZSA9
+PT0gJ3N0b3BwZWQnOwpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnY29udHJvbHMtYm9keScpLmlu
+bmVySFRNTCA9IGAKPGRpdiBjbGFzcz0ic2VsZWN0ZWQtbmFtZSI+PHN2ZyB3aWR0aD0iMTQiIGhl
+aWdodD0iMTQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9
+IjIiIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3QgeD0iMiIgeT0iMyIgd2lkdGg9IjIwIiBoZWln
+aHQ9IjgiIHJ4PSIxIi8+PHJlY3QgeD0iMiIgeT0iMTMiIHdpZHRoPSIyMCIgaGVpZ2h0PSI4IiBy
+eD0iMSIvPjwvc3ZnPgoke25hbWV9CjxzcGFuIGNsYXNzPSJiYWRnZSAke2JhZGdlQ2xhc3Modm0/
+LnN0YXRlfHwndW5rbm93bicpfSIgc3R5bGU9Im1hcmdpbi1sZWZ0OmF1dG8iPiR7dm0/LnN0YXRl
+fHwndW5rbm93bid9PC9zcGFuPjwvZGl2PjxkaXYgY2xhc3M9ImFjdGlvbi1idG5zIj48YnV0dG9u
+IGNsYXNzPSJidG4gYnRuLXN0YXJ0IiBvbmNsaWNrPSJyZXF1aXJlUHJlbWl1bSgndnBzX3N0YXJ0
+JywoKT0+ZG9BY3Rpb24oJ3N0YXJ0JykpIiAke2lzUnVubmluZz8nZGlzYWJsZWQnOicnfT48c3Zn
+IHdpZHRoPSIxMyIgaGVpZ2h0PSIxMyIgZmlsbD0iY3VycmVudENvbG9yIiB2aWV3Qm94PSIwIDAg
+MjQgMjQiPjxwb2x5Z29uIHBvaW50cz0iNSAzIDE5IDEyIDUgMjEgNSAzIi8+PC9zdmc+U3RhcnQ8
+L2J1dHRvbj48YnV0dG9uIGNsYXNzPSJidG4gYnRuLXN0b3AiIG9uY2xpY2s9ImRvQWN0aW9uKCdz
+dG9wJykiICR7aXNTdG9wcGVkPydkaXNhYmxlZCc6Jyd9Pjxzdmcgd2lkdGg9IjEzIiBoZWlnaHQ9
+IjEzIiBmaWxsPSJjdXJyZW50Q29sb3IiIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3QgeD0iNiIg
+eT0iNCIgd2lkdGg9IjQiIGhlaWdodD0iMTYiLz48cmVjdCB4PSIxNCIgeT0iNCIgd2lkdGg9IjQi
+IGhlaWdodD0iMTYiLz48L3N2Zz5TdG9wPC9idXR0b24+PGJ1dHRvbiBjbGFzcz0iYnRuIGJ0bi1y
+ZXN0YXJ0IiBvbmNsaWNrPSJyZXF1aXJlUHJlbWl1bSgndnBzX3Jlc3RhcnQnLCgpPT5kb0FjdGlv
+bigncmVzdGFydCcpKSIgJHtpc1N0b3BwZWQ/J2Rpc2FibGVkJzonJ30+PHN2ZyB3aWR0aD0iMTMi
+IGhlaWdodD0iMTMiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lk
+dGg9IjIuNSIgdmlld0JveD0iMCAwIDI0IDI0Ij48cG9seWxpbmUgcG9pbnRzPSIyMyA0IDIzIDEw
+IDE3IDEwIi8+PHBhdGggZD0iTTIwLjQ5IDE1YTkgOSAwIDEgMS0yLjEyLTkuMzZMMjMgMTAiLz48
+L3N2Zz5SZXN0YXJ0PC9idXR0b24+PGJ1dHRvbiBjbGFzcz0iYnRuIGJ0bi1kZWxldGUiIG9uY2xp
+Y2s9ImNvbmZpcm1EZWxldGUoJyR7bmFtZX0nKSI+PHN2ZyB3aWR0aD0iMTMiIGhlaWdodD0iMTMi
+IGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHZpZXdC
+b3g9IjAgMCAyNCAyNCI+PHBvbHlsaW5lIHBvaW50cz0iMyA2IDUgNiAyMSA2Ii8+PHBhdGggZD0i
+TTE5IDZsLTEgMTRINkw1IDYiLz48cGF0aCBkPSJNMTAgMTF2NiIvPjxwYXRoIGQ9Ik0xNCAxMXY2
+Ii8+PHBhdGggZD0iTTkgNlY0aDZ2MiIvPjwvc3ZnPkRlbGV0ZTwvYnV0dG9uPjxidXR0b24gY2xh
+c3M9ImJ0biBidG4tc3NoIiBvbmNsaWNrPSJvcGVuU3NoKCcke25hbWV9JykiIHN0eWxlPSJncmlk
+LWNvbHVtbjoxLy0xIj48c3ZnIHdpZHRoPSIxMyIgaGVpZ2h0PSIxMyIgZmlsbD0ibm9uZSIgc3Ry
+b2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIgdmlld0JveD0iMCAwIDI0IDI0Ij48
+cG9seWxpbmUgcG9pbnRzPSI0IDE3IDEwIDExIDQgNSIvPjxsaW5lIHgxPSIxMiIgeTE9IjE5IiB4
+Mj0iMjAiIHkyPSIxOSIvPjwvc3ZnPkdldCBTU0ggQWNjZXNzIPCfkZE8L2J1dHRvbj48L2Rpdj5g
+Owp9CmFzeW5jIGZ1bmN0aW9uIGRvQWN0aW9uKGFjdGlvbikgewppZiAoIXNlbGVjdGVkVnBzKSBy
+ZXR1cm47CnRyeSB7CmNvbnN0IGQgPSBhd2FpdCBhcGkoYC9hcGkvdnBzLyR7YWN0aW9ufWAsIHtt
+ZXRob2Q6J1BPU1QnLCBib2R5OkpTT04uc3RyaW5naWZ5KHtuYW1lOnNlbGVjdGVkVnBzfSl9KTsK
+aWYgKGQuc3VjY2VzcykgeyB0b2FzdChkLm1lc3NhZ2UpOyBhd2FpdCBsb2FkVnBzKCk7IHNlbGVj
+dFZwcyhzZWxlY3RlZFZwcyk7IH0KZWxzZSB0b2FzdChkLmVycm9yIHx8ICdBY3Rpb24gZmFpbGVk
+JywgZmFsc2UpOwp9IGNhdGNoKGUpIHsgdG9hc3QoJ1JlcXVlc3QgZmFpbGVkJywgZmFsc2UpOyB9
+Cn0KZnVuY3Rpb24gY29uZmlybURlbGV0ZShuYW1lKSB7CmlmICghY2FuVXNlKCd2cHNfZGVsZXRl
+JykpIHsgb3BlblVwZ3JhZGUoKTsgcmV0dXJuOyB9CmRlbGV0ZVRhcmdldCA9IG5hbWU7CmRvY3Vt
+ZW50LmdldEVsZW1lbnRCeUlkKCdkZWwtbXNnJykudGV4dENvbnRlbnQgPSBgVGhpcyB3aWxsIHBl
+cm1hbmVudGx5IGRlc3Ryb3kgIiR7bmFtZX0iIGFuZCBjYW5ub3QgYmUgdW5kb25lLmA7CmRvY3Vt
+ZW50LmdldEVsZW1lbnRCeUlkKCdkZWwtbW9kYWwnKS5jbGFzc0xpc3QuYWRkKCdvcGVuJyk7CmRv
+Y3VtZW50LmdldEVsZW1lbnRCeUlkKCdkZWwtY29uZmlybScpLm9uY2xpY2sgPSBhc3luYyAoKSA9
+PiB7CmNsb3NlTW9kYWwoKTsKdHJ5IHsKY29uc3QgZCA9IGF3YWl0IGFwaSgnL2FwaS92cHMvZGVs
+ZXRlJywge21ldGhvZDonUE9TVCcsIGJvZHk6SlNPTi5zdHJpbmdpZnkoe25hbWU6ZGVsZXRlVGFy
+Z2V0fSl9KTsKaWYgKGQuc3VjY2VzcykgeyB0b2FzdChkLm1lc3NhZ2UpOyBzZWxlY3RlZFZwcz1u
+dWxsOyBhd2FpdCBsb2FkVnBzKCk7IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdjb250cm9scy1i
+b2R5JykuaW5uZXJIVE1MPSc8ZGl2IGNsYXNzPSJuby1zZWxlY3Rpb24iPjxzcGFuIHN0eWxlPSJm
+b250LXNpemU6MTRweCI+U2VsZWN0IGFuIGluc3RhbmNlIHRvIG1hbmFnZTwvc3Bhbj48L2Rpdj4n
+OyB9CmVsc2UgdG9hc3QoZC5lcnJvcnx8J0RlbGV0ZSBmYWlsZWQnLCBmYWxzZSk7Cn0gY2F0Y2go
+ZSkgeyB0b2FzdCgnUmVxdWVzdCBmYWlsZWQnLCBmYWxzZSk7IH0KfTsKfQpmdW5jdGlvbiBjbG9z
+ZU1vZGFsKCkgeyBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnZGVsLW1vZGFsJykuY2xhc3NMaXN0
+LnJlbW92ZSgnb3BlbicpOyB9CmFzeW5jIGZ1bmN0aW9uIHN1Ym1pdENyZWF0ZShlKSB7CmUucHJl
+dmVudERlZmF1bHQoKTsKaWYgKCFjYW5Vc2UoJ3Zwc19jcmVhdGUnKSkgeyBvcGVuVXBncmFkZSgp
+OyByZXR1cm47IH0KY29uc3QgYnRuID0gZS50YXJnZXQucXVlcnlTZWxlY3RvcignYnV0dG9uW3R5
+cGU9c3VibWl0XScpOwpidG4uZGlzYWJsZWQgPSB0cnVlOyBidG4udGV4dENvbnRlbnQgPSAnQ3Jl
+YXRpbmfigKYnOwp0cnkgewpjb25zdCBpc28gPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnZi1p
+c28nKS52YWx1ZS50cmltKCk7CmNvbnN0IGQgPSBhd2FpdCBhcGkoJy9hcGkvdnBzL2NyZWF0ZScs
+IHttZXRob2Q6J1BPU1QnLCBib2R5OkpTT04uc3RyaW5naWZ5KHsKbmFtZTogZG9jdW1lbnQuZ2V0
+RWxlbWVudEJ5SWQoJ2YtbmFtZScpLnZhbHVlLnRyaW0oKSwKcmFtOiBwYXJzZUludChkb2N1bWVu
+dC5nZXRFbGVtZW50QnlJZCgnZi1yYW0nKS52YWx1ZSksCnZjcHVzOiBwYXJzZUludChkb2N1bWVu
+dC5nZXRFbGVtZW50QnlJZCgnZi12Y3B1cycpLnZhbHVlKSwKZGlzazogcGFyc2VJbnQoZG9jdW1l
+bnQuZ2V0RWxlbWVudEJ5SWQoJ2YtZGlzaycpLnZhbHVlKSwKb3NWYXJpYW50OiBkb2N1bWVudC5n
+ZXRFbGVtZW50QnlJZCgnZi12YXJpYW50JykudmFsdWUudHJpbSgpIHx8ICdnZW5lcmljJywKLi4u
+KGlzbyA/IHtpc29QYXRoOiBpc299IDoge30pCn0pfSk7CmlmIChkLnN1Y2Nlc3MpIHsKZG9jdW1l
+bnQuZ2V0RWxlbWVudEJ5SWQoJ2NyZWF0ZS1mb3JtJykucmVzZXQoKTsKYXdhaXQgbG9hZFZwcygp
+Owpjb25zdCB3ID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3RvYXN0LXdyYXAnKTsKY29uc3Qg
+ZWwgPSBkb2N1bWVudC5jcmVhdGVFbGVtZW50KCdkaXYnKTsKZWwuY2xhc3NOYW1lID0gJ3RvYXN0
+IHRvYXN0LW9rJzsKZWwuc3R5bGUuY3NzVGV4dCA9ICdkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6
+Y2VudGVyO2p1c3RpZnktY29udGVudDpzcGFjZS1iZXR3ZWVuO2dhcDoxMnB4O21pbi13aWR0aDoy
+ODBweCc7CmNvbnN0IHZtTmFtZSA9IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdmLW5hbWUnKSA/
+IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdmLW5hbWUnKS52YWx1ZSB8fCAnJyA6ICcnOwplbC5p
+bm5lckhUTUwgPSBgPHNwYW4+JHtkLm1lc3NhZ2V9PC9zcGFuPjxidXR0b24gb25jbGljaz0ic3Rh
+cnROZXdWbSgnJHt2bU5hbWUgfHwgZC5tZXNzYWdlfScpIiBzdHlsZT0iYmFja2dyb3VuZDpyZ2Jh
+KDI1NSwyNTUsMjU1LC4yNSk7Ym9yZGVyOm5vbmU7Y29sb3I6I2ZmZjtmb250LXdlaWdodDo3MDA7
+cGFkZGluZzo0cHggMTBweDtib3JkZXItcmFkaXVzOjZweDtjdXJzb3I6cG9pbnRlcjtmb250LXNp
+emU6MTJweDtmbGV4LXNocmluazowIj5TdGFydCBOb3c8L2J1dHRvbj5gOwp3LmFwcGVuZENoaWxk
+KGVsKTsKc2V0VGltZW91dCgoKSA9PiBlbC5yZW1vdmUoKSwgNjAwMCk7Cn0KZWxzZSB0b2FzdChk
+LmVycm9yIHx8ICdDcmVhdGUgZmFpbGVkJywgZmFsc2UpOwp9IGNhdGNoKGUpIHsgdG9hc3QoJ1Jl
+cXVlc3QgZmFpbGVkJywgZmFsc2UpOyB9CmJ0bi5kaXNhYmxlZCA9IGZhbHNlOyBidG4uaW5uZXJI
+VE1MID0gJzxzdmcgd2lkdGg9IjE1IiBoZWlnaHQ9IjE1IiBmaWxsPSJub25lIiBzdHJva2U9ImN1
+cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiB2aWV3Qm94PSIwIDAgMjQgMjQiPjxjaXJjbGUg
+Y3g9IjEyIiBjeT0iMTIiIHI9IjEwIi8+PGxpbmUgeDE9IjEyIiB5MT0iOCIgeDI9IjEyIiB5Mj0i
+MTYiLz48bGluZSB4MT0iOCIgeTE9IjEyIiB4Mj0iMTYiIHkyPSIxMiIvPjwvc3ZnPiBDcmVhdGUg
+SW5zdGFuY2UnOwp9CmxldCBrdm1GdW5jdGlvbmFsID0gdHJ1ZTsKYXN5bmMgZnVuY3Rpb24gY2hl
+Y2tLdm1TdGF0dXMoKSB7CnRyeSB7CmNvbnN0IGQgPSBhd2FpdCBhcGkoJy9hcGkva3ZtL3N0YXR1
+cycpOwprdm1GdW5jdGlvbmFsID0gZC5mdW5jdGlvbmFsOwpjb25zdCBiYW5uZXIgPSBkb2N1bWVu
+dC5nZXRFbGVtZW50QnlJZCgna3ZtLWJhbm5lcicpOwpjb25zdCB0b3BUZXh0ID0gZG9jdW1lbnQu
+Z2V0RWxlbWVudEJ5SWQoJ2t2bS1zdGF0dXMnKTsKaWYgKCFkLmZ1bmN0aW9uYWwpIHsKZG9jdW1l
+bnQuZ2V0RWxlbWVudEJ5SWQoJ2t2bS1iYW5uZXItbXNnJykudGV4dENvbnRlbnQgPSBkLm1lc3Nh
+Z2U7CmJhbm5lci5jbGFzc0xpc3QuYWRkKCdzaG93Jyk7CnRvcFRleHQudGV4dENvbnRlbnQgPSAn
+4pqgIEtWTSBub3QgYXZhaWxhYmxlJzsKZG9jdW1lbnQucXVlcnlTZWxlY3RvckFsbCgnLmJ0bi1z
+dGFydCwuYnRuLXN0b3AsLmJ0bi1yZXN0YXJ0LC5idG4tZGVsZXRlLC5idG4tc3NoLC5xYS1zdGFy
+dCwucWEtc3RvcCwucWEtcmVzdGFydCwucWEtc3NoJykuZm9yRWFjaChiID0+IHsKYi5kaXNhYmxl
+ZCA9IHRydWU7IGIudGl0bGUgPSBkLm1lc3NhZ2U7Cn0pOwpjb25zdCB2bCA9IGRvY3VtZW50Lmdl
+dEVsZW1lbnRCeUlkKCd2cHMtbGlzdCcpOwppZiAodmwpIHZsLmlubmVySFRNTCA9IGA8bGkgc3R5
+bGU9InBhZGRpbmc6MjRweCAxMnB4O3RleHQtYWxpZ246Y2VudGVyIj48ZGl2IHN0eWxlPSJmb250
+LXNpemU6MjhweDttYXJnaW4tYm90dG9tOjEwcHgiPuKaoO+4jzwvZGl2PjxkaXYgc3R5bGU9ImZv
+bnQtd2VpZ2h0OjcwMDtmb250LXNpemU6MTVweDtjb2xvcjp2YXIoLS1yZWQpO21hcmdpbi1ib3R0
+b206NnB4Ij5LVk0gTm90IEF2YWlsYWJsZSBvbiBUaGlzIEhvc3Q8L2Rpdj48ZGl2IHN0eWxlPSJm
+b250LXNpemU6MTNweDtjb2xvcjp2YXIoLS1tdXRlZCk7bGluZS1oZWlnaHQ6MS42Ij4ke2QubWVz
+c2FnZX08YnI+PGJyPgpUbyBjcmVhdGUgcmVhbCBWUFMgaW5zdGFuY2VzLCB5b3VyIHNlcnZlciBt
+dXN0IHN1cHBvcnQgS1ZNIGhhcmR3YXJlIHZpcnR1YWxpc2F0aW9uLjxicj4KTW9zdCBzaGFyZWQg
+VlBTIHByb3ZpZGVycyBkbyBub3QgYWxsb3cgbmVzdGVkIEtWTS48YnI+CllvdSBuZWVkIGEgPHN0
+cm9uZz5kZWRpY2F0ZWQgc2VydmVyIG9yIGJhcmUtbWV0YWwgaG9zdDwvc3Ryb25nPiB3aXRoIEtW
+TSBlbmFibGVkLjwvZGl2PjwvbGk+YDsKY29uc3QgY2YgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJ
+ZCgnY3JlYXRlLWZvcm0nKTsKaWYgKGNmKSB7CmNvbnN0IHN1YiA9IGNmLnF1ZXJ5U2VsZWN0b3Io
+J2J1dHRvblt0eXBlPXN1Ym1pdF0nKTsKaWYgKHN1YikgeyBzdWIuZGlzYWJsZWQgPSB0cnVlOyBz
+dWIudGV4dENvbnRlbnQgPSAn4pqgIEtWTSBOb3QgQXZhaWxhYmxlJzsgfQppZiAoIWRvY3VtZW50
+LmdldEVsZW1lbnRCeUlkKCdrdm0tY3JlYXRlLW5vdGljZScpKSB7CmNvbnN0IG5vdGljZSA9IGRv
+Y3VtZW50LmNyZWF0ZUVsZW1lbnQoJ2RpdicpOwpub3RpY2UuaWQgPSAna3ZtLWNyZWF0ZS1ub3Rp
+Y2UnOwpub3RpY2Uuc3R5bGUuY3NzVGV4dCA9ICdiYWNrZ3JvdW5kOiNmZWYzYzc7Ym9yZGVyOjFw
+eCBzb2xpZCAjZjU5ZTBiO2JvcmRlci1yYWRpdXM6MTBweDtwYWRkaW5nOjE0cHggMThweDttYXJn
+aW4tYm90dG9tOjE4cHg7Zm9udC1zaXplOjEzcHg7Y29sb3I6IzkyNDAwZTtsaW5lLWhlaWdodDox
+LjYnOwpub3RpY2UuaW5uZXJIVE1MID0gYDxzdHJvbmc+4pqgIEtWTSB2aXJ0dWFsaXNhdGlvbiBp
+cyBub3QgYXZhaWxhYmxlIG9uIHRoaXMgaG9zdC48L3N0cm9uZz48YnI+Q3JlYXRpbmcgVlBTIGlu
+c3RhbmNlcyByZXF1aXJlcyBhIGRlZGljYXRlZC9iYXJlLW1ldGFsIHNlcnZlciB3aXRoIEtWTSBl
+bmFibGVkLiBZb3VyIGN1cnJlbnQgaG9zdCBkb2VzIG5vdCBzdXBwb3J0IGl0LmA7CmNmLmluc2Vy
+dEJlZm9yZShub3RpY2UsIGNmLmZpcnN0Q2hpbGQpOwp9Cn0KfSBlbHNlIHsKYmFubmVyLmNsYXNz
+TGlzdC5yZW1vdmUoJ3Nob3cnKTsKdG9wVGV4dC50ZXh0Q29udGVudCA9ICdLVk0gVmlydHVhbGlz
+YXRpb24gQWN0aXZlJzsKY29uc3Qgbm90aWNlID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2t2
+bS1jcmVhdGUtbm90aWNlJyk7CmlmIChub3RpY2UpIG5vdGljZS5yZW1vdmUoKTsKfQp9IGNhdGNo
+KGUpIHt9Cn0KZnVuY3Rpb24gY2xvc2VTc2goKSB7CmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdz
+c2gtb3ZlcmxheScpLmNsYXNzTGlzdC5yZW1vdmUoJ29wZW4nKTsKfQpmdW5jdGlvbiBjb3B5VGV4
+dCh0eHQsIGJ0bikgewpuYXZpZ2F0b3IuY2xpcGJvYXJkLndyaXRlVGV4dCh0eHQpLnRoZW4oKCkg
+PT4gewpidG4udGV4dENvbnRlbnQgPSAnQ29waWVkISc7CnNldFRpbWVvdXQoKCkgPT4gYnRuLnRl
+eHRDb250ZW50ID0gJ0NvcHknLCAxODAwKTsKfSkuY2F0Y2goKCkgPT4gewpidG4udGV4dENvbnRl
+bnQgPSAnRXJyb3InOwpzZXRUaW1lb3V0KCgpID0+IGJ0bi50ZXh0Q29udGVudCA9ICdDb3B5Jywg
+MTgwMCk7Cn0pOwp9CmFzeW5jIGZ1bmN0aW9uIG9wZW5Tc2gobmFtZSkgewppZiAoIWNhblVzZSgn
+c3NoX2FjY2VzcycpKSB7IG9wZW5VcGdyYWRlKCk7IHJldHVybjsgfQpkb2N1bWVudC5nZXRFbGVt
+ZW50QnlJZCgnc3NoLXRpdGxlLXRleHQnKS50ZXh0Q29udGVudCA9ICdTU0ggQWNjZXNzIOKAlCAn
+ICsgbmFtZTsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3NzaC1ib2R5JykuaW5uZXJIVE1MID0K
+JzxkaXYgY2xhc3M9InNzaC1sb2FkaW5nIj7ij7MgUHJlcGFyaW5nIFNTSCBzZXNzaW9uIGZvciA8
+c3Ryb25nPicgKyBuYW1lICsgJzwvc3Ryb25nPuKApicgKwonPGJyPjxzbWFsbCBzdHlsZT0ib3Bh
+Y2l0eTouNiI+SW5zdGFsbGluZyB0bWF0ZSBpZiBuZWVkZWQsIHRoZW4gc3RhcnRpbmcgc2Vzc2lv
+buKApjwvc21hbGw+PC9kaXY+JzsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3NzaC1vdmVybGF5
+JykuY2xhc3NMaXN0LmFkZCgnb3BlbicpOwp0cnkgewpjb25zdCBkID0gYXdhaXQgYXBpKCcvYXBp
+L3Zwcy90bWF0ZScsIHttZXRob2Q6J1BPU1QnLCBib2R5OkpTT04uc3RyaW5naWZ5KHtuYW1lfSl9
+KTsKaWYgKGQuc3VjY2Vzcykgewpjb25zdCBjbWRzID0gKGQuY21kc19ydW4gfHwgW10pOwpjb25z
+dCBjbWRIdG1sID0gY21kcy5sZW5ndGggPyBgCjxkaXYgY2xhc3M9InNzaC1sYWJlbCIgc3R5bGU9
+Im1hcmdpbi1ib3R0b206NnB4Ij5Db21tYW5kcyBydW4gb24gc2VydmVyPC9kaXY+PGRpdiBjbGFz
+cz0ic3NoLWJveCIgc3R5bGU9ImNvbG9yOiM5NGEzYjg7Zm9udC1zaXplOjEycHg7bWFyZ2luLWJv
+dHRvbToxNnB4Ij4kewpjbWRzLm1hcChjID0+IGA8ZGl2IHN0eWxlPSJtYXJnaW4tYm90dG9tOjRw
+eCI+PHNwYW4gc3R5bGU9ImNvbG9yOiM0YWRlODAiPiQ8L3NwYW4+ICR7Y308L2Rpdj5gKS5qb2lu
+KCcnKQp9PC9kaXY+YCA6ICcnOwpjb25zdCBzc2hTYWZlID0gZC5zc2gucmVwbGFjZSgvJy9nLCAi
+XFwnIik7CmNvbnN0IHdlYlNhZmUgPSAoZC53ZWJ8fCcnKS5yZXBsYWNlKC8nL2csICJcXCciKTsK
+ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3NzaC1ib2R5JykuaW5uZXJIVE1MID0gYAoke2NtZEh0
+bWx9CjxkaXYgY2xhc3M9InNzaC1sYWJlbCI+U1NIIENvbm5lY3Rpb24gS2V5PC9kaXY+PGRpdiBj
+bGFzcz0ic3NoLWJveCI+JHtkLnNzaH08YnV0dG9uIGNsYXNzPSJjb3B5LWJ0biIgb25jbGljaz0i
+Y29weVRleHQoJyR7c3NoU2FmZX0nLHRoaXMpIj5Db3B5PC9idXR0b24+PC9kaXY+CiR7ZC53ZWIg
+PyBgCjxkaXYgY2xhc3M9InNzaC1sYWJlbCI+V2ViIEJyb3dzZXIgTGluazwvZGl2PjxkaXYgY2xh
+c3M9InNzaC1ib3giIHN0eWxlPSJtYXJnaW4tYm90dG9tOjAiPjxhIGhyZWY9IiR7ZC53ZWJ9IiB0
+YXJnZXQ9Il9ibGFuayIgc3R5bGU9ImNvbG9yOiM2MGE1ZmE7dGV4dC1kZWNvcmF0aW9uOm5vbmU7
+d29yZC1icmVhazpicmVhay1hbGwiPiR7ZC53ZWJ9PC9hPjxidXR0b24gY2xhc3M9ImNvcHktYnRu
+IiBvbmNsaWNrPSJjb3B5VGV4dCgnJHt3ZWJTYWZlfScsdGhpcykiPkNvcHk8L2J1dHRvbj48L2Rp
+dj5gIDogJyd9CjxkaXYgY2xhc3M9InNzaC1ub3RlIiBzdHlsZT0ibWFyZ2luLXRvcDoxNnB4Ij4K
+UGFzdGUgdGhlIFNTSCBjb21tYW5kIGludG8geW91ciB0ZXJtaW5hbCB0byBjb25uZWN0IHRvIHRo
+aXMgc2VydmVyLjxicj4KVGhlIHNlc3Npb24gc3RheXMgYWN0aXZlIHVudGlsIHlvdSBjbG9zZSB0
+bWF0ZSBvciByZXN0YXJ0IHRoZSBwYW5lbC4KPC9kaXY+YDsKfSBlbHNlIHsKZG9jdW1lbnQuZ2V0
+RWxlbWVudEJ5SWQoJ3NzaC1ib2R5JykuaW5uZXJIVE1MID0KYDxkaXYgY2xhc3M9InNzaC1sb2Fk
+aW5nIiBzdHlsZT0iY29sb3I6I2RjMjYyNiI+4p2MICR7ZC5lcnJvcn08L2Rpdj5gOwp9Cn0gY2F0
+Y2goZSkgewpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnc3NoLWJvZHknKS5pbm5lckhUTUwgPQon
+PGRpdiBjbGFzcz0ic3NoLWxvYWRpbmciIHN0eWxlPSJjb2xvcjojZGMyNjI2Ij7inYwgUmVxdWVz
+dCBmYWlsZWQg4oCUIGlzIHRoZSBwYW5lbCBydW5uaW5nPzwvZGl2Pic7Cn0KfQpkb2N1bWVudC5h
+ZGRFdmVudExpc3RlbmVyKCdrZXlkb3duJywgZSA9PiB7IGlmIChlLmtleSA9PT0gJ0VzY2FwZScp
+IGNsb3NlU3NoKCk7IH0pOwphc3luYyBmdW5jdGlvbiBzdGFydE5ld1ZtKG5hbWUpIHsKdHJ5IHsK
+Y29uc3QgZCA9IGF3YWl0IGFwaSgnL2FwaS92cHMvc3RhcnQnLCB7bWV0aG9kOidQT1NUJywgYm9k
+eTpKU09OLnN0cmluZ2lmeSh7bmFtZX0pfSk7CmlmIChkLnN1Y2Nlc3MpIHsgdG9hc3QoYCR7bmFt
+ZX0gc3RhcnRlZCFgKTsgYXdhaXQgbG9hZFZwcygpOyBkYXNoU2VsZWN0VnBzKG5hbWUpOyBzaG93
+UGFnZSgnZGFzaGJvYXJkJywgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ21vYi1kYXNoJykpOyB9
+CmVsc2UgdG9hc3QoZC5lcnJvciB8fCAnQ291bGQgbm90IHN0YXJ0JywgZmFsc2UpOwp9IGNhdGNo
+KGUpIHsgdG9hc3QoJ1JlcXVlc3QgZmFpbGVkJywgZmFsc2UpOyB9Cn0KbGV0IGZlYXR1cmVNYXAg
+PSB7fTsKZnVuY3Rpb24gZ2V0VXNlclBsYW4oKSB7CnJldHVybiBsb2NhbFN0b3JhZ2UuZ2V0SXRl
+bSgnY3BtX2FjdGl2YXRpb24nKSB8fCAnbm9uZSc7Cn0KZnVuY3Rpb24gY2FuVXNlKGZlYXR1cmVJ
+ZCkgewpjb25zdCBmZWF0ID0gZmVhdHVyZU1hcFtmZWF0dXJlSWRdOwppZiAoIWZlYXQgfHwgZmVh
+dC50aWVyID09PSAnZnJlZScpIHJldHVybiB0cnVlOwpjb25zdCBwbGFuID0gZ2V0VXNlclBsYW4o
+KTsKcmV0dXJuIHBsYW4gPT09ICdwcmVtaXVtJyB8fCBwbGFuID09PSAncGFpZCcgfHwgcGxhbiA9
+PT0gJ293bmVyJzsKfQpmdW5jdGlvbiByZXF1aXJlUHJlbWl1bShmZWF0dXJlSWQsIGNhbGxiYWNr
+KSB7CmlmIChjYW5Vc2UoZmVhdHVyZUlkKSkgeyBjYWxsYmFjaygpOyB9IGVsc2UgeyBvcGVuVXBn
+cmFkZSgpOyB9Cn0KZnVuY3Rpb24gdXBkYXRlUGxhbkJhZGdlKCkgewpjb25zdCBwbGFuID0gZ2V0
+VXNlclBsYW4oKTsKY29uc3QgYmFkZ2UgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgncGxhbi1i
+YWRnZScpOwppZiAoIWJhZGdlKSByZXR1cm47CmlmIChwbGFuID09PSAncHJlbWl1bScgfHwgcGxh
+biA9PT0gJ3BhaWQnKSB7CmJhZGdlLmNsYXNzTmFtZSA9ICdwbGFuLWJhZGdlIHByZW1pdW0nOyBi
+YWRnZS50ZXh0Q29udGVudCA9ICfwn5GRIFByZW1pdW0nOwp9IGVsc2UgewpiYWRnZS5jbGFzc05h
+bWUgPSAncGxhbi1iYWRnZSBmcmVlJzsgYmFkZ2UudGV4dENvbnRlbnQgPSAn8J+UkyBGcmVlJzsK
+fQp9CmFzeW5jIGZ1bmN0aW9uIGxvYWRGZWF0dXJlTWFwKCkgewp0cnkgewpjb25zdCBkID0gYXdh
+aXQgYXBpKCcvYXBpL2ZlYXR1cmVzL3N0YXR1cycpOwpmZWF0dXJlTWFwID0gZC5mZWF0dXJlcyB8
+fCB7fTsKdXBkYXRlUGxhbkJhZGdlKCk7Cn0gY2F0Y2goZSkge30KfQpmdW5jdGlvbiBvcGVuVXBn
+cmFkZSgpIHsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3VwZ3JhZGUtb3ZlcmxheScpLmNsYXNz
+TGlzdC5hZGQoJ29wZW4nKTsKY29uc3QgaW5wID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3Vw
+Z3JhZGUta2V5LWlucHV0Jyk7CmlucC52YWx1ZSA9ICcnOyBkb2N1bWVudC5nZXRFbGVtZW50QnlJ
+ZCgndXBncmFkZS1lcnInKS50ZXh0Q29udGVudCA9ICcnOwpzZXRUaW1lb3V0KCgpID0+IGlucC5m
+b2N1cygpLCA1MCk7CmlucC5vbmtleWRvd24gPSBlID0+IHsgaWYgKGUua2V5ID09PSAnRW50ZXIn
+KSBzdWJtaXRVcGdyYWRlS2V5KCk7IH07Cn0KZnVuY3Rpb24gY2xvc2VVcGdyYWRlKCkgewpkb2N1
+bWVudC5nZXRFbGVtZW50QnlJZCgndXBncmFkZS1vdmVybGF5JykuY2xhc3NMaXN0LnJlbW92ZSgn
+b3BlbicpOwp9CmFzeW5jIGZ1bmN0aW9uIHN1Ym1pdFVwZ3JhZGVLZXkoKSB7CmNvbnN0IGlucCA9
+IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd1cGdyYWRlLWtleS1pbnB1dCcpOwpjb25zdCBlcnIg
+PSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgndXBncmFkZS1lcnInKTsKY29uc3Qga2V5ID0gaW5w
+LnZhbHVlLnRyaW0oKS50b1VwcGVyQ2FzZSgpOwppZiAoIWtleSkgeyBlcnIudGV4dENvbnRlbnQg
+PSAnUGxlYXNlIGVudGVyIGEga2V5Lic7IHJldHVybjsgfQplcnIudGV4dENvbnRlbnQgPSAn4o+z
+IFZhbGlkYXRpbmfigKYnOwp0cnkgewpjb25zdCB1aWQgPSAndS0nICsgTWF0aC5yYW5kb20oKS50
+b1N0cmluZygzNikuc2xpY2UoMiwgOSk7CmNvbnN0IGQgPSBhd2FpdCBhcGkoJy9hcGkvdXNlci9h
+Y3RpdmF0ZScsIHttZXRob2Q6J1BPU1QnLCBib2R5OkpTT04uc3RyaW5naWZ5KHtrZXksIHVzZXJf
+aWQ6IHVpZH0pfSk7CmlmIChkLnN1Y2Nlc3MpIHsKbG9jYWxTdG9yYWdlLnNldEl0ZW0oJ2NwbV9h
+Y3RpdmF0aW9uJywgJ3ByZW1pdW0nKTsKbG9jYWxTdG9yYWdlLnNldEl0ZW0oJ2NwbV9wcmVtaXVt
+X2tleScsIGtleSk7CmlmIChkLmV4cGlyZXNfYXQpIGxvY2FsU3RvcmFnZS5zZXRJdGVtKCdjcG1f
+cHJlbWl1bV9leHBpcmVzJywgZC5leHBpcmVzX2F0KTsKY2xvc2VVcGdyYWRlKCk7IHVwZGF0ZVBs
+YW5CYWRnZSgpOyBsb2FkRmVhdHVyZU1hcCgpOwp0b2FzdCgn8J+RkSBQcmVtaXVtIGFjdGl2YXRl
+ZCEgQWxsIGZlYXR1cmVzIHVubG9ja2VkLicsIHRydWUpOwp9IGVsc2UgewplcnIudGV4dENvbnRl
+bnQgPSAn4p2MICcgKyAoZC5lcnJvciB8fCAnSW52YWxpZCBrZXknKTsKfQp9IGNhdGNoKGUpIHsg
+ZXJyLnRleHRDb250ZW50ID0gJ+KdjCBTZXJ2ZXIgZXJyb3Ig4oCUIHRyeSBhZ2Fpbic7IH0KfQpj
+b25zdCBBQ1RfU1RPUkVfS0VZID0gJ2NwbV9hY3RpdmF0aW9uJzsKZnVuY3Rpb24gYWN0aXZhdGlv
+bkluaXQoKSB7CmNvbnN0IHNhdmVkID0gbG9jYWxTdG9yYWdlLmdldEl0ZW0oQUNUX1NUT1JFX0tF
+WSk7CmlmIChzYXZlZCA9PT0gJ293bmVyJykgewpvd25lcktleVNlc3Npb24gPSBsb2NhbFN0b3Jh
+Z2UuZ2V0SXRlbSgnY3BtX293bmVyX2tleScpIHx8ICcnOwpoaWRlQWN0T3ZlcmxheSgnb3duZXIn
+KTsKfSBlbHNlIGlmIChzYXZlZCA9PT0gJ3ByZW1pdW0nIHx8IHNhdmVkID09PSAncGFpZCcgfHwg
+c2F2ZWQgPT09ICdmcmVlJykgewpoaWRlQWN0T3ZlcmxheShzYXZlZCk7Cn0gZWxzZSB7CmRvY3Vt
+ZW50LmdldEVsZW1lbnRCeUlkKCdhY3Qtb3ZlcmxheScpLmNsYXNzTGlzdC5yZW1vdmUoJ2hpZGRl
+bicpOwpjb25zdCBpbnAgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnYWN0LWtleS1pbnB1dCcp
+OwppbnAuYWRkRXZlbnRMaXN0ZW5lcignaW5wdXQnLCBmdW5jdGlvbigpIHsKdGhpcy5jbGFzc0xp
+c3QucmVtb3ZlKCdlcnJvcicpOwpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnYWN0LWVycicpLnRl
+eHRDb250ZW50ID0gJyc7Cn0pOwppbnAuYWRkRXZlbnRMaXN0ZW5lcigna2V5ZG93bicsIGUgPT4g
+eyBpZiAoZS5rZXkgPT09ICdFbnRlcicpIGFjdGl2YXRlUGFuZWwoKTsgfSk7Cn0KfQphc3luYyBm
+dW5jdGlvbiBhY3RpdmF0ZVBhbmVsKCkgewpjb25zdCBpbnAgPSBkb2N1bWVudC5nZXRFbGVtZW50
+QnlJZCgnYWN0LWtleS1pbnB1dCcpOwpjb25zdCBlcnIgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJ
+ZCgnYWN0LWVycicpOwpjb25zdCBidG4gPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnYWN0LWJ0
+bi1wYWlkJyk7CmNvbnN0IGtleSA9IGlucC52YWx1ZS50cmltKCk7CmlmICgha2V5KSB7IGlucC5j
+bGFzc0xpc3QuYWRkKCdlcnJvcicpOyBlcnIudGV4dENvbnRlbnQgPSAnUGxlYXNlIGVudGVyIHlv
+dXIga2V5Lic7IHJldHVybjsgfQpidG4udGV4dENvbnRlbnQgPSAn4o+zIFZhbGlkYXRpbmfigKYn
+OyBidG4uZGlzYWJsZWQgPSB0cnVlOwplcnIudGV4dENvbnRlbnQgPSAnJzsKdHJ5IHsKY29uc3Qg
+c3QgPSBhd2FpdCBhcGkoJy9hcGkvb3duZXIvc3RhdHVzJyk7CmlmIChzdC5pbml0aWFsaXplZCkg
+ewpjb25zdCBvZCA9IGF3YWl0IGFwaSgnL2FwaS9vd25lci9hdXRoJywge21ldGhvZDonUE9TVCcs
+IGJvZHk6SlNPTi5zdHJpbmdpZnkoe293bmVyX2tleToga2V5fSl9KTsKaWYgKG9kLnN1Y2Nlc3Mp
+IHsKb3duZXJLZXlTZXNzaW9uID0ga2V5OwppbnAuY2xhc3NMaXN0LmFkZCgnc3VjY2VzcycpOwps
+b2NhbFN0b3JhZ2Uuc2V0SXRlbShBQ1RfU1RPUkVfS0VZLCAnb3duZXInKTsKbG9jYWxTdG9yYWdl
+LnNldEl0ZW0oJ2NwbV9vd25lcl9rZXknLCBrZXkpOwpidG4udGV4dENvbnRlbnQgPSAn4pyFIE93
+bmVyIEFjY2VzcyEnOwpidG4uc3R5bGUuYmFja2dyb3VuZCA9ICdsaW5lYXItZ3JhZGllbnQoMTM1
+ZGVnLCNkOTc3MDYsI2I0NTMwOSknOwpzZXRUaW1lb3V0KCgpID0+IGhpZGVBY3RPdmVybGF5KCdv
+d25lcicpLCA3MDApOwpyZXR1cm47Cn0KfQp9IGNhdGNoKF8pIHt9CnRyeSB7CmNvbnN0IHVpZCA9
+ICd1LScgKyBNYXRoLnJhbmRvbSgpLnRvU3RyaW5nKDM2KS5zbGljZSgyLCA5KTsKY29uc3QgZCA9
+IGF3YWl0IGFwaSgnL2FwaS91c2VyL2FjdGl2YXRlJywge21ldGhvZDonUE9TVCcsIGJvZHk6SlNP
+Ti5zdHJpbmdpZnkoe2tleToga2V5LnRvVXBwZXJDYXNlKCksIHVzZXJfaWQ6IHVpZH0pfSk7Cmlm
+IChkLnN1Y2Nlc3MpIHsKaW5wLmNsYXNzTGlzdC5hZGQoJ3N1Y2Nlc3MnKTsKbG9jYWxTdG9yYWdl
+LnNldEl0ZW0oQUNUX1NUT1JFX0tFWSwgJ3ByZW1pdW0nKTsKbG9jYWxTdG9yYWdlLnNldEl0ZW0o
+J2NwbV9wcmVtaXVtX2tleScsIGtleS50b1VwcGVyQ2FzZSgpKTsKaWYgKGQuZXhwaXJlc19hdCkg
+bG9jYWxTdG9yYWdlLnNldEl0ZW0oJ2NwbV9wcmVtaXVtX2V4cGlyZXMnLCBkLmV4cGlyZXNfYXQp
+OwpidG4udGV4dENvbnRlbnQgPSAn4pyFIFByZW1pdW0gQWN0aXZhdGVkISc7CmJ0bi5zdHlsZS5i
+YWNrZ3JvdW5kID0gJ2xpbmVhci1ncmFkaWVudCgxMzVkZWcsIzE2YTM0YSwjMTU4MDNkKSc7CnNl
+dFRpbWVvdXQoKCkgPT4gaGlkZUFjdE92ZXJsYXkoJ3ByZW1pdW0nKSwgNzAwKTsKcmV0dXJuOwp9
+Cn0gY2F0Y2goXykge30KaW5wLmNsYXNzTGlzdC5hZGQoJ2Vycm9yJyk7CmVyci50ZXh0Q29udGVu
+dCA9ICfinYwgSW52YWxpZCBrZXkg4oCUIGNoZWNrIGl0IGFuZCB0cnkgYWdhaW4uJzsKYnRuLnRl
+eHRDb250ZW50ID0gJ/CflJEgQWNjZXNzIFBhbmVsJzsgYnRuLmRpc2FibGVkID0gZmFsc2U7Cn0K
+ZnVuY3Rpb24gdXNlRnJlZVZlcnNpb24oKSB7CmxvY2FsU3RvcmFnZS5zZXRJdGVtKEFDVF9TVE9S
+RV9LRVksICdmcmVlJyk7CmhpZGVBY3RPdmVybGF5KCdmcmVlJyk7Cn0KZnVuY3Rpb24gaGlkZUFj
+dE92ZXJsYXkobW9kZSkgewpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnYWN0LW92ZXJsYXknKS5j
+bGFzc0xpc3QuYWRkKCdoaWRkZW4nKTsKY29uc3QgbmF2ID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5
+SWQoJ25hdi1vd25lcicpOwppZiAobW9kZSA9PT0gJ293bmVyJykgewpuYXYuc3R5bGUuZGlzcGxh
+eSA9ICdmbGV4JzsKdXBkYXRlUGxhbkJhZGdlKCk7IGxvYWRGZWF0dXJlTWFwKCk7CmVudGVyT3du
+ZXJQYW5lbCgpOwpyZXR1cm47Cn0KbmF2LnN0eWxlLmRpc3BsYXkgPSAnbm9uZSc7CnVwZGF0ZVBs
+YW5CYWRnZSgpOyBsb2FkRmVhdHVyZU1hcCgpOwpjb25zdCBiYW5uZXIgPSBkb2N1bWVudC5nZXRF
+bGVtZW50QnlJZCgnYWN0LW1vZGUtYmFubmVyJyk7CmlmIChtb2RlID09PSAncHJlbWl1bScgfHwg
+bW9kZSA9PT0gJ3BhaWQnKSB7CmJhbm5lci5jbGFzc05hbWUgPSAnYWN0LW1vZGUtYmFubmVyIHBh
+aWQnOwpiYW5uZXIudGV4dENvbnRlbnQgPSAn8J+RkSBQcmVtaXVtIOKAlCBBbGwgZmVhdHVyZXMg
+dW5sb2NrZWQnOwp9IGVsc2UgewpiYW5uZXIuY2xhc3NOYW1lID0gJ2FjdC1tb2RlLWJhbm5lciBm
+cmVlJzsKYmFubmVyLnRleHRDb250ZW50ID0gJ/CflJMgRnJlZSBWZXJzaW9uIOKAlCBFbnRlciBh
+IGtleSB0byB1bmxvY2sgZmVhdHVyZXMnOwp9CmJhbm5lci5zdHlsZS5kaXNwbGF5ID0gJ2Jsb2Nr
+JzsKc2V0VGltZW91dCgoKSA9PiB7IGJhbm5lci5zdHlsZS5kaXNwbGF5ID0gJ25vbmUnOyB9LCA1
+MDAwKTsKfQphc3luYyBmdW5jdGlvbiBzaG93QWN0U2V0dXAoKSB7CnRyeSB7CmNvbnN0IHN0ID0g
+YXdhaXQgYXBpKCcvYXBpL293bmVyL3N0YXR1cycpOwppZiAoc3QuaW5pdGlhbGl6ZWQpIHsKZG9j
+dW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2FjdC1lcnInKS50ZXh0Q29udGVudCA9ICdPd25lciBrZXkg
+YWxyZWFkeSBzZXQuIEVudGVyIGl0IGFib3ZlLic7CnJldHVybjsKfQp9IGNhdGNoKF8pIHt9CmRv
+Y3VtZW50LmdldEVsZW1lbnRCeUlkKCdhY3QtbWFpbi1mb3JtJykuc3R5bGUuZGlzcGxheSA9ICdu
+b25lJzsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2FjdC1zZXR1cC1mb3JtJykuc3R5bGUuZGlz
+cGxheSA9ICdibG9jayc7CnNldFRpbWVvdXQoKCkgPT4geyBjb25zdCBpID0gZG9jdW1lbnQuZ2V0
+RWxlbWVudEJ5SWQoJ2FjdC1zZXR1cC1rZXknKTsgaWYgKGkpIHsgaS5mb2N1cygpOyBpLmFkZEV2
+ZW50TGlzdGVuZXIoJ2tleWRvd24nLCBlID0+IHsgaWYgKGUua2V5ID09PSAnRW50ZXInKSBzdWJt
+aXRBY3RPd25lclNldHVwKCk7IH0pOyB9IH0sIDUwKTsKfQpmdW5jdGlvbiBoaWRlQWN0U2V0dXAo
+KSB7CmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdhY3Qtc2V0dXAtZm9ybScpLnN0eWxlLmRpc3Bs
+YXkgPSAnbm9uZSc7CmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdhY3QtbWFpbi1mb3JtJykuc3R5
+bGUuZGlzcGxheSA9ICdibG9jayc7CmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdhY3Qtc2V0dXAt
+ZXJyJykudGV4dENvbnRlbnQgPSAnJzsKfQphc3luYyBmdW5jdGlvbiBzdWJtaXRBY3RPd25lclNl
+dHVwKCkgewpjb25zdCBpbnAgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnYWN0LXNldHVwLWtl
+eScpOwpjb25zdCBlcnIgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnYWN0LXNldHVwLWVycicp
+Owpjb25zdCBidG4gPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnYWN0LXNldHVwLWJ0bicpOwpj
+b25zdCBrZXkgPSBpbnAudmFsdWUudHJpbSgpOwppZiAoa2V5Lmxlbmd0aCA8IDYpIHsgZXJyLnRl
+eHRDb250ZW50ID0gJ0tleSBtdXN0IGJlIGF0IGxlYXN0IDYgY2hhcmFjdGVycy4nOyByZXR1cm47
+IH0KYnRuLnRleHRDb250ZW50ID0gJ+KPsyBTZXR0aW5nIHVw4oCmJzsgYnRuLmRpc2FibGVkID0g
+dHJ1ZTsKdHJ5IHsKY29uc3QgZCA9IGF3YWl0IGFwaSgnL2FwaS9vd25lci9zZXR1cCcsIHttZXRo
+b2Q6J1BPU1QnLCBib2R5OkpTT04uc3RyaW5naWZ5KHtvd25lcl9rZXk6IGtleX0pfSk7CmlmIChk
+LnN1Y2Nlc3MpIHsKb3duZXJLZXlTZXNzaW9uID0ga2V5Owpsb2NhbFN0b3JhZ2Uuc2V0SXRlbShB
+Q1RfU1RPUkVfS0VZLCAnb3duZXInKTsKbG9jYWxTdG9yYWdlLnNldEl0ZW0oJ2NwbV9vd25lcl9r
+ZXknLCBrZXkpOwpidG4udGV4dENvbnRlbnQgPSAn4pyFIERvbmUhJzsKYnRuLnN0eWxlLmJhY2tn
+cm91bmQgPSAnbGluZWFyLWdyYWRpZW50KDEzNWRlZywjZDk3NzA2LCNiNDUzMDkpJzsKc2V0VGlt
+ZW91dCgoKSA9PiBoaWRlQWN0T3ZlcmxheSgnb3duZXInKSwgNzAwKTsKfSBlbHNlIHsKZXJyLnRl
+eHRDb250ZW50ID0gJ+KdjCAnICsgKGQuZXJyb3IgfHwgJ1NldHVwIGZhaWxlZCcpOwpidG4udGV4
+dENvbnRlbnQgPSAn8J+UkCBTZXQgT3duZXIgS2V5ICYgRW50ZXInOyBidG4uZGlzYWJsZWQgPSBm
+YWxzZTsKfQp9IGNhdGNoKF8pIHsKZXJyLnRleHRDb250ZW50ID0gJ+KdjCBTZXJ2ZXIgZXJyb3Ig
+4oCUIHRyeSBhZ2Fpbic7CmJ0bi50ZXh0Q29udGVudCA9ICfwn5SQIFNldCBPd25lciBLZXkgJiBF
+bnRlcic7IGJ0bi5kaXNhYmxlZCA9IGZhbHNlOwp9Cn0KbGV0IG93bmVyS2V5U2Vzc2lvbiA9ICcn
+OwpmdW5jdGlvbiBvcGVuT3duZXJQYW5lbCgpIHsKZW50ZXJPd25lclBhbmVsKCk7Cn0KZnVuY3Rp
+b24gY2xvc2VPd25lck1vZGFsKCkgewpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnb3duZXItbW9k
+YWwtb3ZlcmxheScpLmNsYXNzTGlzdC5yZW1vdmUoJ29wZW4nKTsKfQpmdW5jdGlvbiBzaG93T3du
+ZXJTZXR1cCgpIHsKZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ293bmVyLW1vZGFsLWJvZHknKS5p
+bm5lckhUTUwgPSBgCjxwIHN0eWxlPSJjb2xvcjojOTRhM2I4O2ZvbnQtc2l6ZToxM3B4O21hcmdp
+bi1ib3R0b206MjBweDtsaW5lLWhlaWdodDoxLjYiPgpGaXJzdC10aW1lIHNldHVwLiBDcmVhdGUg
+YSBzZWNyZXQgT3duZXIgS2V5IHRvIHByb3RlY3QgdGhpcyBtYW5hZ2VtZW50IHBhbmVsLiA8c3Ry
+b25nIHN0eWxlPSJjb2xvcjojZjU5ZTBiIj5LZWVwIGl0IHNhZmUg4oCUIGl0IGNhbm5vdCBiZSBy
+ZWNvdmVyZWQuPC9zdHJvbmc+PC9wPjxkaXYgY2xhc3M9Imdlbi1sYWJlbCIgc3R5bGU9ImNvbG9y
+OiM5NGEzYjg7bWFyZ2luLWJvdHRvbTo2cHgiPkNyZWF0ZSBPd25lciBTZWNyZXQgS2V5PC9kaXY+
+PGlucHV0IGNsYXNzPSJvd25lci1pbnB1dCIgaWQ9Im93bmVyLXNldHVwLWtleSIgdHlwZT0icGFz
+c3dvcmQiIHBsYWNlaG9sZGVyPSJNaW4gNiBjaGFyYWN0ZXJzIiBhdXRvY29tcGxldGU9Im5ldy1w
+YXNzd29yZCIvPjxkaXYgY2xhc3M9Im93bmVyLWVyciIgaWQ9Im93bmVyLXNldHVwLWVyciI+PC9k
+aXY+PGJ1dHRvbiBjbGFzcz0ib3duZXItYnRuIG93bmVyLWJ0bi1wcmltYXJ5IiBvbmNsaWNrPSJz
+dWJtaXRPd25lclNldHVwKCkiPvCflJAgU2V0IE93bmVyIEtleTwvYnV0dG9uPjxidXR0b24gY2xh
+c3M9Im93bmVyLWJ0biBvd25lci1idG4tc2Vjb25kYXJ5IiBvbmNsaWNrPSJjbG9zZU93bmVyTW9k
+YWwoKSI+Q2FuY2VsPC9idXR0b24+YDsKc2V0VGltZW91dCgoKSA9PiB7CmNvbnN0IGkgPSBkb2N1
+bWVudC5nZXRFbGVtZW50QnlJZCgnb3duZXItc2V0dXAta2V5Jyk7CmlmIChpKSB7IGkuZm9jdXMo
+KTsgaS5hZGRFdmVudExpc3RlbmVyKCdrZXlkb3duJywgZSA9PiB7IGlmIChlLmtleT09PSdFbnRl
+cicpIHN1Ym1pdE93bmVyU2V0dXAoKTsgfSk7IH0KfSwgNTApOwp9CmZ1bmN0aW9uIHNob3dPd25l
+ckF1dGgoKSB7CmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdvd25lci1tb2RhbC1ib2R5JykuaW5u
+ZXJIVE1MID0gYAo8cCBzdHlsZT0iY29sb3I6Izk0YTNiODtmb250LXNpemU6MTNweDttYXJnaW4t
+Ym90dG9tOjIwcHgiPkVudGVyIHlvdXIgT3duZXIgU2VjcmV0IEtleSB0byBhY2Nlc3MgdGhlIG1h
+bmFnZW1lbnQgcGFuZWwuPC9wPjxkaXYgY2xhc3M9Imdlbi1sYWJlbCIgc3R5bGU9ImNvbG9yOiM5
+NGEzYjg7bWFyZ2luLWJvdHRvbTo2cHgiPk93bmVyIFNlY3JldCBLZXk8L2Rpdj48aW5wdXQgY2xh
+c3M9Im93bmVyLWlucHV0IiBpZD0ib3duZXItYXV0aC1rZXkiIHR5cGU9InBhc3N3b3JkIiBwbGFj
+ZWhvbGRlcj0iWW91ciBvd25lciBzZWNyZXQga2V5IiBhdXRvY29tcGxldGU9ImN1cnJlbnQtcGFz
+c3dvcmQiLz48ZGl2IGNsYXNzPSJvd25lci1lcnIiIGlkPSJvd25lci1hdXRoLWVyciI+PC9kaXY+
+PGJ1dHRvbiBjbGFzcz0ib3duZXItYnRuIG93bmVyLWJ0bi1wcmltYXJ5IiBvbmNsaWNrPSJzdWJt
+aXRPd25lckF1dGgoKSI+8J+RkSBBY2Nlc3MgT3duZXIgUGFuZWw8L2J1dHRvbj48YnV0dG9uIGNs
+YXNzPSJvd25lci1idG4gb3duZXItYnRuLXNlY29uZGFyeSIgb25jbGljaz0iY2xvc2VPd25lck1v
+ZGFsKCkiPkNhbmNlbDwvYnV0dG9uPmA7CnNldFRpbWVvdXQoKCkgPT4gewpjb25zdCBpID0gZG9j
+dW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ293bmVyLWF1dGgta2V5Jyk7CmlmIChpKSB7IGkuZm9jdXMo
+KTsgaS5hZGRFdmVudExpc3RlbmVyKCdrZXlkb3duJywgZSA9PiB7IGlmIChlLmtleT09PSdFbnRl
+cicpIHN1Ym1pdE93bmVyQXV0aCgpOyB9KTsgfQp9LCA1MCk7Cn0KYXN5bmMgZnVuY3Rpb24gc3Vi
+bWl0T3duZXJTZXR1cCgpIHsKY29uc3QgaW5wID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ293
+bmVyLXNldHVwLWtleScpOwpjb25zdCBlcnIgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnb3du
+ZXItc2V0dXAtZXJyJyk7CmNvbnN0IGtleSA9IGlucC52YWx1ZS50cmltKCk7CmlmIChrZXkubGVu
+Z3RoIDwgNikgeyBlcnIudGV4dENvbnRlbnQgPSAnS2V5IG11c3QgYmUgYXQgbGVhc3QgNiBjaGFy
+YWN0ZXJzJzsgcmV0dXJuOyB9CnRyeSB7CmNvbnN0IGQgPSBhd2FpdCBhcGkoJy9hcGkvb3duZXIv
+c2V0dXAnLCB7bWV0aG9kOidQT1NUJywgYm9keTpKU09OLnN0cmluZ2lmeSh7b3duZXJfa2V5OiBr
+ZXl9KX0pOwppZiAoZC5zdWNjZXNzKSB7Cm93bmVyS2V5U2Vzc2lvbiA9IGtleTsgY2xvc2VPd25l
+ck1vZGFsKCk7IGVudGVyT3duZXJQYW5lbCgpOwp0b2FzdCgn8J+UkCBPd25lciBrZXkgc2V0ISBL
+ZWVwIGl0IHNhZmUuJywgdHJ1ZSk7Cn0gZWxzZSB7IGVyci50ZXh0Q29udGVudCA9IGQuZXJyb3Ig
+fHwgJ0ZhaWxlZCc7IH0KfSBjYXRjaChlKSB7IGVyci50ZXh0Q29udGVudCA9ICdTZXJ2ZXIgZXJy
+b3InOyB9Cn0KYXN5bmMgZnVuY3Rpb24gc3VibWl0T3duZXJBdXRoKCkgewpjb25zdCBpbnAgPSBk
+b2N1bWVudC5nZXRFbGVtZW50QnlJZCgnb3duZXItYXV0aC1rZXknKTsKY29uc3QgZXJyID0gZG9j
+dW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ293bmVyLWF1dGgtZXJyJyk7CmNvbnN0IGtleSA9IGlucC52
+YWx1ZS50cmltKCk7CmlmICgha2V5KSB7IGVyci50ZXh0Q29udGVudCA9ICdFbnRlciB5b3VyIG93
+bmVyIGtleSc7IHJldHVybjsgfQp0cnkgewpjb25zdCBkID0gYXdhaXQgYXBpKCcvYXBpL293bmVy
+L2F1dGgnLCB7bWV0aG9kOidQT1NUJywgYm9keTpKU09OLnN0cmluZ2lmeSh7b3duZXJfa2V5OiBr
+ZXl9KX0pOwppZiAoZC5zdWNjZXNzKSB7Cm93bmVyS2V5U2Vzc2lvbiA9IGtleTsgY2xvc2VPd25l
+ck1vZGFsKCk7IGVudGVyT3duZXJQYW5lbCgpOwp9IGVsc2UgewppbnAuY2xhc3NMaXN0LmFkZCgn
+ZXJyb3InKTsgZXJyLnRleHRDb250ZW50ID0gJ+KdjCAnICsgKGQuZXJyb3IgfHwgJ0ludmFsaWQg
+b3duZXIga2V5Jyk7Cn0KfSBjYXRjaChlKSB7IGVyci50ZXh0Q29udGVudCA9ICdTZXJ2ZXIgZXJy
+b3InOyB9Cn0KZnVuY3Rpb24gZW50ZXJPd25lclBhbmVsKCkgewpzaG93UGFnZSgnb3duZXInLCBk
+b2N1bWVudC5nZXRFbGVtZW50QnlJZCgnbmF2LW93bmVyJykpOwpvd25lckxvYWRBbmFseXRpY3Mo
+KTsKfQpmdW5jdGlvbiBvd25lclRhYih0YWIsIGJ0bikgewpkb2N1bWVudC5xdWVyeVNlbGVjdG9y
+QWxsKCcub3duZXItdGFiJykuZm9yRWFjaChiID0+IGIuY2xhc3NMaXN0LnJlbW92ZSgnYWN0aXZl
+JykpOwpkb2N1bWVudC5xdWVyeVNlbGVjdG9yQWxsKCcub3duZXItdGFiLXBhbmVsJykuZm9yRWFj
+aChwID0+IHAuY2xhc3NMaXN0LnJlbW92ZSgnYWN0aXZlJykpOwpidG4uY2xhc3NMaXN0LmFkZCgn
+YWN0aXZlJyk7CmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdvdGFiLScgKyB0YWIpLmNsYXNzTGlz
+dC5hZGQoJ2FjdGl2ZScpOwppZiAodGFiID09PSAnYW5hbHl0aWNzJykgb3duZXJMb2FkQW5hbHl0
+aWNzKCk7CmVsc2UgaWYgKHRhYiA9PT0gJ2tleXMnKSBvd25lckxvYWRLZXlzKCk7CmVsc2UgaWYg
+KHRhYiA9PT0gJ2xvZ3MnKSBvd25lckxvYWRMb2dzKCk7Cn0KYXN5bmMgZnVuY3Rpb24gb3duZXJQ
+b3N0KGVuZHBvaW50LCBleHRyYSA9IHt9KSB7CnJldHVybiBhcGkoZW5kcG9pbnQsIHttZXRob2Q6
+J1BPU1QnLCBib2R5OiBKU09OLnN0cmluZ2lmeSh7b3duZXJfa2V5OiBvd25lcktleVNlc3Npb24s
+IC4uLmV4dHJhfSl9KTsKfQphc3luYyBmdW5jdGlvbiBvd25lckxvYWRBbmFseXRpY3MoKSB7CmNv
+bnN0IGVsID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2FuYS1jYXJkcycpOwpjb25zdCByZWNl
+bnRFbCA9IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdhbmEtcmVjZW50LWxvZ3MnKTsKaWYgKCFl
+bCkgcmV0dXJuOwp0cnkgewpjb25zdCBkID0gYXdhaXQgb3duZXJQb3N0KCcvYXBpL293bmVyL2Fu
+YWx5dGljcycpOwpjb25zdCBzdGF0cyA9IFsKWydUb3RhbCBLZXlzJywgZC50b3RhbF9rZXlzLCAn
+IzI1NjNlYiddLApbJ0FjdGl2ZSBLZXlzJywgZC5hY3RpdmVfa2V5cywgJyMxNmEzNGEnXSwKWydV
+c2VkIEtleXMnLCBkLnVzZWRfa2V5cywgJyMwMzY5YTEnXSwKWydBY3RpdmF0aW9ucycsIGQudG90
+YWxfYWN0aXZhdGlvbnMsICcjN2MzYWVkJ10sCl07CmVsLmlubmVySFRNTCA9IHN0YXRzLm1hcCgo
+W2xhYmVsLCBudW0sIGNvbG9yXSkgPT4KYDxkaXYgY2xhc3M9ImFuYS1jYXJkIj48ZGl2IGNsYXNz
+PSJhbmEtbnVtIiBzdHlsZT0iY29sb3I6JHtjb2xvcn0iPiR7bnVtID8/IDB9PC9kaXY+PGRpdiBj
+bGFzcz0iYW5hLWxhYmVsIj4ke2xhYmVsfTwvZGl2PjwvZGl2PmAKKS5qb2luKCcnKTsKY29uc3Qg
+bG9ncyA9IGQucmVjZW50X2xvZ3MgfHwgW107CnJlY2VudEVsLmlubmVySFRNTCA9IGxvZ3MubGVu
+Z3RoCj8gbG9ncy5tYXAobCA9PiBgPGRpdiBjbGFzcz0ibG9nLXJvdyI+PHNwYW4gY2xhc3M9Imxv
+Zy10aW1lIj4keyhsLmFjdGl2YXRlZF9hdHx8JycpLnNsaWNlKDAsMTkpLnJlcGxhY2UoJ1QnLCcg
+Jyl9PC9zcGFuPjxzcGFuIGNsYXNzPSJsb2cta2V5Ij4ke2wua2V5fTwvc3Bhbj48c3BhbiBzdHls
+ZT0ibWFyZ2luLWxlZnQ6YXV0bztmb250LXNpemU6MTFweDtjb2xvcjp2YXIoLS1tdXRlZCkiPiR7
+bC5leHBpcmVzX2F0ID8gJ0V4cDogJytsLmV4cGlyZXNfYXQuc2xpY2UoMCwxMCkgOiAn4oieIE5v
+IGV4cGlyeSd9PC9zcGFuPjwvZGl2PmApLmpvaW4oJycpCjogJzxkaXYgc3R5bGU9ImNvbG9yOnZh
+cigtLW11dGVkKTtmb250LXNpemU6MTRweDtwYWRkaW5nOjhweCI+Tm8gYWN0aXZhdGlvbnMgeWV0
+PC9kaXY+JzsKfSBjYXRjaChlKSB7IGlmIChlbCkgZWwuaW5uZXJIVE1MID0gJzxkaXYgc3R5bGU9
+ImNvbG9yOiNkYzI2MjYiPkZhaWxlZCB0byBsb2FkIOKAlCBpcyBvd25lciBrZXkgY29ycmVjdD88
+L2Rpdj4nOyB9Cn0KYXN5bmMgZnVuY3Rpb24gb3duZXJMb2FkS2V5cygpIHsKY29uc3QgdGJvZHkg
+PSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgna2V5cy10Ym9keScpOwppZiAoIXRib2R5KSByZXR1
+cm47CnRyeSB7CmNvbnN0IGQgPSBhd2FpdCBvd25lclBvc3QoJy9hcGkvb3duZXIva2V5cycpOwpj
+b25zdCBrZXlzID0gZC5rZXlzIHx8IFtdOwp0Ym9keS5pbm5lckhUTUwgPSBrZXlzLmxlbmd0aAo/
+IGtleXMubWFwKGsgPT4gYDx0cj48dGQ+PHNwYW4gY2xhc3M9ImtleS1tb25vIj4ke2sua2V5fTwv
+c3Bhbj48YnI+PHNwYW4gc3R5bGU9ImZvbnQtc2l6ZToxMHB4O2NvbG9yOnZhcigtLW11dGVkKSI+
+JHtrLmlkfSR7ay5ub3RlPycgwrcgJytrLm5vdGU6Jyd9PC9zcGFuPjwvdGQ+PHRkPjxzcGFuIGNs
+YXNzPSJzdGF0dXMtcGlsbCBwaWxsLSR7ay5zdGF0dXN9Ij4ke2suc3RhdHVzfTwvc3Bhbj48L3Rk
+Pjx0ZCBzdHlsZT0iZm9udC1zaXplOjEycHgiPiR7ay5leHBpcmVzX2F0ID8gay5leHBpcmVzX2F0
+LnNsaWNlKDAsMTApIDogJ+KIniBOZXZlcid9PC90ZD48dGQgc3R5bGU9ImZvbnQtc2l6ZToxMnB4
+Ij4ke2sudXNlc19tYXg9PT0tMT8n4oieJzprLnVzZXNfbWF4fSAvIHVzZWQ6ICR7ay51c2VzX2Nv
+dW50fTwvdGQ+PHRkPgoke2suc3RhdHVzIT09J3Jldm9rZWQnP2A8YnV0dG9uIGNsYXNzPSJ0Ymwt
+YnRuIHRibC1idG4tcmV2b2tlIiBvbmNsaWNrPSJvd25lclJldm9rZSgnJHtrLmlkfScpIj5SZXZv
+a2U8L2J1dHRvbj5gOicnfQo8YnV0dG9uIGNsYXNzPSJ0YmwtYnRuIHRibC1idG4tZGVsZXRlIiBv
+bmNsaWNrPSJvd25lckRlbGV0ZUtleSgnJHtrLmlkfScpIj5EZWxldGU8L2J1dHRvbj48L3RkPjwv
+dHI+YCkuam9pbignJykKOiAnPHRyPjx0ZCBjb2xzcGFuPSI1IiBzdHlsZT0idGV4dC1hbGlnbjpj
+ZW50ZXI7Y29sb3I6dmFyKC0tbXV0ZWQpO3BhZGRpbmc6MjRweCI+Tm8ga2V5cyB5ZXQg4oCUIGdl
+bmVyYXRlIG9uZSBhYm92ZTwvdGQ+PC90cj4nOwp9IGNhdGNoKGUpIHsgdGJvZHkuaW5uZXJIVE1M
+ID0gJzx0cj48dGQgY29sc3Bhbj0iNSIgc3R5bGU9ImNvbG9yOiNkYzI2MjYiPkZhaWxlZCB0byBs
+b2FkIGtleXM8L3RkPjwvdHI+JzsgfQp9CmFzeW5jIGZ1bmN0aW9uIG93bmVyR2VuZXJhdGVLZXko
+KSB7CnRyeSB7CmNvbnN0IGQgPSBhd2FpdCBvd25lclBvc3QoJy9hcGkvb3duZXIva2V5cy9nZW5l
+cmF0ZScsIHsKY3VzdG9tX2tleTogZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2dlbi1jdXN0b20n
+KS52YWx1ZS50cmltKCksCmV4cF92YWx1ZTogZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2dlbi1l
+eHAtdmFsJykudmFsdWUudHJpbSgpIHx8IG51bGwsCmV4cF91bml0OiBkb2N1bWVudC5nZXRFbGVt
+ZW50QnlJZCgnZ2VuLWV4cC11bml0JykudmFsdWUsCnVzZXNfbWF4OiBwYXJzZUludChkb2N1bWVu
+dC5nZXRFbGVtZW50QnlJZCgnZ2VuLXVzZXMnKS52YWx1ZSksCm5vdGU6IGRvY3VtZW50LmdldEVs
+ZW1lbnRCeUlkKCdnZW4tbm90ZScpLnZhbHVlLnRyaW0oKSwKfSk7CmlmIChkLnN1Y2Nlc3MpIHsK
+dG9hc3QoJ+KchSBLZXk6ICcgKyBkLmtleS5rZXksIHRydWUpOwpbJ2dlbi1jdXN0b20nLCdnZW4t
+ZXhwLXZhbCcsJ2dlbi1ub3RlJ10uZm9yRWFjaChpZCA9PiB7IGRvY3VtZW50LmdldEVsZW1lbnRC
+eUlkKGlkKS52YWx1ZSA9ICcnOyB9KTsKb3duZXJMb2FkS2V5cygpOwp9IGVsc2UgeyB0b2FzdChk
+LmVycm9yIHx8ICdGYWlsZWQnLCBmYWxzZSk7IH0KfSBjYXRjaChlKSB7IHRvYXN0KCdTZXJ2ZXIg
+ZXJyb3InLCBmYWxzZSk7IH0KfQphc3luYyBmdW5jdGlvbiBvd25lclJldm9rZShpZCkgewppZiAo
+IWNvbmZpcm0oJ1Jldm9rZSB0aGlzIGtleT8gVXNlcnMgd2l0aCB0aGlzIGtleSB3aWxsIGxvc2Ug
+cHJlbWl1bSBhY2Nlc3MuJykpIHJldHVybjsKdHJ5IHsgY29uc3QgZCA9IGF3YWl0IG93bmVyUG9z
+dCgnL2FwaS9vd25lci9rZXlzL3Jldm9rZScsIHtpZH0pOyBpZiAoZC5zdWNjZXNzKSB7IG93bmVy
+TG9hZEtleXMoKTsgdG9hc3QoJ0tleSByZXZva2VkJywgdHJ1ZSk7IH0gZWxzZSB0b2FzdChkLmVy
+cm9yLCBmYWxzZSk7IH0KY2F0Y2goZSkgeyB0b2FzdCgnRmFpbGVkJywgZmFsc2UpOyB9Cn0KYXN5
+bmMgZnVuY3Rpb24gb3duZXJEZWxldGVLZXkoaWQpIHsKaWYgKCFjb25maXJtKCdQZXJtYW5lbnRs
+eSBkZWxldGUgdGhpcyBrZXk/JykpIHJldHVybjsKdHJ5IHsgY29uc3QgZCA9IGF3YWl0IG93bmVy
+UG9zdCgnL2FwaS9vd25lci9rZXlzL2RlbGV0ZScsIHtpZH0pOyBpZiAoZC5zdWNjZXNzKSB7IG93
+bmVyTG9hZEtleXMoKTsgdG9hc3QoJ0tleSBkZWxldGVkJywgdHJ1ZSk7IH0gZWxzZSB0b2FzdChk
+LmVycm9yLCBmYWxzZSk7IH0KY2F0Y2goZSkgeyB0b2FzdCgnRmFpbGVkJywgZmFsc2UpOyB9Cn0K
+YXN5bmMgZnVuY3Rpb24gb3duZXJMb2FkTG9ncygpIHsKY29uc3QgZWwgPSBkb2N1bWVudC5nZXRF
+bGVtZW50QnlJZCgnbG9nLWxpc3QnKTsKaWYgKCFlbCkgcmV0dXJuOwp0cnkgewpjb25zdCBkID0g
+YXdhaXQgb3duZXJQb3N0KCcvYXBpL293bmVyL2xvZ3MnKTsKY29uc3QgbG9ncyA9IGQubG9ncyB8
+fCBbXTsKZWwuaW5uZXJIVE1MID0gbG9ncy5sZW5ndGgKPyBsb2dzLm1hcChsID0+IGA8ZGl2IGNs
+YXNzPSJsb2ctcm93Ij48c3BhbiBjbGFzcz0ibG9nLXRpbWUiPiR7KGwuYWN0aXZhdGVkX2F0fHwn
+Jykuc2xpY2UoMCwxOSkucmVwbGFjZSgnVCcsJyAnKX08L3NwYW4+PHNwYW4gY2xhc3M9ImxvZy1r
+ZXkiPiR7bC5rZXl9PC9zcGFuPjxzcGFuIHN0eWxlPSJmb250LXNpemU6MTFweDtjb2xvcjp2YXIo
+LS1tdXRlZCk7bWFyZ2luLWxlZnQ6NHB4Ij4ke2wua2V5X2lkfTwvc3Bhbj48c3BhbiBzdHlsZT0i
+bWFyZ2luLWxlZnQ6YXV0bztmb250LXNpemU6MTFweDtjb2xvcjp2YXIoLS1tdXRlZCkiPiR7bC5l
+eHBpcmVzX2F0PydFeHA6ICcrbC5leHBpcmVzX2F0LnNsaWNlKDAsMTApOifiiJ4nfTwvc3Bhbj48
+L2Rpdj5gKS5qb2luKCcnKQo6ICc8ZGl2IHN0eWxlPSJjb2xvcjp2YXIoLS1tdXRlZCk7Zm9udC1z
+aXplOjE0cHg7cGFkZGluZzoyNHB4Ij5ObyBhY3RpdmF0aW9uIGxvZ3MgeWV0PC9kaXY+JzsKfSBj
+YXRjaChlKSB7IGVsLmlubmVySFRNTCA9ICc8ZGl2IHN0eWxlPSJjb2xvcjojZGMyNjI2Ij5GYWls
+ZWQgdG8gbG9hZCBsb2dzPC9kaXY+JzsgfQp9CmxldCBzdG9yYWdlUGF0aCA9ICcnOwpmdW5jdGlv
+biBvcGVuU3RvcmFnZVdpdGhDaGVjayhlbCkgewpyZXF1aXJlUHJlbWl1bSgnZmlsZV9tYW5hZ2Vy
+JywgKCkgPT4geyBzaG93UGFnZSgnc3RvcmFnZScsIGVsKTsgc3RvcmFnZU9wZW4oKTsgfSk7Cn0K
+ZnVuY3Rpb24gc3RvcmFnZU9wZW4oKSB7IGxvYWRTdG9yYWdlKCcnKTsgfQpmdW5jdGlvbiBzdG9y
+YWdlVG8ocGF0aCkgeyBsb2FkU3RvcmFnZShwYXRoKTsgfQphc3luYyBmdW5jdGlvbiBsb2FkU3Rv
+cmFnZShwYXRoKSB7CnN0b3JhZ2VQYXRoID0gcGF0aDsKcmVuZGVyU3RvcmFnZUNydW1iKCk7CmNv
+bnN0IGVsID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3N0b3JhZ2UtZmlsZS1saXN0Jyk7CmVs
+LmlubmVySFRNTCA9ICc8ZGl2IHN0eWxlPSJwYWRkaW5nOjMycHg7Y29sb3I6dmFyKC0tbXV0ZWQp
+O3RleHQtYWxpZ246Y2VudGVyIj7ij7MgTG9hZGluZ+KApjwvZGl2Pic7CnRyeSB7CmNvbnN0IGQg
+PSBhd2FpdCBhcGkoJy9hcGkvc3RvcmFnZS9saXN0P3BhdGg9JyArIGVuY29kZVVSSUNvbXBvbmVu
+dChwYXRoKSk7CmNvbnN0IGl0ZW1zID0gZC5pdGVtcyB8fCBbXTsKaWYgKCFpdGVtcy5sZW5ndGgp
+IHsKZWwuaW5uZXJIVE1MID0gJzxkaXYgc3R5bGU9InBhZGRpbmc6MzZweDtjb2xvcjp2YXIoLS1t
+dXRlZCk7dGV4dC1hbGlnbjpjZW50ZXIiPvCfk4IgVGhpcyBmb2xkZXIgaXMgZW1wdHkuPGJyPjxz
+bWFsbD5VcGxvYWQgZmlsZXMgb3IgY3JlYXRlIGEgZm9sZGVyIHRvIGdldCBzdGFydGVkLjwvc21h
+bGw+PC9kaXY+JzsKfSBlbHNlIHsKZWwuaW5uZXJIVE1MID0gYDxkaXYgc3R5bGU9Im92ZXJmbG93
+LXg6YXV0byI+PHRhYmxlIGNsYXNzPSJmaWxlLXRhYmxlIj48dGhlYWQ+PHRyPjx0aD5OYW1lPC90
+aD48dGg+U2l6ZTwvdGg+PHRoPk1vZGlmaWVkPC90aD48dGggc3R5bGU9InRleHQtYWxpZ246cmln
+aHQiPkFjdGlvbnM8L3RoPjwvdHI+PC90aGVhZD48dGJvZHk+JHtpdGVtcy5tYXAoZiA9PiB7CmNv
+bnN0IGZ1bGxSZWwgPSAocGF0aCA/IHBhdGggKyAnLycgOiAnJykgKyBmLm5hbWU7CmNvbnN0IGVz
+YyA9IGZ1bGxSZWwucmVwbGFjZSgvJy9nLCAiXFwnIik7CnJldHVybiBgPHRyPjx0ZD4KJHtmLnR5
+cGUgPT09ICdmb2xkZXInCj8gYDxidXR0b24gY2xhc3M9ImZpbGUtbmFtZS1idG4iIG9uY2xpY2s9
+InN0b3JhZ2VUbygnJHtlc2N9JykiPvCfk4EgJHtmLm5hbWV9PC9idXR0b24+YAo6IGA8c3Bhbj4k
+e3N0b3JhZ2VGaWxlSWNvbihmLm5hbWUpfSAke2YubmFtZX08L3NwYW4+YH0KPC90ZD48dGQgc3R5
+bGU9ImNvbG9yOnZhcigtLW11dGVkKTtmb250LXNpemU6MTJweCI+JHtmLnR5cGUgPT09ICdmb2xk
+ZXInID8gJ+KAlCcgOiBmbXRCeXRlcyhmLnNpemUpfTwvdGQ+PHRkIHN0eWxlPSJjb2xvcjp2YXIo
+LS1tdXRlZCk7Zm9udC1zaXplOjEycHg7d2hpdGUtc3BhY2U6bm93cmFwIj4ke2YubW9kaWZpZWR9
+PC90ZD48dGQgc3R5bGU9InRleHQtYWxpZ246cmlnaHQ7d2hpdGUtc3BhY2U6bm93cmFwIj4KJHtm
+LnR5cGUgPT09ICdmaWxlJyA/IGA8YnV0dG9uIGNsYXNzPSJ0YmwtYnRuIiBvbmNsaWNrPSJyZXF1
+aXJlUHJlbWl1bSgnZmlsZV9kb3dubG9hZCcsKCk9Pnsgd2luZG93LmxvY2F0aW9uPScvYXBpL3N0
+b3JhZ2UvZG93bmxvYWQ/cGF0aD0ke2VuY29kZVVSSUNvbXBvbmVudChmdWxsUmVsKX0nOyB9KSIg
+c3R5bGU9ImRpc3BsYXk6aW5saW5lLWJsb2NrIj7irIcgRG93bmxvYWQg8J+RkTwvYnV0dG9uPmAg
+OiAnJ30KPGJ1dHRvbiBjbGFzcz0idGJsLWJ0biB0YmwtYnRuLWRlbGV0ZSIgb25jbGljaz0ic3Rv
+cmFnZURlbGV0ZSgnJHtlc2N9JywnJHtmLnR5cGV9JykiPvCfl5EgRGVsZXRlPC9idXR0b24+PC90
+ZD48L3RyPmA7Cn0pLmpvaW4oJycpfTwvdGJvZHk+PC90YWJsZT48L2Rpdj5gOwp9Cn0gY2F0Y2go
+ZSkgewplbC5pbm5lckhUTUwgPSAnPGRpdiBzdHlsZT0icGFkZGluZzoyNHB4O2NvbG9yOiNkYzI2
+MjY7dGV4dC1hbGlnbjpjZW50ZXIiPuKdjCBGYWlsZWQgdG8gbG9hZCDigJQgaXMgdGhlIHBhbmVs
+IHJ1bm5pbmc/PC9kaXY+JzsKfQpsb2FkU3RvcmFnZVN0YXRzKCk7Cn0KZnVuY3Rpb24gcmVuZGVy
+U3RvcmFnZUNydW1iKCkgewpjb25zdCBlbCA9IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdzdG9y
+YWdlLWNydW1iJyk7CmlmICghZWwpIHJldHVybjsKY29uc3QgcGFydHMgPSBzdG9yYWdlUGF0aCA/
+IHN0b3JhZ2VQYXRoLnNwbGl0KCcvJykuZmlsdGVyKEJvb2xlYW4pIDogW107CmxldCBodG1sID0g
+YDxzcGFuIG9uY2xpY2s9InN0b3JhZ2VUbygnJykiIHN0eWxlPSJjdXJzb3I6cG9pbnRlcjtjb2xv
+cjp2YXIoLS1ibHVlKTtmb250LXdlaWdodDo2MDAiPvCfk4EgU3RvcmFnZTwvc3Bhbj5gOwpsZXQg
+YnVpbHQgPSAnJzsKcGFydHMuZm9yRWFjaCgocCwgaSkgPT4gewpidWlsdCA9IGJ1aWx0ID8gYnVp
+bHQgKyAnLycgKyBwIDogcDsKY29uc3Qgc25hcCA9IGJ1aWx0OwpodG1sICs9IGA8c3BhbiBzdHls
+ZT0iY29sb3I6dmFyKC0tbXV0ZWQpO3BhZGRpbmc6MCA1cHgiPi88L3NwYW4+YDsKaWYgKGkgPT09
+IHBhcnRzLmxlbmd0aCAtIDEpIHsKaHRtbCArPSBgPHNwYW4gc3R5bGU9ImNvbG9yOnZhcigtLXRl
+eHQpO2ZvbnQtd2VpZ2h0OjYwMCI+JHtwfTwvc3Bhbj5gOwp9IGVsc2UgewpodG1sICs9IGA8c3Bh
+biBvbmNsaWNrPSJzdG9yYWdlVG8oJyR7c25hcH0nKSIgc3R5bGU9ImN1cnNvcjpwb2ludGVyO2Nv
+bG9yOnZhcigtLWJsdWUpIj4ke3B9PC9zcGFuPmA7Cn0KfSk7CmVsLmlubmVySFRNTCA9IGh0bWw7
+Cn0KYXN5bmMgZnVuY3Rpb24gbG9hZFN0b3JhZ2VTdGF0cygpIHsKdHJ5IHsKY29uc3QgZCA9IGF3
+YWl0IGFwaSgnL2FwaS9zdG9yYWdlL3N0YXRzJyk7CmNvbnN0IHVzZWQgPSBkLnVzZWQgfHwgMCwg
+dG90YWwgPSBkLnRvdGFsIHx8IDA7CmNvbnN0IHBjdCA9IHRvdGFsID8gTWF0aC5taW4oMTAwLCAo
+dXNlZCAvIHRvdGFsKSAqIDEwMCkudG9GaXhlZCgxKSA6IDA7CmNvbnN0IGVsID0gZG9jdW1lbnQu
+Z2V0RWxlbWVudEJ5SWQoJ3N0b3JhZ2UtdXNhZ2UtdGV4dCcpOwpjb25zdCBiYXIgPSBkb2N1bWVu
+dC5nZXRFbGVtZW50QnlJZCgnc3RvcmFnZS1iYXInKTsKaWYgKGVsKSBlbC50ZXh0Q29udGVudCA9
+IGZtdEJ5dGVzKHVzZWQpICsgJyB1c2VkIG9mICcgKyBmbXRCeXRlcyh0b3RhbCk7CmlmIChiYXIp
+IGJhci5zdHlsZS53aWR0aCA9IHBjdCArICclJzsKfSBjYXRjaChfKSB7fQp9CmZ1bmN0aW9uIHN0
+b3JhZ2VGaWxlSWNvbihuYW1lKSB7CmNvbnN0IGV4dCA9IChuYW1lLnNwbGl0KCcuJykucG9wKCkg
+fHwgJycpLnRvTG93ZXJDYXNlKCk7CmNvbnN0IG1hcCA9IHtqcGc6J/CflrwnLGpwZWc6J/Cflrwn
+LHBuZzon8J+WvCcsZ2lmOifwn5a8Jyx3ZWJwOifwn5a8Jyxzdmc6J/CflrwnLGljbzon8J+WvCcs
+Cm1wNDon8J+OrCcsbWt2Oifwn46sJyxhdmk6J/CfjqwnLG1vdjon8J+OrCcsbXAzOifwn461Jyx3
+YXY6J/CfjrUnLG9nZzon8J+OtScsCnBkZjon8J+ThCcsZG9jOifwn5OdJyxkb2N4Oifwn5OdJyx0
+eHQ6J/Cfk50nLGxvZzon8J+TnScsCnppcDon8J+TpicsdGFyOifwn5OmJyxnejon8J+TpicsJzd6
+Jzon8J+TpicscmFyOifwn5OmJywKc2g6J+KamScscHk6J/CfkI0nLGpzOifwn5OcJyx0czon8J+T
+nCcsanNvbjon8J+TiycseW1sOifwn5OLJyx5YW1sOifwn5OLJywKaHRtbDon8J+MkCcsY3NzOifw
+n46oJyxwaHA6J/CfkJgnLHNxbDon8J+Xgyd9OwpyZXR1cm4gbWFwW2V4dF0gfHwgJ/Cfk4QnOwp9
+CmZ1bmN0aW9uIGZtdEJ5dGVzKGIpIHsKaWYgKCFiKSByZXR1cm4gJzAgQic7CmlmIChiIDwgMTAy
+NCkgcmV0dXJuIGIgKyAnIEInOwppZiAoYiA8IDEwNDg1NzYpIHJldHVybiAoYi8xMDI0KS50b0Zp
+eGVkKDEpICsgJyBLQic7CmlmIChiIDwgMTA3Mzc0MTgyNCkgcmV0dXJuIChiLzEwNDg1NzYpLnRv
+Rml4ZWQoMSkgKyAnIE1CJzsKcmV0dXJuIChiLzEwNzM3NDE4MjQpLnRvRml4ZWQoMikgKyAnIEdC
+JzsKfQpmdW5jdGlvbiBzdG9yYWdlVXBsb2FkKCkgewpkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgn
+c3RvcmFnZS1maWxlLWlucHV0JykuY2xpY2soKTsKfQphc3luYyBmdW5jdGlvbiBzdG9yYWdlRG9V
+cGxvYWQoaW5wdXQpIHsKY29uc3QgZmlsZXMgPSBBcnJheS5mcm9tKGlucHV0LmZpbGVzKTsKaWYg
+KCFmaWxlcy5sZW5ndGgpIHJldHVybjsKdG9hc3QoYOKPsyBVcGxvYWRpbmcgJHtmaWxlcy5sZW5n
+dGh9IGZpbGUocynigKZgKTsKbGV0IG9rID0gMCwgZmFpbCA9IDA7CmZvciAoY29uc3QgZmlsZSBv
+ZiBmaWxlcykgewpjb25zdCBmZCA9IG5ldyBGb3JtRGF0YSgpOwpmZC5hcHBlbmQoJ2ZpbGUnLCBm
+aWxlKTsKZmQuYXBwZW5kKCdwYXRoJywgc3RvcmFnZVBhdGgpOwp0cnkgewpjb25zdCByID0gYXdh
+aXQgZmV0Y2goJy9hcGkvc3RvcmFnZS91cGxvYWQnLCB7bWV0aG9kOidQT1NUJywgYm9keTogZmR9
+KTsKY29uc3QgZCA9IGF3YWl0IHIuanNvbigpOwppZiAoZC5zdWNjZXNzKSBvaysrOyBlbHNlIHsg
+ZmFpbCsrOyB0b2FzdCgn4p2MICcgKyBmaWxlLm5hbWUgKyAnOiAnICsgKGQuZXJyb3J8fCdmYWls
+ZWQnKSwgZmFsc2UpOyB9Cn0gY2F0Y2goXykgeyBmYWlsKys7IHRvYXN0KCfinYwgVXBsb2FkIGZh
+aWxlZCBmb3IgJyArIGZpbGUubmFtZSwgZmFsc2UpOyB9Cn0KaW5wdXQudmFsdWUgPSAnJzsKaWYg
+KG9rKSB0b2FzdCgn4pyFICcgKyBvayArICcgZmlsZShzKSB1cGxvYWRlZCcsIHRydWUpOwpsb2Fk
+U3RvcmFnZShzdG9yYWdlUGF0aCk7Cn0KYXN5bmMgZnVuY3Rpb24gc3RvcmFnZU1rZGlyKCkgewpj
+b25zdCBuYW1lID0gcHJvbXB0KCdOZXcgZm9sZGVyIG5hbWU6Jyk7CmlmICghbmFtZSB8fCAhbmFt
+ZS50cmltKCkpIHJldHVybjsKY29uc3Qgc2FmZSA9IG5hbWUudHJpbSgpLnJlcGxhY2UoL1teYS16
+QS1aMC05X1wtLiBdL2csICdfJyk7CmlmICghc2FmZSkgeyB0b2FzdCgnSW52YWxpZCBmb2xkZXIg
+bmFtZScsIGZhbHNlKTsgcmV0dXJuOyB9CnRyeSB7CmNvbnN0IGQgPSBhd2FpdCBhcGkoJy9hcGkv
+c3RvcmFnZS9ta2RpcicsIHttZXRob2Q6J1BPU1QnLCBib2R5OiBKU09OLnN0cmluZ2lmeSh7cGF0
+aDogKHN0b3JhZ2VQYXRoID8gc3RvcmFnZVBhdGggKyAnLycgOiAnJykgKyBzYWZlfSl9KTsKaWYg
+KGQuc3VjY2VzcykgeyB0b2FzdCgn8J+TgSBGb2xkZXIgY3JlYXRlZCcsIHRydWUpOyBsb2FkU3Rv
+cmFnZShzdG9yYWdlUGF0aCk7IH0KZWxzZSB0b2FzdChkLmVycm9yIHx8ICdGYWlsZWQgdG8gY3Jl
+YXRlIGZvbGRlcicsIGZhbHNlKTsKfSBjYXRjaChfKSB7IHRvYXN0KCdTZXJ2ZXIgZXJyb3InLCBm
+YWxzZSk7IH0KfQphc3luYyBmdW5jdGlvbiBzdG9yYWdlRGVsZXRlKHBhdGgsIHR5cGUpIHsKY29u
+c3QgbXNnID0gdHlwZSA9PT0gJ2ZvbGRlcicKPyAnRGVsZXRlIHRoaXMgZm9sZGVyIGFuZCBBTEwg
+aXRzIGNvbnRlbnRzPyBUaGlzIGNhbm5vdCBiZSB1bmRvbmUuJwo6ICdEZWxldGUgdGhpcyBmaWxl
+PyBUaGlzIGNhbm5vdCBiZSB1bmRvbmUuJzsKaWYgKCFjb25maXJtKG1zZykpIHJldHVybjsKdHJ5
+IHsKY29uc3QgZCA9IGF3YWl0IGFwaSgnL2FwaS9zdG9yYWdlL2RlbGV0ZScsIHttZXRob2Q6J1BP
+U1QnLCBib2R5OiBKU09OLnN0cmluZ2lmeSh7cGF0aH0pfSk7CmlmIChkLnN1Y2Nlc3MpIHsgdG9h
+c3QoJ/Cfl5EgRGVsZXRlZCcsIHRydWUpOyBsb2FkU3RvcmFnZShzdG9yYWdlUGF0aCk7IH0KZWxz
+ZSB0b2FzdChkLmVycm9yIHx8ICdEZWxldGUgZmFpbGVkJywgZmFsc2UpOwp9IGNhdGNoKF8pIHsg
+dG9hc3QoJ1NlcnZlciBlcnJvcicsIGZhbHNlKTsgfQp9CmxldCBfdHVubmVsVXJsID0gbnVsbDsK
+YXN5bmMgZnVuY3Rpb24gbG9hZFR1bm5lbFVybCgpIHsKdHJ5IHsKY29uc3QgZCA9IGF3YWl0IGFw
+aSgnL2FwaS90dW5uZWwvc3RhdHVzJyk7CmlmIChkLnJlYWR5ICYmIGQudXJsKSB7Cl90dW5uZWxV
+cmwgPSBkLnVybDsKY29uc3QgYmFubmVyID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3R1bm5l
+bC1iYW5uZXInKTsKY29uc3QgdXJsRWwgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgndHVubmVs
+LXVybC10ZXh0Jyk7CmlmIChiYW5uZXIgJiYgdXJsRWwpIHsKdXJsRWwudGV4dENvbnRlbnQgPSBk
+LnVybDsKYmFubmVyLmNsYXNzTGlzdC5hZGQoJ3Nob3cnKTsKfQp9Cn0gY2F0Y2goZSkge30KfQpm
+dW5jdGlvbiBjb3B5VHVubmVsVXJsKCkgewppZiAoIV90dW5uZWxVcmwpIHJldHVybjsKbmF2aWdh
+dG9yLmNsaXBib2FyZC53cml0ZVRleHQoX3R1bm5lbFVybCkudGhlbigoKSA9PiB7CmNvbnN0IGJ0
+biA9IGRvY3VtZW50LnF1ZXJ5U2VsZWN0b3IoJy50dW5uZWwtY29weScpOwppZiAoYnRuKSB7IGJ0
+bi50ZXh0Q29udGVudCA9ICdDb3BpZWQhJzsgc2V0VGltZW91dCgoKSA9PiBidG4udGV4dENvbnRl
+bnQgPSAnQ29weScsIDIwMDApOyB9Cn0pOwp9CmZ1bmN0aW9uIHBvbGxUdW5uZWwodHJpZXM9MCkg
+ewpsb2FkVHVubmVsVXJsKCkudGhlbigoKSA9PiB7CmlmICghX3R1bm5lbFVybCAmJiB0cmllcyA8
+IDI0KSBzZXRUaW1lb3V0KCgpID0+IHBvbGxUdW5uZWwodHJpZXMrMSksIDUwMDApOwp9KTsKfQpj
+b25zdCBVSUNfUFJFU0VUUyA9IHsKZGVmYXVsdDogeyBsYWJlbDon4piA77iPIERlZmF1bHQnLCBi
+ZzonI2YwZjRmOCcsIHNpZGViYXI6JyNmZmZmZmYnLCBjYXJkOicjZmZmZmZmJywgYmx1ZTonIzI1
+NjNlYicsIHRleHQ6JyMwZjE3MmEnLCBtdXRlZDonIzY0NzQ4YicsIGJvcmRlcjonI2UyZThmMCcs
+IGdyZWVuOicjMTZhMzRhJywgcmVkOicjZGMyNjI2JywgYW1iZXI6JyNkOTc3MDYnIH0sCmRhcms6
+IHsgbGFiZWw6J/CfjJkgRGFyaycsIGJnOicjMGYxNzJhJywgc2lkZWJhcjonIzFlMjkzYicsIGNh
+cmQ6JyMxZTI5M2InLCBibHVlOicjM2I4MmY2JywgdGV4dDonI2YxZjVmOScsIG11dGVkOicjOTRh
+M2I4JywgYm9yZGVyOicjMzM0MTU1JywgZ3JlZW46JyMyMmM1NWUnLCByZWQ6JyNlZjQ0NDQnLCBh
+bWJlcjonI2Y1OWUwYicgfSwKb2NlYW46IHsgbGFiZWw6J/CfjIogT2NlYW4nLCBiZzonIzBjMWEy
+ZScsIHNpZGViYXI6JyMwZjI3NDQnLCBjYXJkOicjMTIyZjUwJywgYmx1ZTonIzM4YmRmOCcsIHRl
+eHQ6JyNlMGYyZmUnLCBtdXRlZDonIzdkZDNmYycsIGJvcmRlcjonIzFlNDk3NicsIGdyZWVuOicj
+MzRkMzk5JywgcmVkOicjZjg3MTcxJywgYW1iZXI6JyNmYmJmMjQnIH0sCnNha3VyYTogeyBsYWJl
+bDon8J+MuCBTYWt1cmEnLCBiZzonI2ZmZjBmNScsIHNpZGViYXI6JyNmZmU0ZWYnLCBjYXJkOicj
+ZmZmOGZiJywgYmx1ZTonI2U4NzlhMCcsIHRleHQ6JyM0YTE5NDInLCBtdXRlZDonI2JlOGFhYycs
+IGJvcmRlcjonI2Y5YzZkYicsIGdyZWVuOicjMjJjNTVlJywgcmVkOicjZWY0NDQ0JywgYW1iZXI6
+JyNmNTllMGInIH0sCmZvcmVzdDogeyBsYWJlbDon8J+MvyBGb3Jlc3QnLCBiZzonIzBhMWYwZics
+IHNpZGViYXI6JyMwZjJiMTUnLCBjYXJkOicjMTIyYjE4JywgYmx1ZTonIzRhZGU4MCcsIHRleHQ6
+JyNkY2ZjZTcnLCBtdXRlZDonIzg2ZWZhYycsIGJvcmRlcjonIzFhNDIyNScsIGdyZWVuOicjODZl
+ZmFjJywgcmVkOicjZjg3MTcxJywgYW1iZXI6JyNmYmJmMjQnIH0sCnN1bnNldDogeyBsYWJlbDon
+8J+MhSBTdW5zZXQnLCBiZzonIzFjMGEwMCcsIHNpZGViYXI6JyMyZDFhMDAnLCBjYXJkOicjMmQx
+YTAwJywgYmx1ZTonI2Y5NzMxNicsIHRleHQ6JyNmZmY3ZWQnLCBtdXRlZDonI2ZkYmE3NCcsIGJv
+cmRlcjonIzQzMWEwMCcsIGdyZWVuOicjODZlZmFjJywgcmVkOicjZjg3MTcxJywgYW1iZXI6JyNm
+YmJmMjQnIH0sCm1pZG5pZ2h0OiB7IGxhYmVsOifwn4yDIE1pZG5pZ2h0JywgYmc6JyMwYTBhMWEn
+LCBzaWRlYmFyOicjMGQwZDJiJywgY2FyZDonIzEyMTIyZScsIGJsdWU6JyM4MThjZjgnLCB0ZXh0
+OicjZTBlN2ZmJywgbXV0ZWQ6JyNhNWI0ZmMnLCBib3JkZXI6JyMxZTFlNGEnLCBncmVlbjonIzRh
+ZGU4MCcsIHJlZDonI2Y4NzE3MScsIGFtYmVyOicjZmJiZjI0JyB9LApjeWJlcjogeyBsYWJlbDon
+4pqhIEN5YmVyJywgYmc6JyMwMDBkMGQnLCBzaWRlYmFyOicjMDAxYTFhJywgY2FyZDonIzAwMWEx
+YScsIGJsdWU6JyMwMGZmY2MnLCB0ZXh0OicjY2NmZmVlJywgbXV0ZWQ6JyMwMGFhODgnLCBib3Jk
+ZXI6JyMwMDQ0MzMnLCBncmVlbjonIzAwZmZhYScsIHJlZDonI2ZmNDQ2NicsIGFtYmVyOicjZmZj
+YzAwJyB9LApjYW5keTogeyBsYWJlbDon8J+NrCBDYW5keScsIGJnOicjZmZmMGZmJywgc2lkZWJh
+cjonI2ZmZTBmZicsIGNhcmQ6JyNmZmYwZmYnLCBibHVlOicjYTg1NWY3JywgdGV4dDonIzJlMTA2
+NScsIG11dGVkOicjYzA4NGZjJywgYm9yZGVyOicjZjVkMGZlJywgZ3JlZW46JyMyMmM1NWUnLCBy
+ZWQ6JyNlZjQ0NDQnLCBhbWJlcjonI2Y1OWUwYicgfSwKc3RlZWw6IHsgbGFiZWw6J/CflKkgU3Rl
+ZWwnLCBiZzonIzFjMWYyNicsIHNpZGViYXI6JyMyMjI2MmYnLCBjYXJkOicjMjIyNjJmJywgYmx1
+ZTonIzYwYTVmYScsIHRleHQ6JyNlMmU4ZjAnLCBtdXRlZDonIzk0YTNiOCcsIGJvcmRlcjonIzJk
+MzMzYicsIGdyZWVuOicjNGFkZTgwJywgcmVkOicjZjg3MTcxJywgYW1iZXI6JyNmYmJmMjQnIH0s
+CmdsYXNzOiB7IGxhYmVsOifwn5KOIExpZ2h0IFRyYW5zcGFyZW50JywgYmc6J3RyYW5zcGFyZW50
+Jywgc2lkZWJhcjoncmdiYSgyNTUsMjU1LDI1NSwwLjE1KScsIGNhcmQ6J3JnYmEoMjU1LDI1NSwy
+NTUsMC4xMiknLCBibHVlOicjNjBhNWZhJywgdGV4dDonI2Y4ZmFmYycsIG11dGVkOicjZTJlOGYw
+JywgYm9yZGVyOidyZ2JhKDI1NSwyNTUsMjU1LDAuMjUpJywgZ3JlZW46JyM0YWRlODAnLCByZWQ6
+JyNmODcxNzEnLCBhbWJlcjonI2ZiYmYyNCcgfSwKfTsKbGV0IHVpY0N1cnJlbnRQcmVzZXQgPSAn
+ZGVmYXVsdCc7CmxldCB1aWNDdXJyZW50QmcgPSAnbm9uZSc7CmxldCB1aWNTZXR0aW5ncyA9IHt9
+OwpmdW5jdGlvbiBvcGVuVWlDdXN0b21pemVXaXRoQ2hlY2soZWwpIHsKcmVxdWlyZVByZW1pdW0o
+J3VpX2N1c3RvbWl6ZScsICgpID0+IHsgc2hvd1BhZ2UoJ3VpY3VzdG9tJywgZWwpOyB1aWNSZW5k
+ZXJQYWdlKCk7IH0pOwp9CmZ1bmN0aW9uIHVpY1JlbmRlclBhZ2UoKSB7CmNvbnN0IHByZXNldEVs
+ID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3VpYy1wcmVzZXQtYnRucycpOwppZiAocHJlc2V0
+RWwpIHsKcHJlc2V0RWwuaW5uZXJIVE1MID0gT2JqZWN0LmVudHJpZXMoVUlDX1BSRVNFVFMpLm1h
+cCgoW2tleSwgcF0pID0+CmA8YnV0dG9uIGNsYXNzPSJ1aWMtcHJlc2V0ICR7dWljQ3VycmVudFBy
+ZXNldD09PWtleT8nYWN0aXZlJzonJ30iIG9uY2xpY2s9InVpY0FwcGx5UHJlc2V0KCcke2tleX0n
+KSI+JHtwLmxhYmVsfTwvYnV0dG9uPmAKKS5qb2luKCcnKTsKfQpjb25zdCBzYXZlZEZvbnQgPSB1
+aWNTZXR0aW5ncy5mb250RmFtaWx5IHx8ICcnOwpjb25zdCBzYXZlZFNpemUgPSB1aWNTZXR0aW5n
+cy5mb250U2l6ZSB8fCAnMTQnOwpjb25zdCBmb250RWwgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJ
+ZCgndWljLWZvbnQtc2VsZWN0Jyk7CmlmIChmb250RWwpIGZvbnRFbC52YWx1ZSA9IHNhdmVkRm9u
+dDsKY29uc3Qgc2l6ZUVsID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3VpYy1mb250LXNpemUn
+KTsKaWYgKHNpemVFbCkgeyBzaXplRWwudmFsdWUgPSBzYXZlZFNpemU7IGNvbnN0IHY9ZG9jdW1l
+bnQuZ2V0RWxlbWVudEJ5SWQoJ3VpYy1zaXplLXZhbCcpOyBpZih2KXYudGV4dENvbnRlbnQ9c2F2
+ZWRTaXplKydweCc7IH0KY29uc3Qgc2F2ZWRSYWRpdXMgPSB1aWNTZXR0aW5ncy5yYWRpdXMgfHwg
+JzEycHgnOwpkb2N1bWVudC5xdWVyeVNlbGVjdG9yQWxsKCcudWljLXJhZGl1cy1vcHQnKS5mb3JF
+YWNoKGIgPT4gYi5jbGFzc0xpc3QudG9nZ2xlKCdhY3RpdmUnLCBiLmRhdGFzZXQucj09PXNhdmVk
+UmFkaXVzKSk7CnVpY1N5bmNQaWNrZXJzKCk7CmlmICh1aWNTZXR0aW5ncy5iZ190eXBlID09PSAn
+aW1hZ2UnICYmIHVpY1NldHRpbmdzLmJnX3VybCkgewpjb25zdCB3cmFwID0gZG9jdW1lbnQuZ2V0
+RWxlbWVudEJ5SWQoJ3VpYy1pbWctcHJldmlldy13cmFwJyk7CmlmICh3cmFwKSB3cmFwLmlubmVy
+SFRNTCA9IGA8aW1nIHNyYz0iJHt1aWNTZXR0aW5ncy5iZ191cmx9IiBzdHlsZT0id2lkdGg6MTAw
+JTtoZWlnaHQ6MTAwJTtvYmplY3QtZml0OmNvdmVyO2JvcmRlci1yYWRpdXM6MTBweCIvPmA7CmNv
+bnN0IGJ0biA9IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd1aWMtaW1nLWNsZWFyLWJ0bicpOwpp
+ZiAoYnRuKSBidG4uc3R5bGUuZGlzcGxheSA9ICdibG9jayc7Cn0KaWYgKHVpY1NldHRpbmdzLmJn
+X3R5cGUgPT09ICd2aWRlbycgJiYgdWljU2V0dGluZ3MuYmdfdXJsKSB7CmNvbnN0IHdyYXAgPSBk
+b2N1bWVudC5nZXRFbGVtZW50QnlJZCgndWljLXZpZC1wcmV2aWV3LXdyYXAnKTsKaWYgKHdyYXAp
+IHdyYXAuaW5uZXJIVE1MID0gYDx2aWRlbyBzcmM9IiR7dWljU2V0dGluZ3MuYmdfdXJsfSIgYXV0
+b3BsYXkgbG9vcCBtdXRlZCBwbGF5c2lubGluZSBzdHlsZT0id2lkdGg6MTAwJTtoZWlnaHQ6MTAw
+JTtvYmplY3QtZml0OmNvdmVyO2JvcmRlci1yYWRpdXM6MTBweCI+PC92aWRlbz5gOwpjb25zdCBi
+dG4gPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgndWljLXZpZC1jbGVhci1idG4nKTsKaWYgKGJ0
+bikgYnRuLnN0eWxlLmRpc3BsYXkgPSAnYmxvY2snOwp9Cn0KZnVuY3Rpb24gdWljU3luY1BpY2tl
+cnMoKSB7CmNvbnN0IHBhaXJzID0gW1snYmcnLCdzdy1iZyddLFsnc2lkZWJhcicsJ3N3LXNpZGVi
+YXInXSxbJ2NhcmQnLCdzdy1jYXJkJ10sWydibHVlJywnc3ctYmx1ZSddLFsndGV4dCcsJ3N3LXRl
+eHQnXSxbJ211dGVkJywnc3ctbXV0ZWQnXSxbJ2JvcmRlcicsJ3N3LWJvcmQnXSxbJ2dyZWVuJywn
+c3ctZ3JlZW4nXSxbJ3JlZCcsJ3N3LXJlZCddLFsnYW1iZXInLCdzdy1hbWJlciddXTsKcGFpcnMu
+Zm9yRWFjaCgoW3Zhck4sIHN3SWRdKSA9PiB7CmNvbnN0IGlucCA9IGRvY3VtZW50LmdldEVsZW1l
+bnRCeUlkKCd1aWMtY2xyLScgKyB2YXJOKTsKY29uc3Qgc3cgPSBkb2N1bWVudC5nZXRFbGVtZW50
+QnlJZChzd0lkKTsKaWYgKCFpbnApIHJldHVybjsKY29uc3QgdmFsID0gZ2V0Q29tcHV0ZWRTdHls
+ZShkb2N1bWVudC5kb2N1bWVudEVsZW1lbnQpLmdldFByb3BlcnR5VmFsdWUoJy0tJyArIHZhck4p
+LnRyaW0oKTsKY29uc3QgaGV4ID0gdWljVG9IZXgodmFsKTsKaW5wLnZhbHVlID0gaGV4OwppZiAo
+c3cpIHN3LnN0eWxlLmJhY2tncm91bmQgPSBoZXg7Cn0pOwp9CmZ1bmN0aW9uIHVpY1RvSGV4KGNv
+bG9yKSB7CmlmICghY29sb3IpIHJldHVybiAnIzAwMDAwMCc7CmNvbnN0IG0gPSBjb2xvci50cmlt
+KCkubWF0Y2goL14jKFswLTlhLWZBLUZdezZ9KS8pOwppZiAobSkgcmV0dXJuICcjJyArIG1bMV07
+CmNvbnN0IG0zID0gY29sb3IudHJpbSgpLm1hdGNoKC9eIyhbMC05YS1mQS1GXXszfSkkLyk7Cmlm
+IChtMykgeyBjb25zdCBbcixnLGJdPW0zWzFdLnNwbGl0KCcnKS5tYXAoYz0+YytjKTsgcmV0dXJu
+ICcjJytyK2crYjsgfQpjb25zdCB0bXAgPSBkb2N1bWVudC5jcmVhdGVFbGVtZW50KCdjYW52YXMn
+KS5nZXRDb250ZXh0KCcyZCcpOwp0bXAuZmlsbFN0eWxlID0gY29sb3I7CmNvbnN0IGMgPSB0bXAu
+ZmlsbFN0eWxlOwppZiAoYy5zdGFydHNXaXRoKCcjJykpIHJldHVybiBjLnNsaWNlKDAsNyk7CmNv
+bnN0IHJnYiA9IGMubWF0Y2goL1xkKy9nKTsKaWYgKHJnYikgcmV0dXJuICcjJytyZ2Iuc2xpY2Uo
+MCwzKS5tYXAoeD0+cGFyc2VJbnQoeCkudG9TdHJpbmcoMTYpLnBhZFN0YXJ0KDIsJzAnKSkuam9p
+bignJyk7CnJldHVybiAnIzAwMDAwMCc7Cn0KZnVuY3Rpb24gdWljUGlja0NvbG9yKHZhck5hbWUs
+IGVsKSB7CmNvbnN0IHZhbCA9IGVsLnZhbHVlOwpkb2N1bWVudC5kb2N1bWVudEVsZW1lbnQuc3R5
+bGUuc2V0UHJvcGVydHkoJy0tJyArIHZhck5hbWUsIHZhbCk7CmNvbnN0IHN3ID0gZWwucGFyZW50
+RWxlbWVudDsKaWYgKHN3KSBzdy5zdHlsZS5iYWNrZ3JvdW5kID0gdmFsOwp1aWNDdXJyZW50UHJl
+c2V0ID0gJ2N1c3RvbSc7CmRvY3VtZW50LnF1ZXJ5U2VsZWN0b3JBbGwoJy51aWMtcHJlc2V0Jyku
+Zm9yRWFjaChiID0+IGIuY2xhc3NMaXN0LnJlbW92ZSgnYWN0aXZlJykpOwp1aWNTZXR0aW5ncy5j
+b2xvcnMgPSB1aWNTZXR0aW5ncy5jb2xvcnMgfHwge307CnVpY1NldHRpbmdzLmNvbG9yc1snLS0n
+ICsgdmFyTmFtZV0gPSB2YWw7Cn0KZnVuY3Rpb24gdWljSGV4QWxwaGEoaGV4LCBhKSB7CmlmICgh
+aGV4IHx8ICFoZXguc3RhcnRzV2l0aCgnIycpKSByZXR1cm4gYHJnYmEoMCwwLDAsJHthfSlgOwpj
+b25zdCByPXBhcnNlSW50KGhleC5zbGljZSgxLDMpLDE2KSwgZz1wYXJzZUludChoZXguc2xpY2Uo
+Myw1KSwxNiksIGI9cGFyc2VJbnQoaGV4LnNsaWNlKDUsNyksMTYpOwpyZXR1cm4gYHJnYmEoJHty
+fSwke2d9LCR7Yn0sJHthfSlgOwp9CmZ1bmN0aW9uIHVpY0FwcGx5UHJlc2V0KGtleSkgewpjb25z
+dCBwID0gVUlDX1BSRVNFVFNba2V5XTsKaWYgKCFwKSByZXR1cm47CmNvbnN0IHJvb3QgPSBkb2N1
+bWVudC5kb2N1bWVudEVsZW1lbnQ7CnJvb3Quc3R5bGUuc2V0UHJvcGVydHkoJy0tYmcnLCBwLmJn
+KTsKcm9vdC5zdHlsZS5zZXRQcm9wZXJ0eSgnLS1zaWRlYmFyJyxwLnNpZGViYXIpOwpyb290LnN0
+eWxlLnNldFByb3BlcnR5KCctLWNhcmQnLCBwLmNhcmQpOwpyb290LnN0eWxlLnNldFByb3BlcnR5
+KCctLWJsdWUnLCBwLmJsdWUpOwpyb290LnN0eWxlLnNldFByb3BlcnR5KCctLWJsdWUtbGlnaHQn
+LCB1aWNIZXhBbHBoYShwLmJsdWUsIDAuMTIpKTsKcm9vdC5zdHlsZS5zZXRQcm9wZXJ0eSgnLS1i
+bHVlLW1pZCcsIHVpY0hleEFscGhhKHAuYmx1ZSwgMC4zMCkpOwpyb290LnN0eWxlLnNldFByb3Bl
+cnR5KCctLXRleHQnLCBwLnRleHQpOwpyb290LnN0eWxlLnNldFByb3BlcnR5KCctLW11dGVkJywg
+cC5tdXRlZCk7CnJvb3Quc3R5bGUuc2V0UHJvcGVydHkoJy0tYm9yZGVyJywgcC5ib3JkZXIpOwpy
+b290LnN0eWxlLnNldFByb3BlcnR5KCctLWdyZWVuJywgcC5ncmVlbik7CnJvb3Quc3R5bGUuc2V0
+UHJvcGVydHkoJy0tcmVkJywgcC5yZWQpOwpyb290LnN0eWxlLnNldFByb3BlcnR5KCctLWFtYmVy
+JywgcC5hbWJlcik7CnVpY0N1cnJlbnRQcmVzZXQgPSBrZXk7CnVpY1NldHRpbmdzLnByZXNldCA9
+IGtleTsKdWljU2V0dGluZ3MuY29sb3JzID0gbnVsbDsKZG9jdW1lbnQucXVlcnlTZWxlY3RvckFs
+bCgnLnVpYy1wcmVzZXQnKS5mb3JFYWNoKChiLGkpID0+IHsKYi5jbGFzc0xpc3QudG9nZ2xlKCdh
+Y3RpdmUnLCBPYmplY3Qua2V5cyhVSUNfUFJFU0VUUylbaV0gPT09IGtleSk7Cn0pOwp1aWNTeW5j
+UGlja2VycygpOwp0b2FzdChgVGhlbWUgYXBwbGllZDogJHtwLmxhYmVsfWAsIHRydWUpOwp9CmZ1
+bmN0aW9uIHVpY1VwbG9hZEltYWdlKGlucHV0KSB7CmNvbnN0IGZpbGUgPSBpbnB1dC5maWxlc1sw
+XTsKaWYgKCFmaWxlKSByZXR1cm47CmlmIChmaWxlLnNpemUgPiAyMCAqIDEwMjQgKiAxMDI0KSB7
+IHRvYXN0KCdJbWFnZSB0b28gbGFyZ2Ug4oCUIG1heCAyMCBNQicsIGZhbHNlKTsgcmV0dXJuOyB9
+CnRvYXN0KCfij7MgVXBsb2FkaW5nIGltYWdl4oCmJywgdHJ1ZSk7CmNvbnN0IGZvcm0gPSBuZXcg
+Rm9ybURhdGEoKTsKZm9ybS5hcHBlbmQoJ2ZpbGUnLCBmaWxlKTsKZmV0Y2goJy9hcGkvdWkvYmFj
+a2dyb3VuZCcsIHsKbWV0aG9kOiAnUE9TVCcsCmhlYWRlcnM6IHsnWC1DbGllbnQtVG9rZW4nOiBn
+ZXRDbGllbnRUb2tlbigpfSwKYm9keTogZm9ybQp9KS50aGVuKHIgPT4gci5qc29uKCkpLnRoZW4o
+ZCA9PiB7CmlmICghZC5vaykgeyB0b2FzdCgn4p2MIFVwbG9hZCBmYWlsZWQ6ICcgKyAoZC5lcnJv
+cnx8JycpLCBmYWxzZSk7IHJldHVybjsgfQpjb25zdCBiZ0xheWVyID0gZG9jdW1lbnQuZ2V0RWxl
+bWVudEJ5SWQoJ2NwbS1iZy1sYXllcicpOwppZiAoYmdMYXllcikgYmdMYXllci5zdHlsZS5jc3NU
+ZXh0ID0gYHBvc2l0aW9uOmZpeGVkO2luc2V0OjA7ei1pbmRleDotMjtwb2ludGVyLWV2ZW50czpu
+b25lO2JhY2tncm91bmQtaW1hZ2U6dXJsKCcke2QudXJsfScpO2JhY2tncm91bmQtc2l6ZTpjb3Zl
+cjtiYWNrZ3JvdW5kLXBvc2l0aW9uOmNlbnRlcmA7CmRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdj
+cG0tYmctc3R5bGUnKS5pbm5lckhUTUwgPSAnJzsKZG9jdW1lbnQuZG9jdW1lbnRFbGVtZW50LnN0
+eWxlLnNldFByb3BlcnR5KCctLWJnJywgJ3RyYW5zcGFyZW50Jyk7CmNvbnN0IHdyYXAgPSBkb2N1
+bWVudC5nZXRFbGVtZW50QnlJZCgndWljLWltZy1wcmV2aWV3LXdyYXAnKTsKaWYgKHdyYXApIHdy
+YXAuaW5uZXJIVE1MID0gYDxpbWcgc3JjPSIke2QudXJsfSIgc3R5bGU9IndpZHRoOjEwMCU7aGVp
+Z2h0OjEwMCU7b2JqZWN0LWZpdDpjb3Zlcjtib3JkZXItcmFkaXVzOjEwcHgiLz5gOwpjb25zdCBi
+dG4gPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgndWljLWltZy1jbGVhci1idG4nKTsKaWYgKGJ0
+bikgYnRuLnN0eWxlLmRpc3BsYXkgPSAnYmxvY2snOwp1aWNDbGVhclZpZGVvU2lsZW50KCk7CnVp
+Y1NldHRpbmdzLmJnX3VybCA9IGQudXJsOyB1aWNTZXR0aW5ncy5iZ190eXBlID0gJ2ltYWdlJzsg
+dWljU2V0dGluZ3MuYmFja2dyb3VuZCA9ICd1cGxvYWQtaW1nJzsKdWljQ3VycmVudEJnID0gJ3Vw
+bG9hZC1pbWcnOwp0b2FzdCgn8J+WvO+4jyBJbWFnZSBiYWNrZ3JvdW5kIHNhdmVkIG9uIHNlcnZl
+ciEnLCB0cnVlKTsKfSkuY2F0Y2goKCkgPT4gdG9hc3QoJ+KdjCBVcGxvYWQgZmFpbGVkJywgZmFs
+c2UpKTsKfQpmdW5jdGlvbiB1aWNEcm9wSW1hZ2UoZXYpIHsKZXYucHJldmVudERlZmF1bHQoKTsK
+Y29uc3QgZmlsZSA9IGV2LmRhdGFUcmFuc2Zlci5maWxlc1swXTsKaWYgKCFmaWxlIHx8ICFmaWxl
+LnR5cGUuc3RhcnRzV2l0aCgnaW1hZ2UvJykpIHsgdG9hc3QoJ1BsZWFzZSBkcm9wIGFuIGltYWdl
+IGZpbGUnLCBmYWxzZSk7IHJldHVybjsgfQpjb25zdCBmYWtlSW5wdXQgPSB7IGZpbGVzOltmaWxl
+XSB9Owp1aWNVcGxvYWRJbWFnZShmYWtlSW5wdXQpOwp9CmZ1bmN0aW9uIHVpY1VwbG9hZFZpZGVv
+KGlucHV0KSB7CmNvbnN0IGZpbGUgPSBpbnB1dC5maWxlc1swXTsKaWYgKCFmaWxlKSByZXR1cm47
+CmlmIChmaWxlLnNpemUgPiAxMDAgKiAxMDI0ICogMTAyNCkgeyB0b2FzdCgnVmlkZW8gdG9vIGxh
+cmdlIOKAlCBtYXggMTAwIE1CJywgZmFsc2UpOyByZXR1cm47IH0KdG9hc3QoJ+KPsyBVcGxvYWRp
+bmcgdmlkZW/igKYgcGxlYXNlIHdhaXQnLCB0cnVlKTsKY29uc3QgZm9ybSA9IG5ldyBGb3JtRGF0
+YSgpOwpmb3JtLmFwcGVuZCgnZmlsZScsIGZpbGUpOwpmZXRjaCgnL2FwaS91aS9iYWNrZ3JvdW5k
+JywgewptZXRob2Q6ICdQT1NUJywKaGVhZGVyczogeydYLUNsaWVudC1Ub2tlbic6IGdldENsaWVu
+dFRva2VuKCl9LApib2R5OiBmb3JtCn0pLnRoZW4ociA9PiByLmpzb24oKSkudGhlbihkID0+IHsK
+aWYgKCFkLm9rKSB7IHRvYXN0KCfinYwgVXBsb2FkIGZhaWxlZDogJyArIChkLmVycm9yfHwnJyks
+IGZhbHNlKTsgcmV0dXJuOyB9CmNvbnN0IHZpZCA9IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdj
+cG0tYmctdmlkZW8nKTsKaWYgKHZpZCkgeyB2aWQuc3JjID0gZC51cmw7IHZpZC5zdHlsZS5kaXNw
+bGF5ID0gJ2Jsb2NrJzsgdmlkLmxvYWQoKTsgdmlkLnBsYXkoKS5jYXRjaCgoKT0+e30pOyB9CmNv
+bnN0IGJnTGF5ZXIgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnY3BtLWJnLWxheWVyJyk7Cmlm
+IChiZ0xheWVyKSBiZ0xheWVyLnN0eWxlLmNzc1RleHQgPSAncG9zaXRpb246Zml4ZWQ7aW5zZXQ6
+MDt6LWluZGV4Oi0yO3BvaW50ZXItZXZlbnRzOm5vbmUnOwpkb2N1bWVudC5nZXRFbGVtZW50QnlJ
+ZCgnY3BtLWJnLXN0eWxlJykuaW5uZXJIVE1MID0gJyc7CmRvY3VtZW50LmRvY3VtZW50RWxlbWVu
+dC5zdHlsZS5zZXRQcm9wZXJ0eSgnLS1iZycsICd0cmFuc3BhcmVudCcpOwpjb25zdCB3cmFwID0g
+ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3VpYy12aWQtcHJldmlldy13cmFwJyk7CmlmICh3cmFw
+KSB3cmFwLmlubmVySFRNTCA9IGA8dmlkZW8gc3JjPSIke2QudXJsfSIgYXV0b3BsYXkgbG9vcCBt
+dXRlZCBwbGF5c2lubGluZSBzdHlsZT0id2lkdGg6MTAwJTtoZWlnaHQ6MTAwJTtvYmplY3QtZml0
+OmNvdmVyO2JvcmRlci1yYWRpdXM6MTBweCI+PC92aWRlbz5gOwpjb25zdCBidG4gPSBkb2N1bWVu
+dC5nZXRFbGVtZW50QnlJZCgndWljLXZpZC1jbGVhci1idG4nKTsKaWYgKGJ0bikgYnRuLnN0eWxl
+LmRpc3BsYXkgPSAnYmxvY2snOwp1aWNDbGVhckltYWdlU2lsZW50KCk7CnVpY1NldHRpbmdzLmJn
+X3VybCA9IGQudXJsOyB1aWNTZXR0aW5ncy5iZ190eXBlID0gJ3ZpZGVvJzsgdWljU2V0dGluZ3Mu
+YmFja2dyb3VuZCA9ICd1cGxvYWQtdmlkJzsKdWljQ3VycmVudEJnID0gJ3VwbG9hZC12aWQnOwp0
+b2FzdCgn8J+OrCBWaWRlbyBiYWNrZ3JvdW5kIHNhdmVkIG9uIHNlcnZlciEnLCB0cnVlKTsKfSku
+Y2F0Y2goKCkgPT4gdG9hc3QoJ+KdjCBVcGxvYWQgZmFpbGVkJywgZmFsc2UpKTsKfQpmdW5jdGlv
+biB1aWNEcm9wVmlkZW8oZXYpIHsKZXYucHJldmVudERlZmF1bHQoKTsKY29uc3QgZmlsZSA9IGV2
+LmRhdGFUcmFuc2Zlci5maWxlc1swXTsKaWYgKCFmaWxlIHx8ICFmaWxlLnR5cGUuc3RhcnRzV2l0
+aCgndmlkZW8vJykpIHsgdG9hc3QoJ1BsZWFzZSBkcm9wIGEgdmlkZW8gZmlsZScsIGZhbHNlKTsg
+cmV0dXJuOyB9CmNvbnN0IGZha2VJbnB1dCA9IHsgZmlsZXM6W2ZpbGVdIH07CnVpY1VwbG9hZFZp
+ZGVvKGZha2VJbnB1dCk7Cn0KZnVuY3Rpb24gdWljQ2xlYXJJbWFnZVNpbGVudCgpIHsKaWYgKHVp
+Y1NldHRpbmdzLmJnX3R5cGUgPT09ICdpbWFnZScpIHsKZmV0Y2goJy9hcGkvdWkvYmFja2dyb3Vu
+ZCcsIHttZXRob2Q6J0RFTEVURScsIGhlYWRlcnM6eydYLUNsaWVudC1Ub2tlbic6Z2V0Q2xpZW50
+VG9rZW4oKX19KS5jYXRjaCgoKT0+e30pOwp1aWNTZXR0aW5ncy5iZ191cmwgPSBudWxsOyB1aWNT
+ZXR0aW5ncy5iZ190eXBlID0gbnVsbDsKfQp1aWNTZXR0aW5ncy5iYWNrZ3JvdW5kID0gJ25vbmUn
+OyB1aWNDdXJyZW50QmcgPSAnbm9uZSc7CmNvbnN0IGJnTGF5ZXIgPSBkb2N1bWVudC5nZXRFbGVt
+ZW50QnlJZCgnY3BtLWJnLWxheWVyJyk7CmlmIChiZ0xheWVyKSBiZ0xheWVyLnN0eWxlLmNzc1Rl
+eHQgPSAncG9zaXRpb246Zml4ZWQ7aW5zZXQ6MDt6LWluZGV4Oi0yO3BvaW50ZXItZXZlbnRzOm5v
+bmUnOwpkb2N1bWVudC5kb2N1bWVudEVsZW1lbnQuc3R5bGUucmVtb3ZlUHJvcGVydHkoJy0tYmcn
+KTsKaWYgKHVpY1NldHRpbmdzLnByZXNldCAmJiBVSUNfUFJFU0VUU1t1aWNTZXR0aW5ncy5wcmVz
+ZXRdKSB7CmRvY3VtZW50LmRvY3VtZW50RWxlbWVudC5zdHlsZS5zZXRQcm9wZXJ0eSgnLS1iZycs
+IFVJQ19QUkVTRVRTW3VpY1NldHRpbmdzLnByZXNldF0uYmcpOwp9CmNvbnN0IHdyYXAgPSBkb2N1
+bWVudC5nZXRFbGVtZW50QnlJZCgndWljLWltZy1wcmV2aWV3LXdyYXAnKTsKaWYgKHdyYXApIHdy
+YXAuaW5uZXJIVE1MID0gYDxzdmcgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiBmaWxsPSJub25lIiBz
+dHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIxLjUiIHZpZXdCb3g9IjAgMCAyNCAy
+NCI+PHJlY3QgeD0iMyIgeT0iMyIgd2lkdGg9IjE4IiBoZWlnaHQ9IjE4IiByeD0iMiIvPjxjaXJj
+bGUgY3g9IjguNSIgY3k9IjguNSIgcj0iMS41Ii8+PHBhdGggZD0iTTIxIDE1bC01LTVMNSAyMSIv
+Pjwvc3ZnPjxzcGFuIHN0eWxlPSJmb250LXNpemU6MTNweDtmb250LXdlaWdodDo2MDAiPkNsaWNr
+IG9yIGRyYWcgYW4gaW1hZ2UgaGVyZTwvc3Bhbj48c3BhbiBzdHlsZT0iZm9udC1zaXplOjExcHgi
+PkpQRywgUE5HLCBHSUYsIFdlYlAg4oCUIG1heCAyMCBNQjwvc3Bhbj5gOwpjb25zdCBidG4gPSBk
+b2N1bWVudC5nZXRFbGVtZW50QnlJZCgndWljLWltZy1jbGVhci1idG4nKTsKaWYgKGJ0bikgYnRu
+LnN0eWxlLmRpc3BsYXkgPSAnbm9uZSc7Cn0KZnVuY3Rpb24gdWljQ2xlYXJJbWFnZSgpIHsgdWlj
+Q2xlYXJJbWFnZVNpbGVudCgpOyB0b2FzdCgnSW1hZ2UgYmFja2dyb3VuZCByZW1vdmVkJywgdHJ1
+ZSk7IH0KZnVuY3Rpb24gdWljQ2xlYXJWaWRlb1NpbGVudCgpIHsKaWYgKHVpY1NldHRpbmdzLmJn
+X3R5cGUgPT09ICd2aWRlbycpIHsKZmV0Y2goJy9hcGkvdWkvYmFja2dyb3VuZCcsIHttZXRob2Q6
+J0RFTEVURScsIGhlYWRlcnM6eydYLUNsaWVudC1Ub2tlbic6Z2V0Q2xpZW50VG9rZW4oKX19KS5j
+YXRjaCgoKT0+e30pOwp1aWNTZXR0aW5ncy5iZ191cmwgPSBudWxsOyB1aWNTZXR0aW5ncy5iZ190
+eXBlID0gbnVsbDsKfQp1aWNTZXR0aW5ncy5iYWNrZ3JvdW5kID0gJ25vbmUnOyB1aWNDdXJyZW50
+QmcgPSAnbm9uZSc7CmNvbnN0IHZpZCA9IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdjcG0tYmct
+dmlkZW8nKTsKaWYgKHZpZCkgeyB2aWQuc3R5bGUuZGlzcGxheT0nbm9uZSc7IHZpZC5zcmM9Jyc7
+IH0KY29uc3Qgd3JhcCA9IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCd1aWMtdmlkLXByZXZpZXct
+d3JhcCcpOwppZiAod3JhcCkgd3JhcC5pbm5lckhUTUwgPSBgPHN2ZyB3aWR0aD0iMzIiIGhlaWdo
+dD0iMzIiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjEu
+NSIgdmlld0JveD0iMCAwIDI0IDI0Ij48cG9seWdvbiBwb2ludHM9IjIzIDcgMTYgMTIgMjMgMTcg
+MjMgNyIvPjxyZWN0IHg9IjEiIHk9IjUiIHdpZHRoPSIxNSIgaGVpZ2h0PSIxNCIgcng9IjIiLz48
+L3N2Zz48c3BhbiBzdHlsZT0iZm9udC1zaXplOjEzcHg7Zm9udC13ZWlnaHQ6NjAwIj5DbGljayBv
+ciBkcmFnIGEgdmlkZW8gaGVyZTwvc3Bhbj48c3BhbiBzdHlsZT0iZm9udC1zaXplOjExcHgiPk1Q
+NCwgV2ViTSwgT0dHIOKAlCBtYXggMTAwIE1CPC9zcGFuPmA7CmNvbnN0IGJ0biA9IGRvY3VtZW50
+LmdldEVsZW1lbnRCeUlkKCd1aWMtdmlkLWNsZWFyLWJ0bicpOwppZiAoYnRuKSBidG4uc3R5bGUu
+ZGlzcGxheSA9ICdub25lJzsKfQpmdW5jdGlvbiB1aWNDbGVhclZpZGVvKCkgeyB1aWNDbGVhclZp
+ZGVvU2lsZW50KCk7IHRvYXN0KCdWaWRlbyBiYWNrZ3JvdW5kIHJlbW92ZWQnLCB0cnVlKTsgfQpm
+dW5jdGlvbiB1aWNBcHBseUZvbnQoKSB7CmNvbnN0IGZhbWlseSA9IGRvY3VtZW50LmdldEVsZW1l
+bnRCeUlkKCd1aWMtZm9udC1zZWxlY3QnKS52YWx1ZTsKY29uc3Qgc2l6ZSA9IGRvY3VtZW50Lmdl
+dEVsZW1lbnRCeUlkKCd1aWMtZm9udC1zaXplJykudmFsdWU7CmNvbnN0IHZhbEVsID0gZG9jdW1l
+bnQuZ2V0RWxlbWVudEJ5SWQoJ3VpYy1zaXplLXZhbCcpOwppZiAodmFsRWwpIHZhbEVsLnRleHRD
+b250ZW50ID0gc2l6ZSArICdweCc7CmRvY3VtZW50LmJvZHkuc3R5bGUuZm9udEZhbWlseSA9IGZh
+bWlseSA/IChmYW1pbHkgKyAnLFNlZ29lIFVJLHN5c3RlbS11aSxzYW5zLXNlcmlmJykgOiAnJzsK
+ZG9jdW1lbnQuYm9keS5zdHlsZS5mb250U2l6ZSA9IHNpemUgPyBzaXplICsgJ3B4JyA6ICcnOwp1
+aWNTZXR0aW5ncy5mb250RmFtaWx5ID0gZmFtaWx5Owp1aWNTZXR0aW5ncy5mb250U2l6ZSA9IHNp
+emU7Cn0KZnVuY3Rpb24gdWljQXBwbHlSYWRpdXMocikgewpkb2N1bWVudC5kb2N1bWVudEVsZW1l
+bnQuc3R5bGUuc2V0UHJvcGVydHkoJy0tcmFkaXVzJywgcik7CmRvY3VtZW50LnF1ZXJ5U2VsZWN0
+b3JBbGwoJy51aWMtcmFkaXVzLW9wdCcpLmZvckVhY2goYiA9PiBiLmNsYXNzTGlzdC50b2dnbGUo
+J2FjdGl2ZScsIGIuZGF0YXNldC5yPT09cikpOwp1aWNTZXR0aW5ncy5yYWRpdXMgPSByOwp9CmFz
+eW5jIGZ1bmN0aW9uIHNhdmVVaUN1c3RvbWl6ZSgpIHsKY29uc3Qgcm9vdCA9IGRvY3VtZW50LmRv
+Y3VtZW50RWxlbWVudDsKY29uc3QgdmFycyA9IFsnLS1iZycsJy0tc2lkZWJhcicsJy0tY2FyZCcs
+Jy0tYmx1ZScsJy0tdGV4dCcsJy0tbXV0ZWQnLCctLWJvcmRlcicsJy0tZ3JlZW4nLCctLXJlZCcs
+Jy0tYW1iZXInXTsKY29uc3QgY29sb3JzID0ge307CnZhcnMuZm9yRWFjaCh2ID0+IHsgY29uc3Qg
+dmFsID0gcm9vdC5zdHlsZS5nZXRQcm9wZXJ0eVZhbHVlKHYpOyBpZiAodmFsKSBjb2xvcnNbdl0g
+PSB2YWw7IH0pOwp1aWNTZXR0aW5ncy5zYXZlZENvbG9ycyA9IGNvbG9yczsKdWljU2V0dGluZ3Mu
+cHJlc2V0ID0gdWljQ3VycmVudFByZXNldDsKdWljU2V0dGluZ3MuYmFja2dyb3VuZCA9IHVpY0N1
+cnJlbnRCZzsKdWljU2V0dGluZ3MucmFkaXVzID0gcm9vdC5zdHlsZS5nZXRQcm9wZXJ0eVZhbHVl
+KCctLXJhZGl1cycpIHx8ICcxMnB4JzsKdWljU2V0dGluZ3MuZm9udEZhbWlseSA9IGRvY3VtZW50
+LmdldEVsZW1lbnRCeUlkKCd1aWMtZm9udC1zZWxlY3QnKT8udmFsdWUgfHwgJyc7CnVpY1NldHRp
+bmdzLmZvbnRTaXplID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3VpYy1mb250LXNpemUnKT8u
+dmFsdWUgfHwgJzE0JzsKdHJ5IHsKY29uc3QgZCA9IGF3YWl0IGFwaSgnL2FwaS91aS9zZXR0aW5n
+cycsIHttZXRob2Q6J1BPU1QnLCBib2R5OkpTT04uc3RyaW5naWZ5KHVpY1NldHRpbmdzKX0pOwpp
+ZiAoZC5vaykgdG9hc3QoJ+KchSBVSSBzZXR0aW5ncyBzYXZlZCBvbiBzZXJ2ZXIhJywgdHJ1ZSk7
+CmVsc2UgdG9hc3QoJ+KdjCBTYXZlIGZhaWxlZCcsIGZhbHNlKTsKfSBjYXRjaChlKSB7IHRvYXN0
+KCfinYwgU2F2ZSBmYWlsZWQnLCBmYWxzZSk7IH0KfQphc3luYyBmdW5jdGlvbiByZXNldFVpQ3Vz
+dG9taXplKCkgewppZiAoIWNvbmZpcm0oJ1Jlc2V0IGFsbCBVSSBjdXN0b21pemF0aW9ucyB0byBk
+ZWZhdWx0PycpKSByZXR1cm47CnRyeSB7CmF3YWl0IGFwaSgnL2FwaS91aS9zZXR0aW5ncycsIHtt
+ZXRob2Q6J1BPU1QnLCBib2R5OkpTT04uc3RyaW5naWZ5KHt9KX0pOwphd2FpdCBmZXRjaCgnL2Fw
+aS91aS9iYWNrZ3JvdW5kJywge21ldGhvZDonREVMRVRFJywgaGVhZGVyczp7J1gtQ2xpZW50LVRv
+a2VuJzpnZXRDbGllbnRUb2tlbigpfX0pLmNhdGNoKCgpPT57fSk7Cn0gY2F0Y2goZSkge30KdWlj
+U2V0dGluZ3MgPSB7fTsgdWljQ3VycmVudFByZXNldCA9ICdkZWZhdWx0JzsgdWljQ3VycmVudEJn
+ID0gJ25vbmUnOwpjb25zdCByb290ID0gZG9jdW1lbnQuZG9jdW1lbnRFbGVtZW50OwpbJy0tYmcn
+LCctLXNpZGViYXInLCctLWNhcmQnLCctLWJsdWUnLCctLWJsdWUtbGlnaHQnLCctLWJsdWUtbWlk
+JywnLS10ZXh0JywnLS1tdXRlZCcsJy0tYm9yZGVyJywnLS1ncmVlbicsJy0tcmVkJywnLS1hbWJl
+cicsJy0tcmFkaXVzJ10uZm9yRWFjaCh2PT5yb290LnN0eWxlLnJlbW92ZVByb3BlcnR5KHYpKTsK
+ZG9jdW1lbnQuYm9keS5zdHlsZS5mb250RmFtaWx5ID0gJyc7CmRvY3VtZW50LmJvZHkuc3R5bGUu
+Zm9udFNpemUgPSAnJzsKY29uc3QgYmdMYXllciA9IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCdj
+cG0tYmctbGF5ZXInKTsKaWYgKGJnTGF5ZXIpIGJnTGF5ZXIuc3R5bGUuY3NzVGV4dCA9ICdwb3Np
+dGlvbjpmaXhlZDtpbnNldDowO3otaW5kZXg6LTI7cG9pbnRlci1ldmVudHM6bm9uZSc7CmRvY3Vt
+ZW50LmdldEVsZW1lbnRCeUlkKCdjcG0tYmctc3R5bGUnKS5pbm5lckhUTUwgPSAnJzsKY29uc3Qg
+dmlkID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2NwbS1iZy12aWRlbycpOwppZiAodmlkKSB7
+IHZpZC5zdHlsZS5kaXNwbGF5PSdub25lJzsgdmlkLnNyYz0nJzsgfQp1aWNSZW5kZXJQYWdlKCk7
+CnRvYXN0KCfihqkgUmVzZXQgdG8gZGVmYXVsdHMnLCB0cnVlKTsKfQphc3luYyBmdW5jdGlvbiBp
+bml0VWlDdXN0b21pemUoKSB7CnRyeSB7CmNvbnN0IGQgPSBhd2FpdCBhcGkoJy9hcGkvdWkvc2V0
+dGluZ3MnKTsKaWYgKCFkIHx8ICFPYmplY3Qua2V5cyhkKS5sZW5ndGgpIHJldHVybjsKdWljU2V0
+dGluZ3MgPSBkOwp1aWNDdXJyZW50UHJlc2V0ID0gZC5wcmVzZXQgfHwgJ2RlZmF1bHQnOwp1aWND
+dXJyZW50QmcgPSBkLmJhY2tncm91bmQgfHwgJ25vbmUnOwpjb25zdCByb290ID0gZG9jdW1lbnQu
+ZG9jdW1lbnRFbGVtZW50OwppZiAoZC5zYXZlZENvbG9ycyAmJiBPYmplY3Qua2V5cyhkLnNhdmVk
+Q29sb3JzKS5sZW5ndGgpIHsKT2JqZWN0LmVudHJpZXMoZC5zYXZlZENvbG9ycykuZm9yRWFjaCgo
+W3YsIHZhbF0pID0+IHJvb3Quc3R5bGUuc2V0UHJvcGVydHkodiwgdmFsKSk7Cn0gZWxzZSBpZiAo
+ZC5wcmVzZXQgJiYgVUlDX1BSRVNFVFNbZC5wcmVzZXRdKSB7CmNvbnN0IHAgPSBVSUNfUFJFU0VU
+U1tkLnByZXNldF07CnJvb3Quc3R5bGUuc2V0UHJvcGVydHkoJy0tYmcnLCBwLmJnKTsKcm9vdC5z
+dHlsZS5zZXRQcm9wZXJ0eSgnLS1zaWRlYmFyJywgcC5zaWRlYmFyKTsKcm9vdC5zdHlsZS5zZXRQ
+cm9wZXJ0eSgnLS1jYXJkJywgcC5jYXJkKTsKcm9vdC5zdHlsZS5zZXRQcm9wZXJ0eSgnLS1ibHVl
+JywgcC5ibHVlKTsKcm9vdC5zdHlsZS5zZXRQcm9wZXJ0eSgnLS1ibHVlLWxpZ2h0JywgdWljSGV4
+QWxwaGEocC5ibHVlLDAuMTIpKTsKcm9vdC5zdHlsZS5zZXRQcm9wZXJ0eSgnLS1ibHVlLW1pZCcs
+IHVpY0hleEFscGhhKHAuYmx1ZSwwLjMwKSk7CnJvb3Quc3R5bGUuc2V0UHJvcGVydHkoJy0tdGV4
+dCcsIHAudGV4dCk7CnJvb3Quc3R5bGUuc2V0UHJvcGVydHkoJy0tbXV0ZWQnLCBwLm11dGVkKTsK
+cm9vdC5zdHlsZS5zZXRQcm9wZXJ0eSgnLS1ib3JkZXInLCBwLmJvcmRlcik7CnJvb3Quc3R5bGUu
+c2V0UHJvcGVydHkoJy0tZ3JlZW4nLCBwLmdyZWVuKTsKcm9vdC5zdHlsZS5zZXRQcm9wZXJ0eSgn
+LS1yZWQnLCBwLnJlZCk7CnJvb3Quc3R5bGUuc2V0UHJvcGVydHkoJy0tYW1iZXInLCBwLmFtYmVy
+KTsKfQppZiAoZC5iZ191cmwgJiYgZC5iZ190eXBlID09PSAnaW1hZ2UnKSB7CmNvbnN0IGJnTGF5
+ZXIgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnY3BtLWJnLWxheWVyJyk7CmlmIChiZ0xheWVy
+KSBiZ0xheWVyLnN0eWxlLmNzc1RleHQgPSBgcG9zaXRpb246Zml4ZWQ7aW5zZXQ6MDt6LWluZGV4
+Oi0yO3BvaW50ZXItZXZlbnRzOm5vbmU7YmFja2dyb3VuZC1pbWFnZTp1cmwoJyR7ZC5iZ191cmx9
+Jyk7YmFja2dyb3VuZC1zaXplOmNvdmVyO2JhY2tncm91bmQtcG9zaXRpb246Y2VudGVyYDsKcm9v
+dC5zdHlsZS5zZXRQcm9wZXJ0eSgnLS1iZycsJ3RyYW5zcGFyZW50Jyk7Cn0gZWxzZSBpZiAoZC5i
+Z191cmwgJiYgZC5iZ190eXBlID09PSAndmlkZW8nKSB7CmNvbnN0IHZpZCA9IGRvY3VtZW50Lmdl
+dEVsZW1lbnRCeUlkKCdjcG0tYmctdmlkZW8nKTsKaWYgKHZpZCkgeyB2aWQuc3JjID0gZC5iZ191
+cmw7IHZpZC5zdHlsZS5kaXNwbGF5ID0gJ2Jsb2NrJzsgdmlkLmxvYWQoKTsgdmlkLnBsYXkoKS5j
+YXRjaCgoKT0+e30pOyB9CmNvbnN0IGJnTGF5ZXIgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgn
+Y3BtLWJnLWxheWVyJyk7CmlmIChiZ0xheWVyKSBiZ0xheWVyLnN0eWxlLmNzc1RleHQgPSAncG9z
+aXRpb246Zml4ZWQ7aW5zZXQ6MDt6LWluZGV4Oi0yO3BvaW50ZXItZXZlbnRzOm5vbmUnOwpyb290
+LnN0eWxlLnNldFByb3BlcnR5KCctLWJnJywndHJhbnNwYXJlbnQnKTsKfQppZiAoZC5yYWRpdXMp
+IHJvb3Quc3R5bGUuc2V0UHJvcGVydHkoJy0tcmFkaXVzJywgZC5yYWRpdXMpOwppZiAoZC5mb250
+RmFtaWx5KSBkb2N1bWVudC5ib2R5LnN0eWxlLmZvbnRGYW1pbHkgPSBkLmZvbnRGYW1pbHkrJyxT
+ZWdvZSBVSSxzeXN0ZW0tdWksc2Fucy1zZXJpZic7CmlmIChkLmZvbnRTaXplKSBkb2N1bWVudC5i
+b2R5LnN0eWxlLmZvbnRTaXplID0gZC5mb250U2l6ZSsncHgnOwp9IGNhdGNoKGUpIHt9Cn0KZnVu
+Y3Rpb24gbG9nb3V0UGFuZWwoKSB7CmlmICghY29uZmlybSgnTG9nIG91dCBhbmQgcmV0dXJuIHRv
+IHRoZSBzdGFydHVwIHNjcmVlbj8nKSkgcmV0dXJuOwpbJ2NwbV9hY3RpdmF0aW9uJywnY3BtX293
+bmVyX2tleScsJ2NwbV9wcmVtaXVtX2tleScsJ2NwbV9wcmVtaXVtX2V4cGlyZXMnXS5mb3JFYWNo
+KGsgPT4gbG9jYWxTdG9yYWdlLnJlbW92ZUl0ZW0oaykpOwpsb2NhdGlvbi5yZWxvYWQoKTsKfQph
+Y3RpdmF0aW9uSW5pdCgpOwppbml0VWlDdXN0b21pemUoKS50aGVuKCgpID0+IHVpY1JlbmRlclBh
+Z2UoKSk7CmNoZWNrS3ZtU3RhdHVzKCk7CmxvYWRTdGF0cygpOyBsb2FkVnBzKCk7CnBvbGxUdW5u
+ZWwoKTsKc2V0SW50ZXJ2YWwobG9hZFN0YXRzLCA1MDAwKTsKc2V0SW50ZXJ2YWwobG9hZFZwcywg
+MTAwMDApOwpzZXRJbnRlcnZhbChjaGVja0t2bVN0YXR1cywgMzAwMDApOwo8L3NjcmlwdD48L2Jv
+ZHk+PC9odG1sPg==
+  B64HTMLEOF
+    ok "index.html written"
+  fi
 
 # ── Write requirements.txt ────────────────────────────────────────────────────
 cat > "$DIR/requirements.txt" << 'EOF'
