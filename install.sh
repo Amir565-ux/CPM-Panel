@@ -2767,7 +2767,7 @@ async function submitActOwnerSetup() {
       setTimeout(() => hideActOverlay('owner'), 700);
     } else {
       err.textContent = '❌ ' + (d.error || 'Setup failed');
-      btn.textContent = '🔐 Set Owner Key & Enter'; btn.disabled = false;
+      btn.textContent = '🔐 Set & Enter'; btn.disabled = false;
     }
   } catch(_) {
     err.textContent = '❌ Server error — try again';
@@ -3685,10 +3685,5 @@ echo -e "    ${Y}bash run.sh${N}"
 echo ""
 echo -e "  Then open:"
 echo -e "    ${Y}http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo localhost):5000${N}"
-echo ""
-echo -e "  ${Y}FIRST-TIME SETUP:${N}"
-echo -e "    Click 'Owner Panel' in the sidebar and create your secret owner key."
-echo -e "    No default key is pre-set — you choose your own on first run."
-echo ""
 echo ""
 [[ -n "${SUDO_USER:-}" ]] && echo -e "  ${Y}NOTE:${N} Log out and back in so '$SUDO_USER' can
